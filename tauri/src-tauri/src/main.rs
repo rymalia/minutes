@@ -168,6 +168,15 @@ fn main() {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // Hide main window on close instead of quitting (app stays in tray)
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    window.hide().ok();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::cmd_status,
             commands::cmd_list_meetings,
