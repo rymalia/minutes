@@ -193,16 +193,10 @@ fn main() {
                                 if commands::request_stop(&recording, &stop).is_err() {
                                     return;
                                 }
-                                // Wait in background thread — no timeout kill.
-                                // Let the recording thread finish naturally (transcription
-                                // can take minutes for long recordings).
+                                // Wait in a background thread so we do not block the tray event loop.
+                                // Exiting happens only after the recording pipeline actually finishes.
                                 std::thread::spawn(|| {
-                                    // Wait up to 10 min for pipeline to finish
-                                    if !commands::wait_for_recording_shutdown(
-                                        std::time::Duration::from_secs(600),
-                                    ) {
-                                        eprintln!("Recording shutdown timed out after 10 min. Exiting anyway.");
-                                    }
+                                    commands::wait_for_recording_shutdown_forever();
                                     std::process::exit(0);
                                 });
                             } else {

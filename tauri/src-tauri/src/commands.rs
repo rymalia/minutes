@@ -56,13 +56,27 @@ pub fn request_stop(
     }
 }
 
-pub fn wait_for_recording_shutdown(timeout: std::time::Duration) -> bool {
-    let pid_path = minutes_core::pid::pid_path();
+fn wait_for_path_removal(path: &std::path::Path, timeout: Option<std::time::Duration>) -> bool {
     let start = std::time::Instant::now();
-    while pid_path.exists() && start.elapsed() < timeout {
+    while path.exists() {
+        if let Some(timeout) = timeout {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    !pid_path.exists()
+    true
+}
+
+pub fn wait_for_recording_shutdown(timeout: std::time::Duration) -> bool {
+    let pid_path = minutes_core::pid::pid_path();
+    wait_for_path_removal(&pid_path, Some(timeout))
+}
+
+pub fn wait_for_recording_shutdown_forever() {
+    let pid_path = minutes_core::pid::pid_path();
+    let _ = wait_for_path_removal(&pid_path, None);
 }
 
 /// Start recording in a background thread.
@@ -298,7 +312,13 @@ pub fn cmd_download_model(model: String) -> Result<String, String> {
     eprintln!("[minutes] Downloading model: {} from {}", model, url);
 
     let status = std::process::Command::new("curl")
-        .args(["-L", "-o", &model_file.to_string_lossy(), &url, "--progress-bar"])
+        .args([
+            "-L",
+            "-o",
+            &model_file.to_string_lossy(),
+            &url,
+            "--progress-bar",
+        ])
         .status()
         .map_err(|e| format!("curl failed: {}", e))?;
 
@@ -333,5 +353,35 @@ mod tests {
         assert!(!wav.exists());
         assert!(preserved.exists());
         assert!(preserved.starts_with(config.output_dir.join("failed-captures")));
+    }
+
+    #[test]
+    fn wait_for_path_removal_returns_false_after_timeout() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("still-there.pid");
+        std::fs::write(&path, "123").unwrap();
+
+        let removed = wait_for_path_removal(&path, Some(std::time::Duration::from_millis(50)));
+
+        assert!(!removed);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn wait_for_path_removal_returns_true_when_file_disappears() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("gone-soon.pid");
+        std::fs::write(&path, "123").unwrap();
+
+        let path_for_thread = path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::fs::remove_file(path_for_thread).unwrap();
+        });
+
+        let removed = wait_for_path_removal(&path, Some(std::time::Duration::from_secs(1)));
+
+        assert!(removed);
+        assert!(!path.exists());
     }
 }
