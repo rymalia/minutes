@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -65,6 +65,8 @@ pub fn update_tray_state(app: &tauri::AppHandle, is_recording: bool) {
 fn main() {
     let recording = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let processing = Arc::new(AtomicBool::new(false));
+    let processing_stage = Arc::new(Mutex::new(None));
     let recording_clone = recording.clone();
     let stop_clone = stop_flag.clone();
 
@@ -73,6 +75,8 @@ fn main() {
         .manage(commands::AppState {
             recording: recording.clone(),
             stop_flag: stop_flag.clone(),
+            processing: processing.clone(),
+            processing_stage: processing_stage.clone(),
         })
         .setup(move |app| {
             let initial_recording = minutes_core::pid::status().recording;
@@ -150,10 +154,18 @@ fn main() {
                             let app_done = app.clone();
                             let rec = recording.clone();
                             let sf = stop.clone();
+                            let processing = processing.clone();
+                            let processing_stage = processing_stage.clone();
                             let ri = rec_item.clone();
                             let si = stp_item.clone();
                             std::thread::spawn(move || {
-                                commands::start_recording(app_handle, rec, sf);
+                                commands::start_recording(
+                                    app_handle,
+                                    rec,
+                                    sf,
+                                    processing,
+                                    processing_stage,
+                                );
                                 ri.set_text("Start Recording").ok();
                                 ri.set_enabled(true).ok();
                                 si.set_enabled(false).ok();

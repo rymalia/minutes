@@ -1,11 +1,13 @@
 use minutes_core::{Config, ContentType};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub struct AppState {
     pub recording: Arc<AtomicBool>,
     pub stop_flag: Arc<AtomicBool>,
+    pub processing: Arc<AtomicBool>,
+    pub processing_stage: Arc<Mutex<Option<String>>>,
 }
 
 fn preserve_failed_capture(wav_path: &std::path::Path, config: &Config) -> Option<PathBuf> {
@@ -79,14 +81,33 @@ pub fn wait_for_recording_shutdown_forever() {
     let _ = wait_for_path_removal(&pid_path, None);
 }
 
+fn stage_label(stage: minutes_core::pipeline::PipelineStage) -> &'static str {
+    match stage {
+        minutes_core::pipeline::PipelineStage::Transcribing => "Transcribing audio",
+        minutes_core::pipeline::PipelineStage::Diarizing => "Separating speakers",
+        minutes_core::pipeline::PipelineStage::Summarizing => "Generating summary",
+        minutes_core::pipeline::PipelineStage::Saving => "Saving meeting",
+    }
+}
+
+fn set_processing_stage(stage: &Arc<Mutex<Option<String>>>, value: Option<&str>) {
+    if let Ok(mut current) = stage.lock() {
+        *current = value.map(String::from);
+    }
+}
+
 /// Start recording in a background thread.
 pub fn start_recording(
     _app_handle: tauri::AppHandle,
     recording: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
+    processing: Arc<AtomicBool>,
+    processing_stage: Arc<Mutex<Option<String>>>,
 ) {
     recording.store(true, Ordering::Relaxed);
     stop_flag.store(false, Ordering::Relaxed);
+    processing.store(false, Ordering::Relaxed);
+    set_processing_stage(&processing_stage, None);
 
     let config = Config::load();
     let wav_path = minutes_core::pid::current_wav_path();
@@ -103,10 +124,18 @@ pub fn start_recording(
     let mut remove_current_wav = false;
     match minutes_core::capture::record_to_wav(&wav_path, stop_flag, &config) {
         Ok(()) => {
+            recording.store(false, Ordering::Relaxed);
+            processing.store(true, Ordering::Relaxed);
             let title = chrono::Local::now()
                 .format("Recording %Y-%m-%d %H:%M")
                 .to_string();
-            match minutes_core::process(&wav_path, ContentType::Meeting, Some(&title), &config) {
+            match minutes_core::pipeline::process_with_progress(
+                &wav_path,
+                ContentType::Meeting,
+                Some(&title),
+                &config,
+                |stage| set_processing_stage(&processing_stage, Some(stage_label(stage))),
+            ) {
                 Ok(result) => {
                     remove_current_wav = true;
                     eprintln!(
@@ -133,6 +162,7 @@ pub fn start_recording(
             }
         }
         Err(e) => {
+            recording.store(false, Ordering::Relaxed);
             if let Some(saved) = preserve_failed_capture(&wav_path, &config) {
                 eprintln!(
                     "Capture error: {}. Partial audio preserved at {}",
@@ -150,6 +180,8 @@ pub fn start_recording(
     if remove_current_wav && wav_path.exists() {
         std::fs::remove_file(&wav_path).ok();
     }
+    processing.store(false, Ordering::Relaxed);
+    set_processing_stage(&processing_stage, None);
     recording.store(false, Ordering::Relaxed);
 }
 
@@ -164,10 +196,12 @@ pub fn cmd_start_recording(
     state.recording.store(true, Ordering::Relaxed);
     let rec = state.recording.clone();
     let stop = state.stop_flag.clone();
+    let processing = state.processing.clone();
+    let processing_stage = state.processing_stage.clone();
     crate::update_tray_state(&app, true);
     let app_done = app.clone();
     std::thread::spawn(move || {
-        start_recording(app, rec, stop);
+        start_recording(app, rec, stop, processing, processing_stage);
         crate::update_tray_state(&app_done, false);
     });
     Ok(())
@@ -186,10 +220,16 @@ pub fn cmd_add_note(text: String) -> Result<String, String> {
 #[tauri::command]
 pub fn cmd_status(state: tauri::State<AppState>) -> serde_json::Value {
     let recording = state.recording.load(Ordering::Relaxed);
+    let processing = state.processing.load(Ordering::Relaxed);
     let status = minutes_core::pid::status();
+    let processing_stage = state
+        .processing_stage
+        .lock()
+        .ok()
+        .and_then(|stage| stage.clone());
 
     // Get elapsed time if recording
-    let elapsed = if recording || status.recording {
+    let elapsed = if recording || (status.recording && !processing) {
         let start_path = minutes_core::notes::recording_start_path();
         if start_path.exists() {
             if let Ok(s) = std::fs::read_to_string(&start_path) {
@@ -213,14 +253,16 @@ pub fn cmd_status(state: tauri::State<AppState>) -> serde_json::Value {
         None
     };
 
-    let audio_level = if recording || status.recording {
+    let audio_level = if recording || (status.recording && !processing) {
         minutes_core::capture::audio_level()
     } else {
         0
     };
 
     serde_json::json!({
-        "recording": recording || status.recording,
+        "recording": recording || (status.recording && !processing),
+        "processing": processing,
+        "processingStage": processing_stage,
         "pid": status.pid,
         "elapsed": elapsed,
         "audioLevel": audio_level,
@@ -383,5 +425,17 @@ mod tests {
 
         assert!(removed);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn stage_label_maps_pipeline_stage_to_user_facing_copy() {
+        assert_eq!(
+            stage_label(minutes_core::pipeline::PipelineStage::Transcribing),
+            "Transcribing audio"
+        );
+        assert_eq!(
+            stage_label(minutes_core::pipeline::PipelineStage::Saving),
+            "Saving meeting"
+        );
     }
 }

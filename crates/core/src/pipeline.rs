@@ -23,6 +23,15 @@ use std::path::Path;
 // Phase 1b adds Diarize + Summarize with if-guards.
 // ──────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PipelineStage {
+    Transcribing,
+    Diarizing,
+    Summarizing,
+    Saving,
+}
+
 /// Process an audio file through the full pipeline.
 pub fn process(
     audio_path: &Path,
@@ -30,6 +39,19 @@ pub fn process(
     title: Option<&str>,
     config: &Config,
 ) -> Result<WriteResult, MinutesError> {
+    process_with_progress(audio_path, content_type, title, config, |_| {})
+}
+
+pub fn process_with_progress<F>(
+    audio_path: &Path,
+    content_type: ContentType,
+    title: Option<&str>,
+    config: &Config,
+    mut on_progress: F,
+) -> Result<WriteResult, MinutesError>
+where
+    F: FnMut(PipelineStage),
+{
     let start = std::time::Instant::now();
     tracing::info!(
         file = %audio_path.display(),
@@ -63,6 +85,7 @@ pub fn process(
     }
 
     // Step 1: Transcribe (always)
+    on_progress(PipelineStage::Transcribing);
     tracing::info!(step = "transcribe", file = %audio_path.display(), "transcribing audio");
     let step_start = std::time::Instant::now();
     let transcript = transcribe::transcribe(audio_path, config)?;
@@ -97,6 +120,7 @@ pub fn process(
 
     // Step 2: Diarize (optional — depends on config.diarization.engine)
     let transcript = if config.diarization.engine != "none" {
+        on_progress(PipelineStage::Diarizing);
         tracing::info!(step = "diarize", "running speaker diarization");
         if let Some(result) = diarize::diarize(audio_path, config) {
             diarize::apply_speakers(&transcript, &result)
@@ -118,6 +142,7 @@ pub fn process(
     let mut structured_decisions: Vec<markdown::Decision> = Vec::new();
 
     let summary: Option<String> = if config.summarization.engine != "none" {
+        on_progress(PipelineStage::Summarizing);
         tracing::info!(step = "summarize", "generating summary");
         let transcript_with_notes = if let Some(ref n) = user_notes {
             format!(
@@ -139,6 +164,7 @@ pub fn process(
     };
 
     // Step 4: Write markdown (always)
+    on_progress(PipelineStage::Saving);
     let duration = estimate_duration(audio_path);
     let auto_title = title
         .map(String::from)
