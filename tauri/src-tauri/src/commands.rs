@@ -13,6 +13,8 @@ pub struct AppState {
     pub processing_stage: Arc<Mutex<Option<String>>>,
     pub latest_output: Arc<Mutex<Option<OutputNotice>>>,
     pub completion_notifications_enabled: Arc<AtomicBool>,
+    pub global_hotkey_enabled: Arc<AtomicBool>,
+    pub global_hotkey_shortcut: Arc<Mutex<String>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -58,6 +60,70 @@ pub struct RecoveryItem {
     pub path: String,
     pub detail: String,
     pub retry_type: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HotkeyChoice {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HotkeySettings {
+    pub enabled: bool,
+    pub shortcut: String,
+    pub choices: Vec<HotkeyChoice>,
+}
+
+const HOTKEY_CHOICES: [(&str, &str); 3] = [
+    ("CmdOrCtrl+Shift+M", "Cmd/Ctrl + Shift + M"),
+    ("CmdOrCtrl+Shift+J", "Cmd/Ctrl + Shift + J"),
+    ("CmdOrCtrl+Shift+T", "Cmd/Ctrl + Shift + T"),
+];
+
+pub fn default_hotkey_shortcut() -> &'static str {
+    HOTKEY_CHOICES[0].0
+}
+
+fn hotkey_choices() -> Vec<HotkeyChoice> {
+    HOTKEY_CHOICES
+        .iter()
+        .map(|(value, label)| HotkeyChoice {
+            value: (*value).to_string(),
+            label: (*label).to_string(),
+        })
+        .collect()
+}
+
+fn validate_hotkey_shortcut(shortcut: &str) -> Result<String, String> {
+    HOTKEY_CHOICES
+        .iter()
+        .find_map(|(value, _)| (*value == shortcut).then(|| (*value).to_string()))
+        .ok_or_else(|| {
+            format!(
+                "Unsupported shortcut: {}. Choose one of: {}",
+                shortcut,
+                HOTKEY_CHOICES
+                    .iter()
+                    .map(|(_, label)| *label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn current_hotkey_settings(state: &AppState) -> HotkeySettings {
+    let shortcut = state
+        .global_hotkey_shortcut
+        .lock()
+        .ok()
+        .map(|value| value.clone())
+        .unwrap_or_else(|| default_hotkey_shortcut().to_string());
+    HotkeySettings {
+        enabled: state.global_hotkey_enabled.load(Ordering::Relaxed),
+        shortcut,
+        choices: hotkey_choices(),
+    }
 }
 
 fn preserve_failed_capture(wav_path: &std::path::Path, config: &Config) -> Option<PathBuf> {
@@ -222,6 +288,19 @@ fn maybe_show_completion_notification(
         "display notification \"{}\" with title \"Minutes\" subtitle \"{}\"",
         escape_applescript_literal(&body),
         escape_applescript_literal(&notice.title)
+    );
+
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .spawn();
+}
+
+fn show_hotkey_notification(title: &str, body: &str) {
+    let script = format!(
+        "display notification \"{}\" with title \"Minutes\" subtitle \"{}\"",
+        escape_applescript_literal(body),
+        escape_applescript_literal(title)
     );
 
     let _ = std::process::Command::new("osascript")
@@ -641,6 +720,55 @@ pub fn start_recording(
     recording.store(false, Ordering::Relaxed);
 }
 
+pub fn handle_global_hotkey(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    if !state.global_hotkey_enabled.load(Ordering::Relaxed) {
+        return;
+    }
+
+    if recording_active(&state.recording) {
+        if let Err(err) = request_stop(&state.recording, &state.stop_flag) {
+            show_hotkey_notification(
+                "Quick thought",
+                &format!("Could not stop recording: {}", err),
+            );
+        }
+        return;
+    }
+
+    if minutes_core::pid::status().processing || state.processing.load(Ordering::Relaxed) {
+        show_hotkey_notification(
+            "Quick thought",
+            "Minutes is still processing the previous capture. Finish that first.",
+        );
+        return;
+    }
+
+    state.recording.store(true, Ordering::Relaxed);
+    let rec = state.recording.clone();
+    let stop = state.stop_flag.clone();
+    let processing = state.processing.clone();
+    let processing_stage = state.processing_stage.clone();
+    let latest_output = state.latest_output.clone();
+    let completion_notifications_enabled = state.completion_notifications_enabled.clone();
+    let app_handle = app.clone();
+    let app_done = app.clone();
+    crate::update_tray_state(app, true);
+    std::thread::spawn(move || {
+        start_recording(
+            app_handle,
+            rec,
+            stop,
+            processing,
+            processing_stage,
+            latest_output,
+            completion_notifications_enabled,
+            CaptureMode::QuickThought,
+        );
+        crate::update_tray_state(&app_done, false);
+    });
+}
+
 #[tauri::command]
 pub fn cmd_start_recording(
     app: tauri::AppHandle,
@@ -797,6 +925,52 @@ pub fn cmd_set_completion_notifications(state: tauri::State<AppState>, enabled: 
     state
         .completion_notifications_enabled
         .store(enabled, Ordering::Relaxed);
+}
+
+#[tauri::command]
+pub fn cmd_global_hotkey_settings(state: tauri::State<AppState>) -> HotkeySettings {
+    current_hotkey_settings(&state)
+}
+
+#[tauri::command]
+pub fn cmd_set_global_hotkey(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    enabled: bool,
+    shortcut: String,
+) -> Result<HotkeySettings, String> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    let next_shortcut = validate_hotkey_shortcut(&shortcut)?;
+    let previous = current_hotkey_settings(&state);
+    let manager = app.global_shortcut();
+
+    if previous.enabled {
+        manager
+            .unregister(previous.shortcut.as_str())
+            .map_err(|e| format!("Could not unregister {}: {}", previous.shortcut, e))?;
+    }
+
+    if enabled {
+        if let Err(e) = manager.register(next_shortcut.as_str()) {
+            if previous.enabled {
+                let _ = manager.register(previous.shortcut.as_str());
+            }
+            return Err(format!(
+                "Could not register {}. Another app may already be using it. ({})",
+                next_shortcut, e
+            ));
+        }
+    }
+
+    state
+        .global_hotkey_enabled
+        .store(enabled, Ordering::Relaxed);
+    if let Ok(mut current) = state.global_hotkey_shortcut.lock() {
+        *current = next_shortcut;
+    }
+
+    Ok(current_hotkey_settings(&state))
 }
 
 #[tauri::command]
@@ -1114,5 +1288,18 @@ mod tests {
         assert_eq!(sections[1].heading, "Notes");
         assert_eq!(sections[2].heading, "Transcript");
         assert!(sections[2].content.contains("[0:00] Hi"));
+    }
+
+    #[test]
+    fn validate_hotkey_shortcut_accepts_known_values() {
+        assert_eq!(
+            validate_hotkey_shortcut("CmdOrCtrl+Shift+M").unwrap(),
+            "CmdOrCtrl+Shift+M"
+        );
+    }
+
+    #[test]
+    fn validate_hotkey_shortcut_rejects_unknown_values() {
+        assert!(validate_hotkey_shortcut("CmdOrCtrl+Shift+P").is_err());
     }
 }

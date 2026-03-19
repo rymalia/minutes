@@ -69,10 +69,22 @@ fn main() {
     let processing_stage = Arc::new(Mutex::new(None));
     let latest_output = Arc::new(Mutex::new(None));
     let completion_notifications_enabled = Arc::new(AtomicBool::new(true));
+    let global_hotkey_enabled = Arc::new(AtomicBool::new(false));
+    let global_hotkey_shortcut =
+        Arc::new(Mutex::new(commands::default_hotkey_shortcut().to_string()));
     let recording_clone = recording.clone();
     let stop_clone = stop_flag.clone();
 
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        commands::handle_global_hotkey(app);
+                    }
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .manage(commands::AppState {
             recording: recording.clone(),
@@ -81,6 +93,8 @@ fn main() {
             processing_stage: processing_stage.clone(),
             latest_output: latest_output.clone(),
             completion_notifications_enabled: completion_notifications_enabled.clone(),
+            global_hotkey_enabled: global_hotkey_enabled.clone(),
+            global_hotkey_shortcut: global_hotkey_shortcut.clone(),
         })
         .setup(move |app| {
             let initial_recording = minutes_core::pid::status().recording;
@@ -310,6 +324,8 @@ fn main() {
             commands::cmd_open_file,
             commands::cmd_clear_latest_output,
             commands::cmd_set_completion_notifications,
+            commands::cmd_global_hotkey_settings,
+            commands::cmd_set_global_hotkey,
             commands::cmd_permission_center,
             commands::cmd_recovery_items,
             commands::cmd_retry_recovery,

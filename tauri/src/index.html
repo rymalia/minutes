@@ -782,6 +782,33 @@
       min-width: 94px;
     }
 
+    .shortcut-select {
+      width: 100%;
+      margin-top: 8px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--bg-elevated);
+      color: var(--text);
+      font: inherit;
+      font-size: 12px;
+      padding: 8px 10px;
+    }
+
+    .about-controls-group {
+      flex: 1;
+    }
+
+    .about-controls-meta {
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--text-tertiary);
+      line-height: 1.45;
+    }
+
+    .about-controls-meta.error {
+      color: #ff9f0a;
+    }
+
     /* ── Readiness view ── */
     .readiness-overlay {
       position: fixed;
@@ -1304,6 +1331,16 @@
         </div>
         <button class="btn btn-secondary btn-sm toggle-btn" id="btn-toggle-cues">On</button>
       </div>
+      <div class="about-controls">
+        <div class="about-controls-group">
+          <div class="about-controls-copy">
+            Opt-in global shortcut for quick-thought capture. Minutes starts a quick thought when idle, then stops the active capture on the next press.
+          </div>
+          <select class="shortcut-select" id="select-hotkey-shortcut"></select>
+          <div class="about-controls-meta" id="hotkey-status">Off by default. If the shortcut is already owned by another app, Minutes leaves it disabled.</div>
+        </div>
+        <button class="btn btn-secondary btn-sm toggle-btn" id="btn-toggle-hotkey">Off</button>
+      </div>
     </div>
   </div>
 
@@ -1430,6 +1467,9 @@
     const aboutOverlay = document.getElementById('about-overlay');
     const notificationToggle = document.getElementById('btn-toggle-notifications');
     const cueToggle = document.getElementById('btn-toggle-cues');
+    const hotkeyToggle = document.getElementById('btn-toggle-hotkey');
+    const hotkeySelect = document.getElementById('select-hotkey-shortcut');
+    const hotkeyStatus = document.getElementById('hotkey-status');
     const readinessOverlay = document.getElementById('readiness-overlay');
     const readinessButton = document.getElementById('btn-readiness');
     const readinessScroll = document.getElementById('readiness-scroll');
@@ -1450,6 +1490,8 @@
     let recoveryItems = [];
     let notifyOnCompletion = true;
     let playCaptureCues = true;
+    let hotkeyEnabled = false;
+    let hotkeyShortcut = 'CmdOrCtrl+Shift+M';
     let lastOutputKey = null;
     let pollInterval = null;
     const NUM_BARS = 32;
@@ -1614,6 +1656,70 @@
       cueToggle.classList.toggle('btn-primary', enabled);
       cueToggle.classList.toggle('btn-secondary', !enabled);
       localStorage.setItem('minutes.playCaptureCues', enabled ? 'true' : 'false');
+    }
+
+    function setHotkeyStatus(text, isError = false) {
+      hotkeyStatus.textContent = text;
+      hotkeyStatus.classList.toggle('error', isError);
+    }
+
+    function setHotkeyToggle(enabled) {
+      hotkeyEnabled = enabled;
+      hotkeyToggle.textContent = enabled ? 'On' : 'Off';
+      hotkeyToggle.classList.toggle('btn-primary', enabled);
+      hotkeyToggle.classList.toggle('btn-secondary', !enabled);
+      localStorage.setItem('minutes.globalHotkeyEnabled', enabled ? 'true' : 'false');
+      setHotkeyStatus(
+        enabled
+          ? `Enabled for ${hotkeyShortcut}. Press once to start a quick thought, then again to stop the active capture.`
+          : 'Off by default. If another app already owns the shortcut, Minutes leaves it disabled.',
+        false
+      );
+    }
+
+    function applyHotkeySettings(settings) {
+      hotkeySelect.replaceChildren();
+      for (const choice of settings.choices || []) {
+        const option = document.createElement('option');
+        option.value = choice.value;
+        option.textContent = choice.label;
+        hotkeySelect.appendChild(option);
+      }
+
+      hotkeyShortcut = settings.shortcut || hotkeyShortcut;
+      hotkeySelect.value = hotkeyShortcut;
+      setHotkeyToggle(!!settings.enabled);
+    }
+
+    async function syncHotkey(enabled, shortcut) {
+      try {
+        const settings = await invoke('cmd_set_global_hotkey', { enabled, shortcut });
+        hotkeyShortcut = settings.shortcut;
+        localStorage.setItem('minutes.globalHotkeyShortcut', hotkeyShortcut);
+        applyHotkeySettings(settings);
+      } catch (e) {
+        console.error('Set hotkey:', e);
+        hotkeyEnabled = false;
+        localStorage.setItem('minutes.globalHotkeyEnabled', 'false');
+        hotkeyToggle.textContent = 'Off';
+        hotkeyToggle.classList.remove('btn-primary');
+        hotkeyToggle.classList.add('btn-secondary');
+        setHotkeyStatus(String(e), true);
+      }
+    }
+
+    async function loadHotkeySettings() {
+      try {
+        const settings = await invoke('cmd_global_hotkey_settings');
+        hotkeyShortcut =
+          localStorage.getItem('minutes.globalHotkeyShortcut') || settings.shortcut || hotkeyShortcut;
+        const storedEnabled = localStorage.getItem('minutes.globalHotkeyEnabled');
+        const desiredEnabled = storedEnabled === null ? !!settings.enabled : storedEnabled === 'true';
+        await syncHotkey(desiredEnabled, hotkeyShortcut);
+      } catch (e) {
+        console.error('Load hotkey settings:', e);
+        setHotkeyStatus('Global shortcut is unavailable right now.', true);
+      }
     }
 
     function closeReadiness() {
@@ -1854,6 +1960,14 @@
 
     cueToggle.addEventListener('click', () => {
       setCueToggle(!playCaptureCues);
+    });
+
+    hotkeyToggle.addEventListener('click', async () => {
+      await syncHotkey(!hotkeyEnabled, hotkeySelect.value || hotkeyShortcut);
+    });
+
+    hotkeySelect.addEventListener('change', async () => {
+      await syncHotkey(hotkeyEnabled, hotkeySelect.value || hotkeyShortcut);
     });
 
     recoveryButton.addEventListener('click', () => {
@@ -2370,6 +2484,7 @@
     invoke('cmd_set_completion_notifications', { enabled: notifyOnCompletion }).catch((e) => {
       console.error('Init notifications:', e);
     });
+    loadHotkeySettings();
     checkSetup();
     checkStatus();
     loadReadinessItems();
