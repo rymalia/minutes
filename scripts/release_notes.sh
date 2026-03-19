@@ -13,17 +13,20 @@ from_ref="${3:-}"
 pick_previous_tag() {
   local channel="$1"
   local to_ref="$2"
-  local pattern
+  local current_tag
+
+  current_tag="$(git describe --tags --exact-match "$to_ref" 2>/dev/null || true)"
 
   if [[ "$channel" == "preview" ]]; then
-    pattern='v*-*'
+    git tag --list 'v*-*' --merged "$to_ref" --sort=-creatordate |
+      grep -Fxv "$current_tag" |
+      head -n 1
   else
-    pattern='v[0-9]*'
+    git tag --list 'v*' --merged "$to_ref" --sort=-creatordate |
+      grep -v '-' |
+      grep -Fxv "$current_tag" |
+      head -n 1
   fi
-
-  git tag --list "$pattern" --merged "$to_ref" --sort=-creatordate |
-    grep -Fxv "$(git describe --tags --exact-match "$to_ref" 2>/dev/null || true)" |
-    head -n 1
 }
 
 if ! git rev-parse --verify "${to_ref}^{commit}" >/dev/null 2>&1; then
