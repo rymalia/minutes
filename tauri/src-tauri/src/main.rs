@@ -64,6 +64,7 @@ pub fn update_tray_state(app: &tauri::AppHandle, is_recording: bool) {
 
 fn main() {
     let recording = Arc::new(AtomicBool::new(false));
+    let starting = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let processing = Arc::new(AtomicBool::new(false));
     let processing_stage = Arc::new(Mutex::new(None));
@@ -88,6 +89,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .manage(commands::AppState {
             recording: recording.clone(),
+            starting: starting.clone(),
             stop_flag: stop_flag.clone(),
             processing: processing.clone(),
             processing_stage: processing_stage.clone(),
@@ -192,14 +194,14 @@ fn main() {
                             if commands::recording_active(&recording) {
                                 return;
                             }
-                            rec_item.set_text("Recording...").ok();
+                            rec_item.set_text("Starting...").ok();
                             rec_item.set_enabled(false).ok();
                             quick_item.set_enabled(false).ok();
                             stp_item.set_enabled(true).ok();
-                            update_tray_state(app, true);
                             let app_handle = app.clone();
                             let app_done = app.clone();
                             let rec = recording.clone();
+                            let starting = starting.clone();
                             let sf = stop.clone();
                             let processing = processing.clone();
                             let processing_stage = processing_stage.clone();
@@ -212,6 +214,7 @@ fn main() {
                                 commands::start_recording(
                                     app_handle,
                                     rec,
+                                    starting,
                                     sf,
                                     processing,
                                     processing_stage,
@@ -233,13 +236,13 @@ fn main() {
                                 return;
                             }
                             rec_item.set_enabled(false).ok();
-                            quick_item.set_text("Quick Thought…").ok();
+                            quick_item.set_text("Starting Quick Thought…").ok();
                             quick_item.set_enabled(false).ok();
                             stp_item.set_enabled(true).ok();
-                            update_tray_state(app, true);
                             let app_handle = app.clone();
                             let app_done = app.clone();
                             let rec = recording.clone();
+                            let starting = starting.clone();
                             let sf = stop.clone();
                             let processing = processing.clone();
                             let processing_stage = processing_stage.clone();
@@ -253,6 +256,7 @@ fn main() {
                                 commands::start_recording(
                                     app_handle,
                                     rec,
+                                    starting,
                                     sf,
                                     processing,
                                     processing_stage,

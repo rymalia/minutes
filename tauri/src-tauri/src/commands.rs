@@ -8,6 +8,7 @@ use tauri::Manager;
 
 pub struct AppState {
     pub recording: Arc<AtomicBool>,
+    pub starting: Arc<AtomicBool>,
     pub stop_flag: Arc<AtomicBool>,
     pub processing: Arc<AtomicBool>,
     pub processing_stage: Arc<Mutex<Option<String>>>,
@@ -761,6 +762,7 @@ fn scan_recovery_items(config: &Config) -> Vec<RecoveryItem> {
 pub fn start_recording(
     app_handle: tauri::AppHandle,
     recording: Arc<AtomicBool>,
+    starting: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     processing: Arc<AtomicBool>,
     processing_stage: Arc<Mutex<Option<String>>>,
@@ -770,18 +772,13 @@ pub fn start_recording(
     discard_short_hotkey_capture: Option<Arc<AtomicBool>>,
     mode: CaptureMode,
 ) {
-    recording.store(true, Ordering::Relaxed);
-    stop_flag.store(false, Ordering::Relaxed);
-    processing.store(false, Ordering::Relaxed);
-    set_processing_stage(&processing_stage, None);
-    set_latest_output(&latest_output, None);
-    minutes_core::pid::clear_processing_status().ok();
-
     let config = Config::load();
     let wav_path = minutes_core::pid::current_wav_path();
 
     if let Err(e) = minutes_core::pid::create() {
         eprintln!("Failed to create PID: {}", e);
+        show_user_notification("Recording", &format!("Could not start recording: {}", e));
+        starting.store(false, Ordering::Relaxed);
         recording.store(false, Ordering::Relaxed);
         reset_hotkey_capture_state(
             hotkey_runtime.as_ref(),
@@ -789,7 +786,15 @@ pub fn start_recording(
         );
         return;
     }
+    starting.store(false, Ordering::Relaxed);
+    recording.store(true, Ordering::Relaxed);
+    stop_flag.store(false, Ordering::Relaxed);
+    processing.store(false, Ordering::Relaxed);
+    set_processing_stage(&processing_stage, None);
+    set_latest_output(&latest_output, None);
+    minutes_core::pid::clear_processing_status().ok();
     minutes_core::pid::write_recording_metadata(mode).ok();
+    crate::update_tray_state(&app_handle, true);
 
     minutes_core::notes::save_recording_start().ok();
     eprintln!("{} started...", mode.noun());
@@ -926,6 +931,7 @@ pub fn start_recording(
     set_processing_stage(&processing_stage, None);
     minutes_core::pid::clear_processing_status().ok();
     minutes_core::pid::clear_recording_metadata().ok();
+    starting.store(false, Ordering::Relaxed);
     recording.store(false, Ordering::Relaxed);
     reset_hotkey_capture_state(
         hotkey_runtime.as_ref(),
@@ -935,7 +941,7 @@ pub fn start_recording(
 
 fn spawn_hotkey_recording(app: &tauri::AppHandle, style: HotkeyCaptureStyle) {
     let state = app.state::<AppState>();
-    state.recording.store(true, Ordering::Relaxed);
+    state.starting.store(true, Ordering::Relaxed);
     if let Ok(mut runtime) = state.hotkey_runtime.lock() {
         runtime.active_capture = Some(style);
         runtime.recording_started_at = Some(Instant::now());
@@ -944,6 +950,7 @@ fn spawn_hotkey_recording(app: &tauri::AppHandle, style: HotkeyCaptureStyle) {
         .discard_short_hotkey_capture
         .store(false, Ordering::Relaxed);
     let rec = state.recording.clone();
+    let starting = state.starting.clone();
     let stop = state.stop_flag.clone();
     let processing = state.processing.clone();
     let processing_stage = state.processing_stage.clone();
@@ -953,11 +960,11 @@ fn spawn_hotkey_recording(app: &tauri::AppHandle, style: HotkeyCaptureStyle) {
     let discard_short_hotkey_capture = state.discard_short_hotkey_capture.clone();
     let app_handle = app.clone();
     let app_done = app.clone();
-    crate::update_tray_state(app, true);
     std::thread::spawn(move || {
         start_recording(
             app_handle,
             rec,
+            starting,
             stop,
             processing,
             processing_stage,
@@ -1101,23 +1108,24 @@ pub fn cmd_start_recording(
     state: tauri::State<AppState>,
     mode: Option<String>,
 ) -> Result<(), String> {
-    if recording_active(&state.recording) {
+    if recording_active(&state.recording) || state.starting.load(Ordering::Relaxed) {
         return Err("Already recording".into());
     }
     let capture_mode = parse_capture_mode(mode.as_deref())?;
-    state.recording.store(true, Ordering::Relaxed);
+    state.starting.store(true, Ordering::Relaxed);
     let rec = state.recording.clone();
+    let starting = state.starting.clone();
     let stop = state.stop_flag.clone();
     let processing = state.processing.clone();
     let processing_stage = state.processing_stage.clone();
     let latest_output = state.latest_output.clone();
     let completion_notifications_enabled = state.completion_notifications_enabled.clone();
-    crate::update_tray_state(&app, true);
     let app_done = app.clone();
     std::thread::spawn(move || {
         start_recording(
             app,
             rec,
+            starting,
             stop,
             processing,
             processing_stage,
