@@ -1219,12 +1219,12 @@ mod tests {
         create_test_file(
             dir.path(),
             "2026-03-01-a.md",
-            "---\ntitle: Pricing Decision\ntype: meeting\ndate: 2026-03-01T12:00:00-07:00\nduration: 30m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions:\n  - text: Launch pricing at monthly billing per month.\n    topic: The Pricing Strategy\nintents: []\n---\n\n## Transcript\n\nPricing discussion.\n",
+            "---\ntitle: Pricing Decision\ntype: meeting\ndate: 2026-03-01T12:00:00-07:00\nduration: 30m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions:\n  - text: Launch pricing at 399 per month\n    topic: pricing strategy\nintents: []\n---\n\n## Transcript\n\nPricing discussion.\n",
         );
         create_test_file(
             dir.path(),
             "2026-03-12-b.md",
-            "---\ntitle: Pricing Follow-up\ntype: meeting\ndate: 2026-03-12T12:00:00-07:00\nduration: 30m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions:\n  - text: Launch pricing at 399 per month\n    topic: pricing strategy\nintents: []\n---\n\n## Transcript\n\nPricing repeated.\n",
+            "---\ntitle: Pricing Follow-up\ntype: meeting\ndate: 2026-03-12T12:00:00-07:00\nduration: 30m\nstatus: complete\ntags: []\nattendees: []\npeople: []\naction_items: []\ndecisions:\n  - text: Launch pricing at 399 per month.\n    topic: pricing strategy\nintents: []\n---\n\n## Transcript\n\nPricing repeated.\n",
         );
 
         let config = Config {
@@ -1255,8 +1255,8 @@ mod tests {
             ..Config::default()
         };
 
-        let profile = person_profile(&config, "sarah").unwrap();
-        assert_eq!(profile.name, "sarah");
+        let profile = person_profile(&config, "alex").unwrap();
+        assert_eq!(profile.name, "alex");
         assert_eq!(profile.recent_meetings.len(), 2);
         assert_eq!(profile.open_intents.len(), 2);
         assert_eq!(profile.recent_decisions.len(), 1);

@@ -667,7 +667,7 @@ COMMITMENTS:
         assert_eq!(summary.action_items.len(), 2);
         assert_eq!(summary.open_questions.len(), 1);
         assert_eq!(summary.commitments.len(), 1);
-        assert!(summary.action_items[0].contains("@mat"));
+        assert!(summary.action_items[0].contains("@user"));
     }
 
     #[test]

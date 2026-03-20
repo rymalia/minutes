@@ -330,7 +330,7 @@ mod tests {
         let slug = generate_slug("Q2 Planning Discussion", date);
         let prefix = date.format("%Y-%m-%d").to_string();
         assert!(slug.starts_with(&prefix));
-        assert!(slug.contains("advisor-pricing-discussion"));
+        assert!(slug.contains("q2-planning-discussion"));
         assert!(slug.ends_with(".md"));
     }
 

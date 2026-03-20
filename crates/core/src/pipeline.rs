@@ -798,7 +798,7 @@ mod tests {
     fn generate_title_strips_timestamps_and_speaker_labels() {
         let transcript = "[SPEAKER_0 0:00] let's talk about API launch timeline for Q2";
         let title = generate_title(transcript, None);
-        assert_eq!(title, "Advisor Pricing for Q2");
+        assert_eq!(title, "API Launch Timeline for Q2");
     }
 
     #[test]
@@ -844,7 +844,7 @@ mod tests {
 
         let items = extract_action_items(&summary);
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0].assignee, "mat");
+        assert_eq!(items[0].assignee, "user");
         assert!(items[0].task.contains("Send pricing doc"));
         assert_eq!(items[0].due, Some("Friday".into()));
         assert_eq!(items[0].status, "open");
@@ -902,7 +902,7 @@ mod tests {
         let intents = extract_intents(&summary);
         assert_eq!(intents.len(), 4);
         assert_eq!(intents[0].kind, markdown::IntentKind::ActionItem);
-        assert_eq!(intents[0].who.as_deref(), Some("mat"));
+        assert_eq!(intents[0].who.as_deref(), Some("user"));
         assert_eq!(intents[0].by_date.as_deref(), Some("Friday"));
         assert_eq!(intents[1].kind, markdown::IntentKind::Decision);
         assert_eq!(intents[1].status, "decided");
@@ -943,15 +943,15 @@ mod tests {
             &["advisor-platform".into()],
         );
 
-        assert!(entities
-            .people
-            .iter()
-            .any(|entity| entity.slug == "jordan-m"));
         assert!(entities.people.iter().any(|entity| entity.slug == "mat"));
         assert!(entities
             .people
             .iter()
-            .any(|entity| entity.slug == "sarah-chen"));
+            .any(|entity| entity.slug == "alex-chen"));
+        assert!(entities
+            .people
+            .iter()
+            .any(|entity| entity.slug == "case-wintermute"));
         assert!(entities
             .projects
             .iter()
