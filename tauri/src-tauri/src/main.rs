@@ -22,6 +22,7 @@ fn show_main_window(app: &tauri::AppHandle) {
         .title("Minutes")
         .inner_size(480.0, 640.0)
         .min_inner_size(380.0, 480.0)
+        .content_protected(true)
         .center()
         .focused(true)
         .build();
@@ -37,6 +38,7 @@ fn show_note_window(app: &tauri::AppHandle) {
         .title("Add Note")
         .inner_size(360.0, 200.0)
         .resizable(false)
+        .content_protected(true)
         .always_on_top(true)
         .center()
         .focused(true)
@@ -65,6 +67,7 @@ pub fn show_terminal_window(app: &tauri::AppHandle, session_id: &str, title: &st
         .title(title)
         .inner_size(900.0, 600.0)
         .min_inner_size(600.0, 400.0)
+        .content_protected(true)
         .center()
         .focused(true)
         .build()
