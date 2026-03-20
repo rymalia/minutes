@@ -1465,6 +1465,17 @@
     <button class="btn btn-primary btn-sm" id="btn-record-upcoming">Record</button>
   </div>
 
+  <!-- Call detected banner -->
+  <div class="call-detected" id="call-detected-banner">
+    <div class="call-detected-icon">📞</div>
+    <div class="call-detected-info">
+      <div class="call-detected-title" id="call-detected-title">Call detected</div>
+      <div class="call-detected-subtitle">Tap to start recording</div>
+    </div>
+    <button class="btn btn-primary btn-sm" id="btn-record-call">Record</button>
+    <button class="btn btn-secondary btn-sm" id="btn-dismiss-call">Dismiss</button>
+  </div>
+
   <!-- Meeting list -->
   <div class="meetings-scroll" id="meetings-scroll">
     <div class="empty-state">
@@ -2883,10 +2894,14 @@
         agentCmdRow.style.display = s.summarization.engine === 'agent' ? '' : 'none';
         const agentCmdSel = document.getElementById('settings-agent-command');
         const sumAgents = await invoke('cmd_list_agents');
+        const currentCmd = s.summarization.agent_command || 'claude';
         agentCmdSel.innerHTML = '';
         for (const a of sumAgents) { const o = document.createElement('option'); o.value = a.name; o.textContent = a.name; agentCmdSel.appendChild(o); }
-        agentCmdSel.value = s.summarization.agent_command || 'claude';
-        document.getElementById('settings-agent-command-status').textContent = sumAgents.find(a => a.name === agentCmdSel.value) ? 'Installed' : 'Not found on this machine';
+        if (!sumAgents.find(a => a.name === currentCmd)) {
+          const o = document.createElement('option'); o.value = currentCmd; o.textContent = currentCmd + ' (custom)'; agentCmdSel.appendChild(o);
+        }
+        agentCmdSel.value = currentCmd;
+        document.getElementById('settings-agent-command-status').textContent = sumAgents.find(a => a.name === currentCmd) ? 'Installed' : 'Custom command';
         setSettingsToggle('settings-screen-context', s.screen_context.enabled);
         document.getElementById('settings-screen-interval-row').style.display = s.screen_context.enabled ? '' : 'none';
         document.getElementById('settings-screen-interval').value = String(s.screen_context.interval_secs);
@@ -3234,6 +3249,39 @@
       if (mode === 'prep') setRecallPhase('prep', context);
       else if (mode === 'debrief') setRecallPhase('debrief', context);
     }
+
+    // ── Call detection banner ──
+    const callBanner = document.getElementById('call-detected-banner');
+    const callTitle = document.getElementById('call-detected-title');
+    let callBannerTimeout = null;
+
+    currentWindow.listen('call:detected', (event) => {
+      const { app_name } = event.payload;
+      callTitle.textContent = `${app_name} call detected`;
+      callBanner.classList.add('active');
+
+      // Show the main window so user sees the banner
+      currentWindow.show();
+      currentWindow.setFocus();
+
+      // Auto-dismiss after 30s
+      clearTimeout(callBannerTimeout);
+      callBannerTimeout = setTimeout(() => {
+        callBanner.classList.remove('active');
+      }, 30000);
+    });
+
+    document.getElementById('btn-record-call').addEventListener('click', async () => {
+      callBanner.classList.remove('active');
+      clearTimeout(callBannerTimeout);
+      // Start recording via the existing record button handler
+      document.getElementById('btn-record').click();
+    });
+
+    document.getElementById('btn-dismiss-call').addEventListener('click', () => {
+      callBanner.classList.remove('active');
+      clearTimeout(callBannerTimeout);
+    });
 
     // ── Listen for recall:expand events from Rust backend ──
     currentWindow.listen('recall:expand', (event) => {

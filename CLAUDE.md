@@ -48,7 +48,7 @@ minutes/
 ├── BUILD-STATUS.md            # Build progress tracker
 ├── Cargo.toml                 # Workspace root
 ├── crates/
-│   ├── core/src/              # 15 Rust modules — the engine
+│   ├── core/src/              # 16 Rust modules — the engine
 │   │   ├── capture.rs         # Audio capture (cpal)
 │   │   ├── transcribe.rs      # Whisper.cpp + symphonia format conversion
 │   │   ├── diarize.rs         # Pyannote subprocess
@@ -118,8 +118,8 @@ node test/mcp_tools_test.mjs                        # 8 MCP integration tests
 
 ## Test Coverage
 
-78 tests total:
-- 57 unit tests (all core modules)
+94 tests total:
+- 81 unit tests (all core modules including screen, calendar, config)
 - 8 integration tests (pipeline, permissions, collisions, search filters)
 - 2 real whisper tests (transcription + no-speech detection with tiny model)
 - 8 MCP integration tests (CLI JSON output, TypeScript compilation)
