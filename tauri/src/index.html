@@ -1362,6 +1362,21 @@
       color: var(--accent);
       font-weight: 500;
     }
+
+    /* ── Call detected banner ── */
+    .call-detected {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 20px;
+      background: rgba(48, 209, 88, 0.08);
+      border-bottom: 1px solid rgba(48, 209, 88, 0.15);
+    }
+    .call-detected.active { display: flex; }
+    .call-detected-icon { font-size: 16px; flex-shrink: 0; }
+    .call-detected-info { flex: 1; min-width: 0; }
+    .call-detected-title { font-size: 12px; font-weight: 500; color: var(--text); }
+    .call-detected-subtitle { font-size: 11px; color: var(--green); font-weight: 500; }
   </style>
 </head>
 <body>
@@ -1672,6 +1687,14 @@
               <option value="openai">OpenAI API — direct API key (legacy)</option>
             </select>
             <div class="about-controls-meta" id="settings-summarization-status"></div>
+          </div>
+        </div>
+        <div class="about-controls" id="settings-agent-command-row" style="display: none;">
+          <div class="about-controls-group">
+            <div class="about-controls-copy">Agent command</div>
+            <select id="settings-agent-command" style="margin-top: 6px; width: 100%; padding: 6px 8px; border-radius: 8px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); color: var(--text); font-size: 13px;">
+            </select>
+            <div class="about-controls-meta" id="settings-agent-command-status"></div>
           </div>
         </div>
       </div>
@@ -2855,6 +2878,15 @@
         setSettingsToggle('settings-diarization', s.diarization.engine !== 'none');
         document.getElementById('settings-summarization-engine').value = s.summarization.engine;
         updateSumStatus(s);
+        // Agent command picker (visible when engine = "agent")
+        const agentCmdRow = document.getElementById('settings-agent-command-row');
+        agentCmdRow.style.display = s.summarization.engine === 'agent' ? '' : 'none';
+        const agentCmdSel = document.getElementById('settings-agent-command');
+        const sumAgents = await invoke('cmd_list_agents');
+        agentCmdSel.innerHTML = '';
+        for (const a of sumAgents) { const o = document.createElement('option'); o.value = a.name; o.textContent = a.name; agentCmdSel.appendChild(o); }
+        agentCmdSel.value = s.summarization.agent_command || 'claude';
+        document.getElementById('settings-agent-command-status').textContent = sumAgents.find(a => a.name === agentCmdSel.value) ? 'Installed' : 'Not found on this machine';
         setSettingsToggle('settings-screen-context', s.screen_context.enabled);
         document.getElementById('settings-screen-interval-row').style.display = s.screen_context.enabled ? '' : 'none';
         document.getElementById('settings-screen-interval').value = String(s.screen_context.interval_secs);
@@ -2894,7 +2926,13 @@
     });
     document.getElementById('settings-summarization-engine').addEventListener('change', async (e) => {
       await invoke('cmd_set_setting', {section:'summarization',key:'engine',value:e.target.value});
+      document.getElementById('settings-agent-command-row').style.display = e.target.value === 'agent' ? '' : 'none';
       const s = await invoke('cmd_get_settings'); updateSumStatus(s);
+    });
+    document.getElementById('settings-agent-command').addEventListener('change', async (e) => {
+      await invoke('cmd_set_setting', {section:'summarization',key:'agent_command',value:e.target.value});
+      const agents = await invoke('cmd_list_agents');
+      document.getElementById('settings-agent-command-status').textContent = agents.find(a => a.name === e.target.value) ? 'Installed' : 'Not found on this machine';
     });
     document.getElementById('settings-screen-context').addEventListener('click', async () => {
       const s = await invoke('cmd_get_settings');
