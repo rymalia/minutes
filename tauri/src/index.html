@@ -2888,7 +2888,7 @@
         document.getElementById('settings-config-path').textContent = s.config_path;
         // General: sync with existing app state
         setSettingsToggle('settings-notifications', notifyOnCompletion);
-        setSettingsToggle('settings-cues', typeof cuesEnabled !== 'undefined' ? cuesEnabled : true);
+        setSettingsToggle('settings-cues', playCaptureCues);
         setSettingsToggle('settings-hotkey', hotkeyEnabled);
         // Populate hotkey shortcut dropdown from existing choices
         const hkSettings = await invoke('cmd_global_hotkey_settings').catch(() => null);
@@ -2960,10 +2960,8 @@
       try { await invoke('cmd_set_completion_notifications', { enabled: next }); setNotificationToggle(next); setSettingsToggle('settings-notifications', next); } catch(e) { console.error(e); }
     });
     document.getElementById('settings-cues').addEventListener('click', () => {
-      cuesEnabled = !cuesEnabled;
-      localStorage.setItem('minutes.cuesEnabled', cuesEnabled);
-      setCueToggle(cuesEnabled);
-      setSettingsToggle('settings-cues', cuesEnabled);
+      setCueToggle(!playCaptureCues);
+      setSettingsToggle('settings-cues', playCaptureCues);
     });
     document.getElementById('settings-hotkey').addEventListener('click', async () => {
       const shortcut = document.getElementById('settings-hotkey-shortcut').value || hotkeyShortcut;
