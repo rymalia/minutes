@@ -22,6 +22,7 @@ pub struct Summary {
     pub open_questions: Vec<String>,
     pub commitments: Vec<String>,
     pub key_points: Vec<String>,
+    pub participants: Vec<String>,
 }
 
 /// Summarize a transcript using the configured LLM engine.
@@ -128,6 +129,7 @@ const SYSTEM_PROMPT: &str = r#"You are a meeting summarizer. Given a transcript,
 3. Action items (tasks assigned to specific people, with deadlines if mentioned)
 4. Open questions (unresolved questions or unknowns that still need follow-up)
 5. Commitments (explicit promises, commitments, or owner statements made by someone)
+6. Participants (names of people present or mentioned in the conversation)
 
 Respond in this exact format:
 
@@ -145,7 +147,10 @@ OPEN QUESTIONS:
 - question 1
 
 COMMITMENTS:
-- @person: commitment description (by deadline if mentioned)"#;
+- @person: commitment description (by deadline if mentioned)
+
+PARTICIPANTS:
+- Name (role if mentioned)"#;
 
 fn build_prompt(transcript: &str, chunk_max_tokens: usize) -> Vec<String> {
     // Rough token estimate: ~4 chars per token
@@ -180,6 +185,7 @@ fn parse_summary_response(response: &str) -> Summary {
     let mut action_items = Vec::new();
     let mut open_questions = Vec::new();
     let mut commitments = Vec::new();
+    let mut participants_raw = Vec::new();
     let mut current_section = "";
 
     for line in response.lines() {
@@ -200,6 +206,9 @@ fn parse_summary_response(response: &str) -> Summary {
         } else if trimmed.starts_with("COMMITMENTS:") {
             current_section = "commitments";
             continue;
+        } else if trimmed.starts_with("PARTICIPANTS:") {
+            current_section = "participants";
+            continue;
         }
 
         if let Some(item) = trimmed.strip_prefix("- ") {
@@ -209,10 +218,24 @@ fn parse_summary_response(response: &str) -> Summary {
                 "action_items" => action_items.push(item.to_string()),
                 "open_questions" => open_questions.push(item.to_string()),
                 "commitments" => commitments.push(item.to_string()),
+                "participants" => participants_raw.push(item.to_string()),
                 _ => {}
             }
         }
     }
+
+    // Strip role annotations: "Dan (patent attorney)" → "Dan"
+    let participants = participants_raw
+        .into_iter()
+        .map(|p| {
+            if let Some(paren) = p.find(" (") {
+                p[..paren].trim().to_string()
+            } else {
+                p.trim().to_string()
+            }
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
 
     Summary {
         text: if key_points.is_empty() {
@@ -225,6 +248,7 @@ fn parse_summary_response(response: &str) -> Summary {
         open_questions,
         commitments,
         key_points,
+        participants,
     }
 }
 
@@ -751,6 +775,24 @@ COMMITMENTS:
     }
 
     #[test]
+    fn parse_summary_response_extracts_participants() {
+        let response = "\
+KEY POINTS:
+- Discussed the patent
+
+PARTICIPANTS:
+- Dan (patent attorney)
+- Catherine
+- Mat (demo/dev)";
+
+        let summary = parse_summary_response(response);
+        assert_eq!(summary.participants.len(), 3);
+        assert_eq!(summary.participants[0], "Dan");
+        assert_eq!(summary.participants[1], "Catherine");
+        assert_eq!(summary.participants[2], "Mat");
+    }
+
+    #[test]
     fn format_summary_produces_markdown() {
         let summary = Summary {
             text: String::new(),
@@ -759,6 +801,7 @@ COMMITMENTS:
             action_items: vec!["@user: Do the thing".into()],
             open_questions: vec!["Should we grandfather current customers?".into()],
             commitments: vec!["@case: Share the rollout plan by Friday".into()],
+            participants: vec!["User".into(), "Case".into()],
         };
         let md = format_summary(&summary);
         assert!(md.contains("- Point one"));

@@ -156,6 +156,8 @@ where
         vec![]
     };
 
+    let mut summary_participants: Vec<String> = Vec::new();
+
     let summary: Option<String> = if config.summarization.engine != "none" {
         on_progress(PipelineStage::Summarizing);
         tracing::info!(step = "summarize", "generating summary");
@@ -175,6 +177,13 @@ where
             structured_actions = extract_action_items(&s);
             structured_decisions = extract_decisions(&s);
             structured_intents = extract_intents(&s);
+            summary_participants = s.participants.clone();
+            if !summary_participants.is_empty() {
+                tracing::info!(
+                    participants = ?summary_participants,
+                    "extracted participants from summary"
+                );
+            }
             summarize::format_summary(&s)
         })
     } else {
@@ -189,8 +198,43 @@ where
         tracing::info!(dir = %screen_dir.display(), "screen captures cleaned up");
     }
 
-    // Step 4: Write markdown (always)
+    // Step 4: Match calendar event + merge attendees
     on_progress(PipelineStage::Saving);
+
+    // Query calendar for events overlapping the recording window
+    let calendar_events = if content_type == ContentType::Meeting {
+        crate::calendar::events_overlapping_now()
+    } else {
+        Vec::new()
+    };
+
+    // Pick the best matching calendar event (closest to now, or the one currently happening)
+    let matched_event = calendar_events.first();
+    let calendar_event_title = matched_event.map(|e| e.title.clone());
+    let calendar_attendees: Vec<String> = matched_event
+        .map(|e| e.attendees.clone())
+        .unwrap_or_default();
+
+    if let Some(ref title) = calendar_event_title {
+        tracing::info!(event = %title, attendees = calendar_attendees.len(), "matched calendar event");
+    }
+
+    // Merge attendees: calendar + transcript participants (deduplicate, case-insensitive)
+    let mut attendees: Vec<String> = Vec::new();
+    let mut seen_lower: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for name in calendar_attendees.iter().chain(summary_participants.iter()) {
+        let lower = name.to_lowercase();
+        if !lower.is_empty() && seen_lower.insert(lower) {
+            attendees.push(name.clone());
+        }
+    }
+
+    if !attendees.is_empty() {
+        tracing::info!(attendees = ?attendees, "merged attendee list");
+    }
+
+    // Step 5: Write markdown (always)
     let duration = estimate_duration(audio_path);
     let auto_title = title
         .map(String::from)
@@ -198,7 +242,7 @@ where
     let entities = build_entity_links(
         &auto_title,
         pre_context.as_deref(),
-        &[],
+        &attendees,
         &structured_actions,
         &structured_decisions,
         &structured_intents,
@@ -221,8 +265,8 @@ where
         },
         status,
         tags: vec![],
-        attendees: vec![],
-        calendar_event: None,
+        attendees,
+        calendar_event: calendar_event_title,
         people,
         entities,
         context: pre_context,
@@ -849,6 +893,7 @@ mod tests {
             ],
             open_questions: vec![],
             commitments: vec![],
+            participants: vec![],
         };
 
         let items = extract_action_items(&summary);
@@ -876,6 +921,7 @@ mod tests {
             action_items: vec![],
             open_questions: vec![],
             commitments: vec![],
+            participants: vec![],
         };
 
         let decisions = extract_decisions(&summary);
@@ -906,6 +952,7 @@ mod tests {
             action_items: vec!["@user: Send pricing doc by Friday".into()],
             open_questions: vec!["@case: Do we grandfather current customers?".into()],
             commitments: vec!["@sarah: Share revised pricing model by Tuesday".into()],
+            participants: vec![],
         };
 
         let intents = extract_intents(&summary);

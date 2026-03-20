@@ -10,12 +10,14 @@ use std::process::Command;
 // Also tries a compiled EventKit helper if available.
 // ──────────────────────────────────────────────────────────────
 
-/// A calendar event with title and start time.
+/// A calendar event with title, start time, and attendees.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CalendarEvent {
     pub title: String,
     pub start: String,
     pub minutes_until: i64,
+    #[serde(default)]
+    pub attendees: Vec<String>,
 }
 
 /// Query upcoming calendar events within the next `lookahead_minutes`.
@@ -29,6 +31,101 @@ pub fn upcoming_events(lookahead_minutes: u32) -> Vec<CalendarEvent> {
     }
     // AppleScript: fetch today's events, filter by time range
     query_via_applescript(lookahead_minutes)
+}
+
+/// Find calendar events that overlap a given time window.
+/// Used to match a recording to its calendar event after the fact.
+/// `start_time` and `end_time` are ISO 8601 strings or "HH:MM" format.
+pub fn events_overlapping_now() -> Vec<CalendarEvent> {
+    // Query events in a 2-hour window centered on now (covers most meetings)
+    // The AppleScript returns events starting within the window;
+    // we also look backward to catch events that started before recording began.
+    query_events_with_attendees()
+}
+
+/// AppleScript query that fetches current/recent events WITH attendee names.
+fn query_events_with_attendees() -> Vec<CalendarEvent> {
+    let script = r#"set now to current date
+set windowStart to now - (2 * 60 * 60)
+set windowEnd to now + (2 * 60 * 60)
+set todayStart to current date
+set hours of todayStart to 0
+set minutes of todayStart to 0
+set seconds of todayStart to 0
+set tomorrowEnd to todayStart + (2 * 24 * 60 * 60)
+set output to ""
+set unitSep to (ASCII character 31)
+set fieldSep to (ASCII character 30)
+tell application "Calendar"
+    repeat with cal in calendars
+        try
+            set evts to (every event of cal whose start date >= todayStart and start date <= tomorrowEnd)
+            repeat with evt in evts
+                set s to start date of evt
+                set e to end date of evt
+                if (s <= windowEnd and e >= windowStart) then
+                    set t to summary of evt
+                    set mins to ((s - now) / 60) as integer
+                    set attendeeNames to ""
+                    try
+                        set theAttendees to attendees of evt
+                        repeat with anAttendee in theAttendees
+                            if attendeeNames is not "" then
+                                set attendeeNames to attendeeNames & fieldSep
+                            end if
+                            set attendeeNames to attendeeNames & (name of anAttendee)
+                        end repeat
+                    end try
+                    set output to output & t & unitSep & (s as string) & unitSep & mins & unitSep & attendeeNames & linefeed
+                end if
+            end repeat
+        end try
+    end repeat
+end tell
+return output"#;
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+
+    let unit_sep = '\x1F';
+    let field_sep = '\x1E';
+    let mut events: Vec<CalendarEvent> = output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(4, unit_sep).collect();
+            if parts.len() >= 3 {
+                let attendees = if parts.len() >= 4 && !parts[3].trim().is_empty() {
+                    parts[3]
+                        .split(field_sep)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Some(CalendarEvent {
+                    title: parts[0].trim().to_string(),
+                    start: parts[1].trim().to_string(),
+                    minutes_until: parts[2].trim().parse().unwrap_or(0),
+                    attendees,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    events.sort_by_key(|e| (e.minutes_until.abs(), e.title.clone()));
+    events.dedup_by(|a, b| a.title == b.title);
+    events
 }
 
 /// Query via compiled Swift EventKit helper (if available and permitted).
@@ -139,6 +236,7 @@ return output"#,
                     title: parts[0].trim().to_string(),
                     start: parts[1].trim().to_string(),
                     minutes_until: parts[2].trim().parse().unwrap_or(0),
+                    attendees: Vec::new(),
                 })
             } else {
                 None
