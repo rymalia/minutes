@@ -4,6 +4,7 @@ use chrono::{DateTime, Local};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -161,7 +162,11 @@ pub fn write(
         .map_err(|e| MarkdownError::OutputDirError(format!("{}: {}", output_dir.display(), e)))?;
 
     // Generate filename slug
-    let slug = generate_slug(&frontmatter.title, frontmatter.date, frontmatter.recorded_by.as_deref());
+    let slug = generate_slug(
+        &frontmatter.title,
+        frontmatter.date,
+        frontmatter.recorded_by.as_deref(),
+    );
     let path = resolve_collision(&output_dir, &slug);
 
     // Build markdown content
@@ -286,10 +291,13 @@ fn resolve_collision(dir: &Path, filename: &str) -> PathBuf {
     dir.join(format!("{}-{}.md", stem, ts))
 }
 
-/// Set file permissions to the given mode.
-fn set_permissions(path: &Path, mode: u32) -> Result<(), MarkdownError> {
-    let perms = fs::Permissions::from_mode(mode);
-    fs::set_permissions(path, perms)?;
+/// Set file permissions to the given mode (Unix only; no-op on Windows).
+fn set_permissions(path: &Path, _mode: u32) -> Result<(), MarkdownError> {
+    #[cfg(unix)]
+    {
+        let perms = fs::Permissions::from_mode(_mode);
+        fs::set_permissions(path, perms)?;
+    }
     Ok(())
 }
 
@@ -387,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn visibility_team_sets_0640_permissions() {
         let dir = TempDir::new().unwrap();
         let config = Config {
@@ -446,6 +455,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn writes_markdown_with_correct_permissions() {
         let dir = TempDir::new().unwrap();
         let config = Config {

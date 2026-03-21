@@ -315,12 +315,27 @@ fn main() -> Result<()> {
         Commands::Devices => cmd_devices(),
         Commands::Setup { model, list } => cmd_setup(&model, list),
         Commands::Qmd { action, collection } => cmd_qmd(&action, &collection, &config),
-        Commands::Service { action } => cmd_service(&action),
+        Commands::Service { action } => {
+            #[cfg(target_os = "macos")]
+            {
+                cmd_service(&action)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = action;
+                eprintln!("The service command uses macOS launchd and is only available on macOS.");
+                eprintln!("On Linux, use systemd or cron to run `minutes watch`.");
+                eprintln!("On Windows, use Task Scheduler to run `minutes watch`.");
+                Ok(())
+            }
+        }
         Commands::Logs { errors, lines } => cmd_logs(errors, lines),
         Commands::Schema => cmd_schema(),
         Commands::Get { slug } => cmd_get(&slug, &config),
         Commands::Events { limit, since } => cmd_events(limit, since, &config),
-        Commands::Import { from, dir, dry_run } => cmd_import(&from, dir.as_deref(), dry_run, &config),
+        Commands::Import { from, dir, dry_run } => {
+            cmd_import(&from, dir.as_deref(), dry_run, &config)
+        }
     }
 }
 
@@ -449,9 +464,9 @@ fn cmd_record(
     let result = result?;
 
     // Emit RecordingCompleted event (AudioProcessed already emitted by pipeline)
-    minutes_core::events::append_event(
-        minutes_core::events::recording_completed_event(&result, "live"),
-    );
+    minutes_core::events::append_event(minutes_core::events::recording_completed_event(
+        &result, "live",
+    ));
 
     // Write result file for `minutes stop` to read
     let result_json = serde_json::to_string_pretty(&serde_json::json!({
@@ -486,11 +501,22 @@ fn cmd_stop(_config: &Config) -> Result<()> {
                 .unwrap_or(CaptureMode::Meeting);
             eprintln!("Stopping recording (PID {})...", pid);
 
-            // Send SIGTERM to the recording process
-            let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                anyhow::bail!("could not signal recording process (PID {}): {}", pid, err);
+            // Write sentinel file (cross-platform stop mechanism)
+            minutes_core::pid::write_stop_sentinel()
+                .map_err(|e| anyhow::anyhow!("failed to write stop sentinel: {}", e))?;
+
+            // On Unix, also send SIGTERM for instant stop
+            #[cfg(unix)]
+            {
+                let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    tracing::warn!(
+                        "SIGTERM failed (PID {}): {} — sentinel file will stop recording",
+                        pid,
+                        err
+                    );
+                }
             }
 
             // Poll for PID file removal with progress feedback
@@ -1172,6 +1198,7 @@ fn cmd_qmd(action: &str, collection: &str, config: &Config) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn cmd_service(action: &str) -> Result<()> {
     let plist_name = "dev.getminutes.watcher";
     let plist_dest = dirs::home_dir()
@@ -1403,14 +1430,12 @@ fn cmd_import(from: &str, dir: Option<&Path>, dry_run: bool, config: &Config) ->
 }
 
 fn import_granola(dir: Option<&Path>, dry_run: bool, config: &Config) -> Result<()> {
-    let source_dir = dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".granola-archivist")
-                .join("output")
-        });
+    let source_dir = dir.map(PathBuf::from).unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".granola-archivist")
+            .join("output")
+    });
 
     if !source_dir.exists() {
         anyhow::bail!(
@@ -1473,7 +1498,13 @@ fn import_granola(dir: Option<&Path>, dry_run: bool, config: &Config) -> Result<
         let slug: String = title
             .to_lowercase()
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == ' ' { c } else { ' ' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == ' ' {
+                    c
+                } else {
+                    ' '
+                }
+            })
             .collect::<String>()
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -1538,7 +1569,10 @@ fn import_granola(dir: Option<&Path>, dry_run: bool, config: &Config) -> Result<
         "dry_run": dry_run,
     });
     println!("{}", serde_json::to_string_pretty(&json)?);
-    eprintln!("\n{} {} meetings ({} skipped, already exist)", action, imported, skipped);
+    eprintln!(
+        "\n{} {} meetings ({} skipped, already exist)",
+        action, imported, skipped
+    );
 
     Ok(())
 }
