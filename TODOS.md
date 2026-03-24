@@ -6,14 +6,8 @@
 ## ~~P2: Claude Code Plugin Standalone Distribution~~ DONE
 **Shipped:** 2026-03-24. Marketplace manifest at `.claude-plugin/marketplace.json`, plugin manifest at `.claude/plugins/minutes/.claude-plugin/plugin.json`. Install: `claude plugin marketplace add silverstein/minutes && claude plugin install minutes`.
 
-## P3: Open Source Interactive Skill Template
-**What:** Extract the multi-phase interactive skill pattern into a reusable SKILL-TEMPLATE-INTERACTIVE.md that other Claude Code plugin authors can follow.
-**Why:** Positions Minutes as the reference implementation for great Claude Code plugin skills. Community multiplier.
-**Pros:** Low effort, high community impact. Documents patterns that would otherwise live only in our heads.
-**Cons:** Template may need revision as patterns evolve. Premature extraction risk if patterns aren't battle-tested.
-**Context:** Deferred from interactive skills ecosystem CEO review (2026-03-19). Extract after the interactive skills have been used for 2-4 weeks and the patterns are proven.
-**Effort:** S (human: ~1 day / CC: ~15 min)
-**Depends on:** Interactive skills being battle-tested (2-4 weeks of usage).
+## ~~P3: Open Source Interactive Skill Template~~ DONE
+**Shipped:** 2026-03-24. `docs/SKILL-TEMPLATE-INTERACTIVE.md` — full template with 5-phase pattern, design principles, skill chaining, and real examples from Minutes.
 
 ## P2: Weekly Synthesis as First-Class Recall Panel View
 **What:** Add a "Weekly" phase to the Recall panel that renders the weekly synthesis directly, rather than only running as a CLI skill in the terminal.
@@ -64,11 +58,5 @@
 **Effort:** L (human: ~3 weeks / CC: ~3-4 hours)
 **Depends on:** Cross-device ghost context layer shipping first (Approach B).
 
-## P3: Create DESIGN.md
-**What:** Formalize the implicit design system (CSS variables, component patterns, typography, spacing, color usage) into a DESIGN.md file.
-**Why:** The codebase has a strong implicit design language in the CSS but no documentation. As the UI grows (Recall panel, future features), having a reference prevents drift.
-**Pros:** Single source of truth for all design decisions. Makes design reviews faster. Prevents contributors from introducing conflicting visual patterns.
-**Cons:** Maintenance overhead — must be updated when CSS changes.
-**Context:** Deferred from Recall panel design review (2026-03-19). Extract from existing CSS variables + the new Recall panel patterns. Include: color tokens, typography scale, spacing scale, radius values, component patterns (pills, badges, buttons, overlays, bars), animation timing curves.
-**Effort:** S (human: ~2 hours / CC: ~15 min)
-**Depends on:** Recall panel implementation (new patterns should be included).
+## ~~P3: Create DESIGN.md~~ DONE
+**Shipped:** 2026-03-24. `DESIGN.md` — color tokens, typography, spacing, radius, component patterns (pills, buttons, forms, overlays), animation timing, recording states, iconography, accessibility, file conventions.
