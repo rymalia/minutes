@@ -18,6 +18,7 @@ fn test_config(output_dir: PathBuf) -> Config {
             language: Some("en".into()),
             vad_model: "silero-v6.2.0".into(),
             noise_reduction: false,
+            ..minutes_core::config::TranscriptionConfig::default()
         },
         ..Config::default()
     }

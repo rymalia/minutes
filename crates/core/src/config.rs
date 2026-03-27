@@ -47,6 +47,8 @@ impl Default for VoiceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TranscriptionConfig {
+    /// Transcription engine: "whisper" (default) or "parakeet".
+    pub engine: String,
     pub model: String,
     pub model_path: PathBuf,
     pub min_words: usize,
@@ -57,6 +59,12 @@ pub struct TranscriptionConfig {
     /// Enable noise reduction via nnnoiseless (RNNoise) before transcription.
     /// Requires the `denoise` feature flag. Default: true.
     pub noise_reduction: bool,
+    /// Path or name of the parakeet.cpp binary (resolved via PATH if not absolute).
+    pub parakeet_binary: String,
+    /// Parakeet model type: "tdt-ctc-110m", "tdt-600m".
+    pub parakeet_model: String,
+    /// SentencePiece vocab filename (resolved under model_path/parakeet/, e.g. "vocab.txt").
+    pub parakeet_vocab: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,12 +286,16 @@ impl Default for Config {
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
+            engine: "whisper".into(),
             model: "small".into(),
             model_path: minutes_dir().join("models"),
             min_words: 3,
             language: None,
             vad_model: "silero-v6.2.0".into(),
             noise_reduction: true,
+            parakeet_binary: "parakeet".into(),
+            parakeet_model: "tdt-ctc-110m".into(),
+            parakeet_vocab: "vocab.txt".into(),
         }
     }
 }
@@ -472,8 +484,12 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         let config = Config::default();
+        assert_eq!(config.transcription.engine, "whisper");
         assert_eq!(config.transcription.model, "small");
         assert_eq!(config.transcription.min_words, 3);
+        assert_eq!(config.transcription.parakeet_binary, "parakeet");
+        assert_eq!(config.transcription.parakeet_model, "tdt-ctc-110m");
+        assert_eq!(config.transcription.parakeet_vocab, "vocab.txt");
         assert_eq!(config.diarization.engine, "auto");
         assert_eq!(config.summarization.engine, "none");
         assert_eq!(config.search.engine, "builtin");
@@ -557,5 +573,50 @@ model = "tiny"
 
         let config = Config::load_from(&config_path);
         assert_eq!(config.transcription.model, "small");
+    }
+
+    #[test]
+    fn parakeet_config_from_toml() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[transcription]
+engine = "parakeet"
+parakeet_model = "tdt-600m"
+parakeet_binary = "/usr/local/bin/parakeet"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from(&config_path);
+        assert_eq!(config.transcription.engine, "parakeet");
+        assert_eq!(config.transcription.parakeet_model, "tdt-600m");
+        assert_eq!(
+            config.transcription.parakeet_binary,
+            "/usr/local/bin/parakeet"
+        );
+        // Other fields should be defaults
+        assert_eq!(config.transcription.model, "small");
+        assert_eq!(config.transcription.min_words, 3);
+    }
+
+    #[test]
+    fn omitted_engine_defaults_to_whisper() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[transcription]
+model = "tiny"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from(&config_path);
+        assert_eq!(config.transcription.engine, "whisper");
+        assert_eq!(config.transcription.parakeet_binary, "parakeet");
     }
 }

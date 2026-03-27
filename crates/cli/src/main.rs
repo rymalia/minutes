@@ -222,6 +222,14 @@ enum Commands {
         /// Download speaker diarization models (~34 MB)
         #[arg(long)]
         diarization: bool,
+
+        /// Download parakeet.cpp model for alternative transcription engine
+        #[arg(long)]
+        parakeet: bool,
+
+        /// Parakeet model to download: tdt-ctc-110m, tdt-600m
+        #[arg(long, default_value = "tdt-ctc-110m")]
+        parakeet_model: String,
     },
 
     /// Inspect or register the meetings directory as a QMD collection
@@ -472,7 +480,15 @@ fn main() -> Result<()> {
             model,
             list,
             diarization,
-        } => cmd_setup(&model, list, diarization),
+            parakeet,
+            parakeet_model,
+        } => {
+            if parakeet {
+                cmd_setup_parakeet(&parakeet_model)
+            } else {
+                cmd_setup(&model, list, diarization)
+            }
+        }
         Commands::Qmd { action, collection } => cmd_qmd(&action, &collection, &config),
         Commands::Service { action } => {
             #[cfg(target_os = "macos")]
@@ -1560,6 +1576,10 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
         eprintln!();
         eprintln!("Speaker diarization:");
         eprintln!("  --diarization   34 MB   (pyannote-rs: segmentation + speaker embedding)");
+        eprintln!();
+        eprintln!("Parakeet models (alternative engine, --parakeet):");
+        eprintln!("  tdt-ctc-110m  ~220 MB   (English, fast, default)");
+        eprintln!("  tdt-600m      ~1.2 GB   (multilingual, 25 EU languages, best quality)");
         return Ok(());
     }
 
@@ -1676,6 +1696,117 @@ fn cmd_setup_diarization() -> Result<()> {
     eprintln!("\nTo enable speaker diarization, add to ~/.config/minutes/config.toml:");
     eprintln!("  [diarization]");
     eprintln!("  engine = \"pyannote-rs\"");
+
+    Ok(())
+}
+
+/// Set up a parakeet.cpp model for alternative transcription.
+///
+/// Parakeet models are distributed as .nemo files on HuggingFace and must be
+/// converted to safetensors format using parakeet.cpp's convert_nemo.py script.
+/// This command prints the steps needed and checks for existing files.
+fn cmd_setup_parakeet(model: &str) -> Result<()> {
+    let valid_models = ["tdt-ctc-110m", "tdt-600m"];
+    if !valid_models.contains(&model) {
+        anyhow::bail!(
+            "unknown parakeet model: {}. Available: {}",
+            model,
+            valid_models.join(", ")
+        );
+    }
+
+    let config = Config::default();
+    let model_dir = config.transcription.model_path.join("parakeet");
+    std::fs::create_dir_all(&model_dir)?;
+
+    let dest_model = model_dir.join(format!("{}.safetensors", model));
+    let dest_vocab = model_dir.join("vocab.txt");
+
+    // Map model name to HuggingFace repo
+    let hf_repo = match model {
+        "tdt-ctc-110m" => "nvidia/parakeet-tdt_ctc-110m",
+        "tdt-600m" => "nvidia/parakeet-tdt-0.6b-v3",
+        _ => unreachable!(),
+    };
+
+    // Check if model already exists
+    let model_exists = dest_model.exists();
+    let vocab_exists = dest_vocab.exists();
+
+    if model_exists && vocab_exists {
+        let size = std::fs::metadata(&dest_model)?.len();
+        eprintln!(
+            "Model already set up: {} ({:.0} MB)",
+            dest_model.display(),
+            size as f64 / 1_048_576.0
+        );
+        eprintln!("Vocab file: {}", dest_vocab.display());
+    } else {
+        eprintln!("Parakeet model setup: {}", model);
+        eprintln!();
+        eprintln!("Parakeet models require a one-time conversion from NVIDIA's .nemo format.");
+        eprintln!("Follow these steps:");
+        eprintln!();
+        eprintln!("  Step 1: Clone parakeet.cpp");
+        eprintln!("    git clone https://github.com/Frikallo/parakeet.cpp");
+        eprintln!("    cd parakeet.cpp");
+        eprintln!();
+        eprintln!("  Step 2: Download the .nemo model from HuggingFace");
+        eprintln!(
+            "    huggingface-cli download {} --include '*.nemo' --local-dir .",
+            hf_repo
+        );
+        eprintln!();
+        eprintln!("  Step 3: Convert to safetensors (generates model + vocab)");
+        eprintln!(
+            "    python scripts/convert_nemo.py *.nemo -o {}",
+            dest_model.display()
+        );
+        eprintln!();
+        eprintln!("  Step 4: Copy the vocab file");
+        eprintln!("    cp vocab.txt {}", dest_vocab.display());
+        eprintln!();
+        eprintln!("  Step 5: Build and install the parakeet binary");
+        eprintln!("    mkdir build && cd build && cmake .. && make -j");
+        eprintln!("    cp parakeet /usr/local/bin/");
+
+        if model_exists {
+            eprintln!();
+            eprintln!(
+                "Note: model file already present at {}",
+                dest_model.display()
+            );
+        }
+        if vocab_exists {
+            eprintln!(
+                "Note: vocab file already present at {}",
+                dest_vocab.display()
+            );
+        }
+    }
+
+    // Verify parakeet binary is available
+    eprintln!();
+    match std::process::Command::new("parakeet")
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {
+            eprintln!("parakeet binary found in PATH.");
+        }
+        _ => {
+            eprintln!("Warning: `parakeet` binary not found in PATH.");
+            eprintln!("See: https://github.com/Frikallo/parakeet.cpp");
+        }
+    }
+
+    eprintln!();
+    eprintln!("To use parakeet, add to ~/.config/minutes/config.toml:");
+    eprintln!("  [transcription]");
+    eprintln!("  engine = \"parakeet\"");
+    eprintln!("  parakeet_model = \"{}\"", model);
 
     Ok(())
 }

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::error::TranscribeError;
 use std::path::Path;
-#[cfg(feature = "whisper")]
+#[cfg(any(feature = "whisper", feature = "parakeet"))]
 use std::path::PathBuf;
 
 // Re-export from whisper-guard for public API compatibility
@@ -15,22 +15,46 @@ pub use whisper_guard::segments::{clean_transcript, CleanStats};
 //
 //   Input audio (.wav, .m4a, .mp3, .ogg)
 //        │
-//        ├─ .wav ──────────────────────────────────▶ whisper-rs
+//        ├─ .wav ──────────────────────────────────▶ engine
 //        │
-//        └─ .m4a/.mp3/.ogg ─▶ symphonia decode ─▶ whisper-rs
+//        └─ .m4a/.mp3/.ogg ─▶ symphonia decode ─▶ engine
 //                              (to 16kHz mono PCM)
 //
-// whisper-rs wraps whisper.cpp, uses Apple Accelerate on M-series.
+// Engines:
+//   - whisper (default): whisper.cpp via whisper-rs, Apple Accelerate on M-series
+//   - parakeet (opt-in): parakeet.cpp via subprocess, Metal on Apple Silicon
+//
+// Engine is selected via config.transcription.engine ("whisper" or "parakeet").
 // Model must be downloaded first via `minutes setup`.
 // ──────────────────────────────────────────────────────────────
 
 /// Transcribe an audio file to text.
 ///
-/// With the `whisper` feature (default): uses whisper.cpp via whisper-rs.
-/// Without: returns a placeholder transcript (for testing without a model).
+/// Dispatches to the engine configured in `config.transcription.engine`:
+/// - `"whisper"` (default): whisper.cpp via whisper-rs
+/// - `"parakeet"`: parakeet.cpp via subprocess
 ///
 /// Handles format conversion (m4a/mp3/ogg → PCM) automatically via symphonia.
+/// Both engines produce identical output format: `[M:SS] text` lines.
 pub fn transcribe(audio_path: &Path, config: &Config) -> Result<String, TranscribeError> {
+    match config.transcription.engine.as_str() {
+        "whisper" => transcribe_whisper_dispatch(audio_path, config),
+        "parakeet" => transcribe_parakeet_dispatch(audio_path, config),
+        other => {
+            tracing::warn!(
+                engine = other,
+                "unknown transcription engine — falling back to whisper"
+            );
+            transcribe_whisper_dispatch(audio_path, config)
+        }
+    }
+}
+
+/// Whisper transcription path (existing behavior).
+fn transcribe_whisper_dispatch(
+    audio_path: &Path,
+    config: &Config,
+) -> Result<String, TranscribeError> {
     // Step 1: Load audio as 16kHz mono f32 PCM samples
     let samples = load_audio_samples(audio_path)?;
 
@@ -87,6 +111,23 @@ pub fn transcribe(audio_path: &Path, config: &Config) -> Result<String, Transcri
             duration_secs,
             samples.len(),
         ))
+    }
+}
+
+/// Parakeet transcription path (subprocess-based).
+fn transcribe_parakeet_dispatch(
+    audio_path: &Path,
+    config: &Config,
+) -> Result<String, TranscribeError> {
+    #[cfg(feature = "parakeet")]
+    {
+        transcribe_with_parakeet(audio_path, config)
+    }
+
+    #[cfg(not(feature = "parakeet"))]
+    {
+        let _ = (audio_path, config);
+        Err(TranscribeError::EngineNotAvailable("parakeet".into()))
     }
 }
 
@@ -469,19 +510,15 @@ fn decode_with_symphonia(path: &Path) -> Result<Vec<f32>, TranscribeError> {
 // They are re-exported as pub use at the top of this file for API compatibility.
 // The private wrappers below delegate to whisper-guard so internal callers
 // (transcribe_with_whisper) continue working without path changes.
-#[cfg(feature = "whisper")]
 use whisper_guard::segments as wg_segments;
 
-// Thin delegates to whisper-guard (only called by transcribe_with_whisper behind cfg(whisper))
-#[cfg(feature = "whisper")]
+// Thin delegates to whisper-guard (used by whisper, parakeet, and tests)
 fn dedup_segments(lines: Vec<String>) -> Vec<String> {
     wg_segments::dedup_segments(&lines)
 }
-#[cfg(feature = "whisper")]
 fn dedup_interleaved(lines: Vec<String>) -> Vec<String> {
     wg_segments::dedup_interleaved(&lines)
 }
-#[cfg(feature = "whisper")]
 fn trim_trailing_noise(lines: Vec<String>) -> Vec<String> {
     wg_segments::trim_trailing_noise(&lines)
 }
@@ -670,6 +707,285 @@ fn num_cpus() -> i32 {
     whisper_guard::params::num_cpus()
 }
 
+// ──────────────────────────────────────────────────────────────
+// Parakeet engine (subprocess-based)
+//
+// Shells out to parakeet.cpp CLI, parses text output with
+// line-level timestamps, formats as [M:SS] lines to match
+// whisper output exactly. Pipeline/diarization/summarization
+// all work unchanged.
+// ──────────────────────────────────────────────────────────────
+
+/// Known valid parakeet model identifiers.
+#[cfg(feature = "parakeet")]
+const VALID_PARAKEET_MODELS: &[&str] = &["tdt-ctc-110m", "tdt-600m"];
+
+/// Transcribe using parakeet.cpp as a subprocess.
+#[cfg(feature = "parakeet")]
+fn transcribe_with_parakeet(audio_path: &Path, config: &Config) -> Result<String, TranscribeError> {
+    use std::process::Command;
+
+    // Validate model name before doing any work
+    if !VALID_PARAKEET_MODELS.contains(&config.transcription.parakeet_model.as_str()) {
+        return Err(TranscribeError::ParakeetFailed(format!(
+            "unknown parakeet model '{}'. Valid: {}",
+            config.transcription.parakeet_model,
+            VALID_PARAKEET_MODELS.join(", ")
+        )));
+    }
+
+    // Step 1: Load audio and convert to 16kHz mono (reuse existing pipeline)
+    let samples = load_audio_samples(audio_path)?;
+    if samples.is_empty() {
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    // Noise reduction is not yet supported for parakeet — warn if configured
+    if config.transcription.noise_reduction {
+        tracing::debug!(
+            "noise_reduction is enabled but not applied for parakeet engine \
+             (nnnoiseless only supports the whisper path)"
+        );
+    }
+
+    // Strip silence (parakeet benefits from the same pre-processing)
+    let samples = strip_silence(&samples, 16000);
+    if samples.is_empty() {
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    // Step 2: Write samples to temp WAV (NamedTempFile avoids PID collisions
+    // when the watcher processes multiple files concurrently)
+    let tmp_wav = tempfile::Builder::new()
+        .prefix("minutes-parakeet-")
+        .suffix(".wav")
+        .tempfile()
+        .map_err(TranscribeError::Io)?;
+    write_wav_16k_mono(tmp_wav.path(), &samples)?;
+
+    // Step 3: Resolve model and vocab paths
+    let model_path = resolve_parakeet_model_path(config)?;
+    let vocab_path = resolve_parakeet_vocab_path(config)?;
+
+    // Step 4: Run parakeet subprocess
+    // CLI syntax: parakeet <model.safetensors> <audio.wav> --vocab <vocab.txt> [--model type] [--timestamps] [--gpu]
+    let binary = &config.transcription.parakeet_binary;
+    tracing::info!(
+        binary = %binary,
+        model = %model_path.display(),
+        vocab = %vocab_path.display(),
+        audio = %audio_path.display(),
+        "starting parakeet transcription"
+    );
+
+    let model_str = model_path
+        .to_str()
+        .ok_or_else(|| TranscribeError::ParakeetFailed("model path is not valid UTF-8".into()))?;
+    let wav_str = tmp_wav.path().to_str().ok_or_else(|| {
+        TranscribeError::ParakeetFailed("temp WAV path is not valid UTF-8".into())
+    })?;
+    let vocab_str = vocab_path
+        .to_str()
+        .ok_or_else(|| TranscribeError::ParakeetFailed("vocab path is not valid UTF-8".into()))?;
+
+    let output = Command::new(binary)
+        .arg(model_str)
+        .arg(wav_str)
+        .args(["--vocab", vocab_str])
+        .args(["--model", &config.transcription.parakeet_model])
+        .arg("--timestamps")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                TranscribeError::ParakeetNotFound
+            } else {
+                TranscribeError::ParakeetFailed(format!("spawn error: {}", e))
+            }
+        })?;
+    // tmp_wav auto-deletes on drop (NamedTempFile)
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(TranscribeError::ParakeetFailed(
+            stderr.lines().last().unwrap_or("unknown error").to_string(),
+        ));
+    }
+
+    // Step 5: Parse output and format as [M:SS] lines
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let transcript = parse_parakeet_output(&stdout, config)?;
+
+    let word_count = transcript.split_whitespace().count();
+    tracing::info!(words = word_count, "parakeet transcription complete");
+
+    Ok(transcript)
+}
+
+/// Parse parakeet.cpp text output into `[M:SS] text` lines matching whisper format.
+///
+/// parakeet.cpp with `--timestamps` outputs lines like:
+///   `[0.00 - 2.50] Hello world`
+///   `[2.80 - 5.10] How are you`
+///
+/// Applies the full anti-hallucination pipeline: dedup_segments, dedup_interleaved,
+/// and trim_trailing_noise — matching the whisper path exactly.
+#[cfg(feature = "parakeet")]
+fn parse_parakeet_output(raw_output: &str, config: &Config) -> Result<String, TranscribeError> {
+    let raw = raw_output.trim();
+    if raw.is_empty() {
+        return Err(TranscribeError::EmptyTranscript(
+            config.transcription.min_words,
+        ));
+    }
+
+    let mut lines = Vec::new();
+    let mut has_timestamps = false;
+
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Try to parse "[start - end] text" format
+        if let Some(rest) = line.strip_prefix('[') {
+            if let Some(bracket_end) = rest.find(']') {
+                let timestamp_part = &rest[..bracket_end];
+                let text = rest[bracket_end + 1..].trim();
+
+                if let Some((start_str, _end_str)) = timestamp_part.split_once('-') {
+                    if let Ok(start_secs) = start_str.trim().parse::<f64>() {
+                        let mins = (start_secs / 60.0) as u64;
+                        let secs = (start_secs % 60.0) as u64;
+                        if !text.is_empty() {
+                            lines.push(format!("[{}:{:02}] {}", mins, secs, text));
+                            has_timestamps = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Non-timestamp line — skip (don't fake [0:00] timestamps)
+    }
+
+    if lines.is_empty() {
+        if !has_timestamps {
+            // No parseable output at all — include a snippet in the error for debugging
+            let preview: String = raw.chars().take(200).collect();
+            return Err(TranscribeError::ParakeetFailed(format!(
+                "could not parse parakeet output (no [start - end] timestamps found). \
+                 First 200 chars: {}",
+                preview
+            )));
+        }
+        return Err(TranscribeError::EmptyTranscript(
+            config.transcription.min_words,
+        ));
+    }
+
+    // Full anti-hallucination pipeline (same as whisper path)
+    let lines = dedup_segments(lines);
+    let lines = dedup_interleaved(lines);
+    let lines = trim_trailing_noise(lines);
+
+    let transcript = lines.join("\n");
+    if transcript.is_empty() {
+        return Err(TranscribeError::EmptyTranscript(
+            config.transcription.min_words,
+        ));
+    }
+    Ok(format!("{}\n", transcript))
+}
+
+/// Write f32 samples as a 16kHz mono 16-bit WAV file.
+#[cfg(feature = "parakeet")]
+fn write_wav_16k_mono(path: &Path, samples: &[f32]) -> Result<(), TranscribeError> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| TranscribeError::Io(std::io::Error::other(e.to_string())))?;
+    for &s in samples {
+        let sample = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        writer
+            .write_sample(sample)
+            .map_err(|e| TranscribeError::Io(std::io::Error::other(e.to_string())))?;
+    }
+    writer
+        .finalize()
+        .map_err(|e| TranscribeError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(())
+}
+
+/// Resolve the parakeet model file path.
+///
+/// Looks for `.safetensors` files in `~/.minutes/models/parakeet/`.
+#[cfg(feature = "parakeet")]
+fn resolve_parakeet_model_path(config: &Config) -> Result<PathBuf, TranscribeError> {
+    let model_dir = config.transcription.model_path.join("parakeet");
+    let model_name = &config.transcription.parakeet_model;
+
+    let candidates = [
+        model_dir.join(format!("{}.safetensors", model_name)),
+        model_dir.join(format!("parakeet-{}.safetensors", model_name)),
+        model_dir.join("model.safetensors"),
+    ];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    // Try as absolute path
+    let direct = PathBuf::from(model_name);
+    if direct.exists() {
+        return Ok(direct);
+    }
+
+    Err(TranscribeError::ModelNotFound(format!(
+        "Expected parakeet model \"{}\" in {}. Run: minutes setup --parakeet",
+        model_name,
+        model_dir.display(),
+    )))
+}
+
+/// Resolve the parakeet SentencePiece vocab file path.
+///
+/// Looks for the vocab file in `~/.minutes/models/parakeet/` alongside the model.
+#[cfg(feature = "parakeet")]
+fn resolve_parakeet_vocab_path(config: &Config) -> Result<PathBuf, TranscribeError> {
+    let model_dir = config.transcription.model_path.join("parakeet");
+    let vocab_name = &config.transcription.parakeet_vocab;
+
+    let candidates = [model_dir.join(vocab_name), model_dir.join("vocab.txt")];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    // Try as absolute path
+    let direct = PathBuf::from(vocab_name);
+    if direct.exists() {
+        return Ok(direct);
+    }
+
+    Err(TranscribeError::ModelNotFound(format!(
+        "Expected parakeet vocab file \"{}\" in {}. Generated during model conversion.",
+        vocab_name,
+        model_dir.display(),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +1001,7 @@ mod tests {
                 language: Some("en".into()),
                 vad_model: String::new(),
                 noise_reduction: false,
+                ..crate::config::TranscriptionConfig::default()
             },
             ..Config::default()
         };
@@ -751,5 +1068,356 @@ mod tests {
         let result = load_audio_samples(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("xyz"));
+    }
+
+    #[test]
+    fn strip_silence_preserves_speech() {
+        // 1s of "speech" (high energy sine wave)
+        let speech: Vec<f32> = (0..16000)
+            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin())
+            .collect();
+        let result = strip_silence(&speech, 16000);
+        // All speech — nothing should be stripped
+        assert_eq!(result.len(), speech.len());
+    }
+
+    #[test]
+    fn strip_silence_trims_long_silence() {
+        let mut samples = Vec::new();
+        // 1s speech
+        for i in 0..16000 {
+            samples.push(0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin());
+        }
+        // 5s silence
+        samples.extend(vec![0.0f32; 16000 * 5]);
+        // 1s speech
+        for i in 0..16000 {
+            samples.push(0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin());
+        }
+
+        let result = strip_silence(&samples, 16000);
+        // Should be significantly shorter than 7s (5s of silence trimmed)
+        let original_secs = samples.len() as f64 / 16000.0;
+        let result_secs = result.len() as f64 / 16000.0;
+        assert!(
+            result_secs < original_secs * 0.7,
+            "expected significant trimming: {:.1}s → {:.1}s",
+            original_secs,
+            result_secs
+        );
+        // But should still have both speech segments + padding
+        assert!(
+            result_secs > 2.0,
+            "should preserve both speech segments: {:.1}s",
+            result_secs
+        );
+    }
+
+    #[test]
+    fn strip_silence_keeps_short_pauses() {
+        let mut samples = Vec::new();
+        // 1s speech
+        for i in 0..16000 {
+            samples.push(0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin());
+        }
+        // 400ms silence (short natural pause — should be kept)
+        samples.extend(vec![0.0f32; 6400]);
+        // 1s speech
+        for i in 0..16000 {
+            samples.push(0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin());
+        }
+
+        let result = strip_silence(&samples, 16000);
+        // Short pause should be preserved — output ≈ input length
+        let ratio = result.len() as f64 / samples.len() as f64;
+        assert!(
+            ratio > 0.9,
+            "short pauses should be preserved: ratio {:.2}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn strip_silence_handles_all_silence() {
+        let samples = vec![0.0f32; 16000 * 10]; // 10s of silence
+        let result = strip_silence(&samples, 16000);
+        // Should still produce something (short pad at minimum)
+        assert!(result.len() < samples.len() / 2, "should trim most silence");
+    }
+
+    #[test]
+    fn sinc_resample_no_aliasing() {
+        // Generate a 440Hz tone at 44100Hz, resample to 16000Hz.
+        // 440Hz is well below Nyquist (8000Hz), so it should survive.
+        let n = 44100;
+        let samples: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+            .collect();
+        let resampled = resample(&samples, 44100, 16000);
+
+        // Check the resampled signal has reasonable amplitude (not attenuated to nothing)
+        let peak = resampled.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(
+            peak > 0.8,
+            "440Hz tone should survive resampling with peak > 0.8, got {}",
+            peak
+        );
+    }
+
+    #[test]
+    fn dedup_no_repetition() {
+        let lines = vec![
+            "[0:00] Hello world".into(),
+            "[0:03] How are you".into(),
+            "[0:06] Fine thanks".into(),
+        ];
+        let result = dedup_segments(lines.clone());
+        assert_eq!(result, lines);
+    }
+
+    #[test]
+    fn dedup_collapses_exact_repetition() {
+        let lines = vec![
+            "[0:00] Hello world".into(),
+            "[0:03] Hello world".into(),
+            "[0:06] Hello world".into(),
+            "[0:09] Hello world".into(),
+            "[0:12] Something different".into(),
+        ];
+        let result = dedup_segments(lines);
+        assert_eq!(result.len(), 3); // first + marker + different
+        assert!(result[0].contains("Hello world"));
+        assert!(result[1].contains("repeated audio removed"));
+        assert!(result[2].contains("Something different"));
+    }
+
+    #[test]
+    fn dedup_collapses_near_identical() {
+        // Whisper often produces slight variations of the same repeated text
+        let lines = vec![
+            "[0:00] Ok bene le macedi diesel".into(),
+            "[0:03] Ok, bene le macedi diesel".into(),
+            "[0:06] Ok bene, le macedi diesel".into(),
+            "[0:09] Good morning".into(),
+        ];
+        let result = dedup_segments(lines);
+        assert_eq!(result.len(), 3); // first + marker + different
+        assert!(result[1].contains("repeated audio removed"));
+    }
+
+    #[test]
+    fn dedup_leaves_two_similar_alone() {
+        // Only 2 similar — below threshold of 3
+        let lines = vec![
+            "[0:00] Hello world".into(),
+            "[0:03] Hello world".into(),
+            "[0:06] Something else".into(),
+        ];
+        let result = dedup_segments(lines.clone());
+        assert_eq!(result, lines);
+    }
+
+    #[test]
+    fn dedup_handles_empty() {
+        let result = dedup_segments(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn dedup_handles_single_line() {
+        let lines = vec!["[0:00] Hello".into()];
+        let result = dedup_segments(lines.clone());
+        assert_eq!(result, lines);
+    }
+
+    #[test]
+    fn dedup_multiple_runs() {
+        let lines = vec![
+            "[0:00] First phrase".into(),
+            "[0:03] First phrase".into(),
+            "[0:06] First phrase".into(),
+            "[0:09] Second phrase".into(),
+            "[0:12] Second phrase".into(),
+            "[0:15] Second phrase".into(),
+            "[0:18] Second phrase".into(),
+            "[0:21] Normal text".into(),
+        ];
+        let result = dedup_segments(lines);
+        // Two collapsed runs + normal text
+        assert_eq!(result.len(), 5); // first + marker + second + marker + normal
+        assert!(result[1].contains("2 identical"));
+        assert!(result[3].contains("3 identical"));
+    }
+
+    #[test]
+    fn engine_defaults_to_whisper_dispatch() {
+        // Verify that the default engine config takes the whisper path
+        let config = Config::default();
+        assert_eq!(config.transcription.engine, "whisper");
+    }
+
+    #[test]
+    fn engine_not_available_without_feature() {
+        // When parakeet feature is not compiled in, should return EngineNotAvailable
+        #[cfg(not(feature = "parakeet"))]
+        {
+            let config = Config {
+                transcription: crate::config::TranscriptionConfig {
+                    engine: "parakeet".into(),
+                    ..crate::config::TranscriptionConfig::default()
+                },
+                ..Config::default()
+            };
+            // Use a dummy path — it should fail at the engine check, not file check
+            let result = transcribe(Path::new("/nonexistent/test.wav"), &config);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("parakeet"),
+                "error should mention parakeet: {}",
+                err
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_text_basic() {
+        let text = "[0.00 - 2.50] Hello world\n[3.00 - 5.10] How are you\n";
+        let config = Config::default();
+        let result = parse_parakeet_output(text, &config).unwrap();
+        let lines: Vec<&str> = result.trim().lines().collect();
+        assert_eq!(lines.len(), 2, "should have 2 lines: {:?}", lines);
+        assert!(
+            lines[0].contains("[0:00] Hello world"),
+            "first: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("[0:03] How are you"),
+            "second: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_empty_input() {
+        let config = Config::default();
+        let result = parse_parakeet_output("", &config);
+        assert!(result.is_err(), "empty input should fail");
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_plain_text_rejected() {
+        // Plain text without timestamps should be rejected (not faked as [0:00])
+        let text = "this is plain text output without timestamps";
+        let config = Config::default();
+        let result = parse_parakeet_output(text, &config);
+        assert!(result.is_err(), "plain text without timestamps should fail");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no [start - end] timestamps"),
+            "error should explain the issue: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_timestamp_formatting() {
+        // Verify that timestamps > 60s are formatted correctly
+        let text = "[125.00 - 126.00] late segment\n";
+        let config = Config::default();
+        let result = parse_parakeet_output(text, &config).unwrap();
+        assert!(
+            result.contains("[2:05]"),
+            "125s should be [2:05]: {}",
+            result
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_dedup_applied() {
+        // Repeated lines should be collapsed by the anti-hallucination pipeline
+        let text = "[0.00 - 1.00] Hello world\n\
+                     [1.00 - 2.00] Hello world\n\
+                     [2.00 - 3.00] Hello world\n\
+                     [3.00 - 4.00] Hello world\n\
+                     [5.00 - 6.00] Something different\n";
+        let config = Config::default();
+        let result = parse_parakeet_output(text, &config).unwrap();
+        let lines: Vec<&str> = result.trim().lines().collect();
+        assert!(
+            lines.len() < 5,
+            "dedup should collapse repetitions: {:?}",
+            lines
+        );
+        assert!(lines.last().unwrap().contains("Something different"));
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parse_parakeet_model_validation() {
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                engine: "parakeet".into(),
+                parakeet_model: "totally-fake-model".into(),
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+        let result = transcribe(std::path::Path::new("/nonexistent.wav"), &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown parakeet model"),
+            "should reject invalid model: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn write_wav_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.wav");
+
+        let samples: Vec<f32> = (0..16000)
+            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin())
+            .collect();
+
+        write_wav_16k_mono(&path, &samples).unwrap();
+
+        let reader = hound::WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 16000);
+        assert_eq!(spec.bits_per_sample, 16);
+        let read_samples: Vec<i16> = reader.into_samples().filter_map(|s| s.ok()).collect();
+        assert_eq!(read_samples.len(), 16000);
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn resolve_parakeet_model_missing() {
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                model_path: PathBuf::from("/tmp/no-such-dir"),
+                parakeet_model: "tdt-600m".into(),
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+        let result = resolve_parakeet_model_path(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("minutes setup --parakeet"),
+            "error should tell user how to fix it: {}",
+            err
+        );
     }
 }

@@ -12,6 +12,7 @@ categories = ["multimedia::audio", "command-line-utilities"]
 [features]
 default = ["whisper"]
 whisper = ["dep:whisper-rs", "whisper-guard/whisper"]
+parakeet = ["dep:tempfile"]  # subprocess-based, uses tempfile for concurrent safety
 diarize = ["dep:pyannote-rs"]
 cuda = ["whisper-rs/cuda"]
 metal = ["whisper-rs/metal"]
@@ -43,6 +44,7 @@ whisper-guard = { path = "../whisper-guard" }
 nnnoiseless = { workspace = true, optional = true }
 base64 = "0.22"
 rusqlite = { workspace = true }
+tempfile = { version = "3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
