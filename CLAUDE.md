@@ -6,8 +6,9 @@
 
 **Minutes** — open-source, privacy-first conversation memory layer for AI assistants. Captures any audio (meetings, voice memos, brain dumps), transcribes locally with whisper.cpp, diarizes speakers, and outputs searchable markdown with structured action items and decisions. Built with Rust + Tauri v2 + Node.js (MCP).
 
-**Three input modes, one pipeline:**
+**Four input modes, one pipeline:**
 - **Live recording**: `minutes record` / `minutes stop` — for meetings, calls, conversations
+- **Live transcript**: `minutes live` / `minutes stop` — real-time transcription with delta reads for AI coaching mid-meeting
 - **Notetaking**: `minutes note "important point"` — timestamped annotations during recording
 - **Folder watcher**: `minutes watch` — auto-processes voice memos from iPhone/iCloud
 
@@ -204,16 +205,17 @@ minutes/
 │   │   ├── calendar.rs        # Calendar integration (upcoming meetings)
 │   │   ├── daily_notes.rs     # Daily note append for dictation/memos
 │   │   ├── dictation.rs       # Dictation mode (speak → clipboard + daily note)
+│   │   ├── live_transcript.rs # Live transcript mode (real-time JSONL + WAV, delta reads, AI coaching)
 │   │   ├── health.rs          # System health checks (model, mic, disk, watcher)
 │   │   ├── hotkey_macos.rs    # macOS global hotkey registration
 │   │   ├── screen.rs          # Screen context capture (screenshots)
 │   │   ├── vad.rs             # Voice activity detection
 │   │   └── vault.rs           # Obsidian/Logseq vault sync
 │   ├── whisper-guard/          # Standalone anti-hallucination toolkit (segment dedup, silence strip, whisper params)
-│   ├── cli/                   # CLI binary — 29 commands
+│   ├── cli/                   # CLI binary — 31 commands
 │   ├── reader/                # Lightweight read-only meeting parser (no audio deps)
 │   ├── assets/                # Bundled assets (demo.wav)
-│   └── mcp/                   # MCP server — 10 tools + 6 resources + MCP App dashboard
+│   └── mcp/                   # MCP server — 12 tools + 6 resources + MCP App dashboard
 │       └── ui/                # Interactive dashboard (vanilla TS, builds to single-file HTML)
 ├── site/                      # Landing page (Next.js + Remotion demo player)
 ├── tauri/                     # Tauri v2 menu bar app + singleton AI Assistant
@@ -260,6 +262,7 @@ node test/mcp_tools_test.mjs                        # 8 MCP integration tests
 - **Markdown + YAML frontmatter** for storage — universal, works with everything
 - **Structured extraction** — action items + decisions in frontmatter as queryable YAML
 - **No API keys needed** — Claude summarizes conversationally via MCP tools
+- **Live transcript** — per-utterance whisper → JSONL append with PidGuard flock for session exclusivity. Delta reads via line cursor or wall-clock duration. Optional WAV preservation for post-meeting reprocessing. Agent-agnostic: JSONL readable by any agent, MCP tools for Claude, CLAUDE.md context injection for Codex/Gemini.
 
 ## Key Patterns
 
@@ -278,9 +281,9 @@ node test/mcp_tools_test.mjs                        # 8 MCP integration tests
 
 ## Test Coverage
 
-~250 tests total:
+~255 tests total:
 - 27 whisper-guard unit tests (resample, normalize, strip_silence, dedup_segments, dedup_interleaved, trim_trailing_noise, clean_transcript + 1 doctest)
-- 120 core unit tests (all modules including screen, calendar, config, watch, streaming whisper, vault, dictation, health, vad, hotkey)
+- 124 core unit tests (all modules including screen, calendar, config, watch, streaming whisper, vault, dictation, live_transcript, health, vad, hotkey)
 - 10 integration tests (pipeline, permissions, collisions, search filters)
 - 23 Tauri unit tests (commands, call detection)
 - 2 CLI tests
@@ -291,10 +294,11 @@ node test/mcp_tools_test.mjs                        # 8 MCP integration tests
 
 ## Claude Ecosystem Integration
 
-- **MCP Server**: 10 tools + 6 resources for Claude Desktop / Cowork / Dispatch (`npx minutes-mcp` for zero-install)
+- **MCP Server**: 12 tools + 6 resources for Claude Desktop / Cowork / Dispatch (`npx minutes-mcp` for zero-install)
 - **Claude Code Plugin**: 12 skills (8 core + 3 interactive lifecycle + 1 ghost context) + meeting-analyst agent + PostToolUse hook
 - **Interactive meeting lifecycle**: `/minutes prep` → record → `/minutes debrief` → `/minutes weekly` with skill chaining via `.prep.md` files
 - **Conversational summarization**: Claude reads transcripts via MCP, no API key needed
 - **Auto-tagging + alerts**: PostToolUse hook tags meetings with git repo, checks for decision conflicts, surfaces overdue action items
 - **Proactive reminders**: SessionStart hook checks calendar for upcoming meetings and nudges `/minutes prep`
 - **Desktop assistant**: Tauri AI Assistant is a singleton session that can switch focus into a selected meeting without spawning parallel assistant workspaces
+- **Live coaching**: Tauri Live Mode toggle starts real-time transcription; CLAUDE.md in assistant workspace auto-updates to tell any agent (Claude, Codex, Gemini) about the live JSONL file. Agent-agnostic design: MCP tools for Claude, file reads for everything else.

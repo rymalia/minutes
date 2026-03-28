@@ -432,6 +432,8 @@ fn main() {
             pty_manager: Arc::new(Mutex::new(pty::PtyManager::default())),
             dictation_active: Arc::new(AtomicBool::new(false)),
             dictation_stop_flag: Arc::new(AtomicBool::new(false)),
+            live_transcript_active: Arc::new(AtomicBool::new(false)),
+            live_transcript_stop_flag: Arc::new(AtomicBool::new(false)),
         })
         .setup(move |app| {
             let initial_recording = minutes_core::pid::status().recording;
@@ -964,6 +966,9 @@ fn main() {
             commands::cmd_dictation_hotkey_status,
             commands::cmd_check_accessibility,
             commands::cmd_request_accessibility,
+            commands::cmd_start_live_transcript,
+            commands::cmd_stop_live_transcript,
+            commands::cmd_live_transcript_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running minutes app");

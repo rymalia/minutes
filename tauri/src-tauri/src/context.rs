@@ -231,6 +231,9 @@ pub fn generate_assistant_context(config: &Config) -> Result<String, String> {
     md.push_str("- `minutes person \"name\"` — build a profile across meetings\n");
     md.push_str("- `minutes list` — list recent meetings and memos\n");
     md.push_str("- `minutes record` / `minutes stop` — start/stop recording\n");
+    md.push_str("- `minutes live` / `minutes stop` — start/stop live transcript (real-time)\n");
+    md.push_str("- `minutes transcript --since 5m` — read last 5 minutes of live transcript\n");
+    md.push_str("- `minutes transcript --status` — check if a live session is active\n");
     md.push_str("- `minutes note \"text\"` — add a timestamped note to current recording\n");
     md.push_str("- `minutes process <file>` — process an audio file\n");
     md.push_str("- `minutes qmd status` — check QMD collection status\n");

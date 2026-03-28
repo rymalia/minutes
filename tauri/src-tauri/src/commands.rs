@@ -26,6 +26,8 @@ pub struct AppState {
     pub dictation_stop_flag: Arc<AtomicBool>,
     pub dictation_shortcut_enabled: Arc<AtomicBool>,
     pub dictation_shortcut: Arc<Mutex<String>>,
+    pub live_transcript_active: Arc<AtomicBool>,
+    pub live_transcript_stop_flag: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2972,6 +2974,167 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
         Ok(_) => eprintln!("[dictation] overlay shown"),
         Err(e) => eprintln!("[dictation] overlay failed: {}", e),
     }
+}
+
+// ── Live transcript commands ─────────────────────────────────
+
+#[tauri::command]
+pub fn cmd_start_live_transcript(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    if state.live_transcript_active.load(Ordering::Relaxed) {
+        return Err("Live transcript already active".into());
+    }
+    if recording_active(&state.recording) {
+        return Err("Recording in progress — stop recording first".into());
+    }
+    if state.dictation_active.load(Ordering::Relaxed) {
+        return Err("Dictation in progress — stop dictation first".into());
+    }
+
+    let active = state.live_transcript_active.clone();
+    let stop_flag = state.live_transcript_stop_flag.clone();
+    stop_flag.store(false, Ordering::Relaxed);
+    active.store(true, Ordering::Relaxed);
+
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        let config = Config::load();
+
+        // Update the assistant workspace context to mention the live transcript
+        if let Ok(workspace) = crate::context::create_workspace(&config) {
+            update_assistant_live_context(&workspace, true);
+        }
+
+        let result = minutes_core::live_transcript::run(stop_flag.clone(), &config);
+
+        active.store(false, Ordering::Relaxed);
+        stop_flag.store(false, Ordering::Relaxed);
+
+        // Clear the live transcript mention from assistant context
+        if let Ok(workspace) = crate::context::create_workspace(&config) {
+            update_assistant_live_context(&workspace, false);
+        }
+
+        match result {
+            Ok((lines, duration, _path)) => {
+                eprintln!(
+                    "[live-transcript] ended: {} lines in {:.0}s",
+                    lines, duration
+                );
+                if let Some(win) = app_clone.get_webview_window("main") {
+                    win.emit(
+                        "live-transcript:stopped",
+                        serde_json::json!({
+                            "lines": lines,
+                            "duration_secs": duration,
+                        }),
+                    )
+                    .ok();
+                }
+            }
+            Err(e) => {
+                eprintln!("[live-transcript] error: {}", e);
+            }
+        }
+
+        crate::update_tray_state(&app_clone, false);
+    });
+
+    // Emit event to frontend
+    if let Some(win) = app.get_webview_window("main") {
+        win.emit("live-transcript:started", ()).ok();
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cmd_stop_live_transcript(state: tauri::State<AppState>) -> Result<(), String> {
+    if state.live_transcript_active.load(Ordering::Relaxed) {
+        state
+            .live_transcript_stop_flag
+            .store(true, Ordering::Relaxed);
+        return Ok(());
+    }
+    // Check for external live transcript (started from CLI)
+    let lt_pid = minutes_core::pid::live_transcript_pid_path();
+    if let Ok(Some(pid)) = minutes_core::pid::check_pid_file(&lt_pid) {
+        minutes_core::pid::write_stop_sentinel()
+            .map_err(|e| format!("failed to write stop sentinel: {}", e))?;
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+        return Ok(());
+    }
+    Err("No live transcript session active".into())
+}
+
+#[tauri::command]
+pub fn cmd_live_transcript_status(state: tauri::State<AppState>) -> serde_json::Value {
+    let in_app_active = state.live_transcript_active.load(Ordering::Relaxed);
+    let status = minutes_core::live_transcript::session_status();
+    serde_json::json!({
+        "active": in_app_active || status.active,
+        "line_count": status.line_count,
+        "duration_secs": status.duration_secs,
+    })
+}
+
+/// Update the CLAUDE.md in the assistant workspace to mention (or un-mention)
+/// the live transcript. This makes any agent (Claude, Codex, Gemini) aware
+/// of the live JSONL file without requiring MCP.
+fn update_assistant_live_context(workspace: &std::path::Path, live_active: bool) {
+    let claude_md = workspace.join("CLAUDE.md");
+    let existing = std::fs::read_to_string(&claude_md).unwrap_or_default();
+
+    // Marker we look for to find/replace the live transcript section
+    let marker_start = "<!-- LIVE_TRANSCRIPT_START -->";
+    let marker_end = "<!-- LIVE_TRANSCRIPT_END -->";
+
+    // Remove any existing live transcript section
+    let cleaned = if let (Some(start), Some(end)) =
+        (existing.find(marker_start), existing.find(marker_end))
+    {
+        let end_pos = end + marker_end.len();
+        format!("{}{}", &existing[..start], &existing[end_pos..])
+    } else {
+        existing.clone()
+    };
+
+    let updated = if live_active {
+        let jsonl_path = minutes_core::pid::live_transcript_jsonl_path();
+        let section = format!(
+            "\n{marker_start}\n\
+            ## Live Transcript Active\n\
+            \n\
+            A live meeting transcript is being recorded right now.\n\
+            \n\
+            **JSONL file:** `{path}`\n\
+            \n\
+            Each line is a JSON object with: `line` (sequence number), `ts` (wall clock), \
+            `offset_ms` (ms since session start), `duration_ms`, `text`, `speaker` (null for now).\n\
+            \n\
+            To read the latest utterances:\n\
+            - **File:** `cat {path} | tail -5` (last 5 utterances)\n\
+            - **CLI:** `minutes transcript --since 5m` (last 5 minutes)\n\
+            - **MCP:** Use `read_live_transcript` tool with `since: \"5m\"`\n\
+            \n\
+            The user may ask for coaching during the meeting. Read the recent transcript \
+            to understand what's being discussed, then provide tactical advice.\n\
+            {marker_end}\n",
+            marker_start = marker_start,
+            marker_end = marker_end,
+            path = jsonl_path.display(),
+        );
+        format!("{}{}", cleaned.trim_end(), section)
+    } else {
+        cleaned
+    };
+
+    std::fs::write(&claude_md, updated.trim_end().to_string() + "\n").ok();
 }
 
 // ── Native hotkey for dictation (macOS only) ─────────────────
