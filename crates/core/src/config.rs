@@ -85,6 +85,7 @@ pub struct SummarizationConfig {
     pub chunk_max_tokens: usize,
     pub ollama_url: String,
     pub ollama_model: String,
+    pub mistral_model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +319,7 @@ impl Default for SummarizationConfig {
             chunk_max_tokens: 4000,
             ollama_url: "http://localhost:11434".into(),
             ollama_model: "llama3.2".into(),
+            mistral_model: "mistral-large-latest".into(),
         }
     }
 }
