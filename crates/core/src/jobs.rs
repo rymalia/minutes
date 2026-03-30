@@ -289,15 +289,60 @@ pub fn list_jobs() -> Vec<ProcessingJob> {
     jobs
 }
 
+pub fn display_jobs(limit: Option<usize>, include_terminal: bool) -> Vec<ProcessingJob> {
+    let mut jobs = list_jobs();
+    jobs.sort_by(|a, b| {
+        let a_active = !a.state.is_terminal();
+        let b_active = !b.state.is_terminal();
+        b_active
+            .cmp(&a_active)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+
+    if !include_terminal {
+        jobs.retain(|job| !job.state.is_terminal());
+    }
+
+    if let Some(limit) = limit {
+        jobs.truncate(limit);
+    }
+
+    jobs
+}
+
 pub fn active_jobs() -> Vec<ProcessingJob> {
-    list_jobs()
-        .into_iter()
-        .filter(|job| !job.state.is_terminal())
-        .collect()
+    display_jobs(None, false)
 }
 
 pub fn active_job_count() -> usize {
     active_jobs().len()
+}
+
+pub fn requeue_job(job_id: &str) -> std::io::Result<Option<ProcessingJob>> {
+    let Some(job) = load_job(job_id) else {
+        return Ok(None);
+    };
+
+    let audio_path = PathBuf::from(&job.audio_path);
+    if !audio_path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("audio file missing for job {}", job_id),
+        ));
+    }
+
+    let requeued = enqueue_capture_job(
+        job.mode,
+        job.title.clone(),
+        audio_path,
+        job.user_notes.clone(),
+        job.pre_context.clone(),
+        job.recording_started_at,
+        job.recording_finished_at,
+        job.calendar_event.clone(),
+    )?;
+    sync_processing_status();
+    Ok(Some(requeued))
 }
 
 pub fn processing_summary() -> Option<ProcessingJob> {

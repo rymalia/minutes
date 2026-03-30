@@ -678,6 +678,52 @@ server.tool(
   }
 );
 
+server.tool(
+  "list_processing_jobs",
+  "List background processing jobs for recent recordings, including queued, transcript-ready, failed, and completed work.",
+  {
+    limit: z.number().optional().default(10).describe("Maximum number of jobs"),
+    include_completed: z.boolean().optional().default(true).describe("Include completed and failed jobs"),
+  },
+  { title: "Processing Jobs", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  async ({ limit, include_completed }) => {
+    if (!(await isCliAvailable())) {
+      return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
+    }
+
+    const args = ["jobs", "--json", "--limit", String(limit)];
+    if (include_completed) args.push("--all");
+
+    try {
+      const { stdout } = await runMinutes(args);
+      const jobs = parseJsonOutput(stdout);
+      if (!Array.isArray(jobs) || jobs.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No processing jobs right now." }],
+          structuredContent: { jobs: [] },
+        };
+      }
+
+      const lines = jobs.map((job: any) => {
+        const title = job.title || "Queued recording";
+        const state = job.state || "queued";
+        const stage = job.stage ? ` — ${job.stage}` : "";
+        return `- ${job.id}: ${state} — ${title}${stage}`;
+      });
+
+      return {
+        content: [{ type: "text" as const, text: `Processing jobs:\n\n${lines.join("\n")}` }],
+        structuredContent: { jobs },
+      };
+    } catch (error: any) {
+      return {
+        content: [{ type: "text" as const, text: `Failed to list processing jobs: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
 // ── Tool: list_meetings ─────────────────────────────────────
 
 registerAppTool(

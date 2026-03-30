@@ -23,6 +23,7 @@
 | 2026-03-29 | self | Passed two positional test filters to `cargo test`, which Rust interprets as an invalid command rather than "run both sets" | For Rust verification, use one filter per `cargo test` invocation or run the broader target once instead of stacking multiple test names |
 | 2026-03-29 | self | Tried to run new dictation unit tests without enabling the `streaming` feature, so the `dictation` module wasn't present in the test binary and the tests silently appeared missing | When verifying dictation/live-transcript behavior in `minutes-core`, use `cargo test -p minutes-core --features streaming ...` or inspect `cargo test -- --list` first if tests don't appear |
 | 2026-03-30 | self | Started decoupling recording from processing without first accounting for `~/.minutes/current.wav` being a fixed shared path, which would let the next recording overwrite the previous job's audio | For any async/background recording pipeline in this repo, move the finished capture and its screen-context directory to a job-owned path before releasing the live recording lock |
+| 2026-03-30 | self | Used backticks inside a `bd create --description` shell string and zsh tried to execute `minutes jobs` instead of treating it as literal text | When passing issue descriptions through the shell, avoid backticks in double-quoted strings or use single-quoted/heredoc input so command substitution cannot fire |
 
 ## User Preferences
 - For coding/debugging/testing/review tasks, prioritize technical implementation detail and concrete verification.

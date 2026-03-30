@@ -103,6 +103,37 @@ pub struct ProcessingJobView {
     pub word_count: Option<usize>,
 }
 
+fn processing_job_view(job: minutes_core::jobs::ProcessingJob) -> ProcessingJobView {
+    ProcessingJobView {
+        id: job.id,
+        title: job.title.unwrap_or_else(|| "Queued recording".into()),
+        mode: match job.mode {
+            CaptureMode::Meeting => "meeting".into(),
+            CaptureMode::QuickThought => "quick-thought".into(),
+            CaptureMode::Dictation => "dictation".into(),
+            CaptureMode::LiveTranscript => "live-transcript".into(),
+        },
+        state: match job.state {
+            minutes_core::jobs::JobState::Queued => "queued".into(),
+            minutes_core::jobs::JobState::Transcribing => "transcribing".into(),
+            minutes_core::jobs::JobState::TranscriptOnly => "transcript-only".into(),
+            minutes_core::jobs::JobState::Diarizing => "diarizing".into(),
+            minutes_core::jobs::JobState::Summarizing => "summarizing".into(),
+            minutes_core::jobs::JobState::Saving => "saving".into(),
+            minutes_core::jobs::JobState::Complete => "complete".into(),
+            minutes_core::jobs::JobState::Failed => "failed".into(),
+        },
+        stage: job.stage,
+        output_path: job.output_path,
+        audio_path: job.audio_path,
+        error: job.error,
+        created_at: job.created_at.to_rfc3339(),
+        started_at: job.started_at.map(|ts| ts.to_rfc3339()),
+        finished_at: job.finished_at.map(|ts| ts.to_rfc3339()),
+        word_count: job.word_count,
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HotkeyChoice {
     pub value: String,
@@ -1694,34 +1725,7 @@ pub fn cmd_status(state: tauri::State<AppState>) -> serde_json::Value {
         .and_then(|notice| notice.clone());
     let processing_jobs: Vec<ProcessingJobView> = minutes_core::jobs::active_jobs()
         .into_iter()
-        .map(|job| ProcessingJobView {
-            id: job.id,
-            title: job.title.unwrap_or_else(|| "Queued recording".into()),
-            mode: match job.mode {
-                CaptureMode::Meeting => "meeting".into(),
-                CaptureMode::QuickThought => "quick-thought".into(),
-                CaptureMode::Dictation => "dictation".into(),
-                CaptureMode::LiveTranscript => "live-transcript".into(),
-            },
-            state: match job.state {
-                minutes_core::jobs::JobState::Queued => "queued".into(),
-                minutes_core::jobs::JobState::Transcribing => "transcribing".into(),
-                minutes_core::jobs::JobState::TranscriptOnly => "transcript-only".into(),
-                minutes_core::jobs::JobState::Diarizing => "diarizing".into(),
-                minutes_core::jobs::JobState::Summarizing => "summarizing".into(),
-                minutes_core::jobs::JobState::Saving => "saving".into(),
-                minutes_core::jobs::JobState::Complete => "complete".into(),
-                minutes_core::jobs::JobState::Failed => "failed".into(),
-            },
-            stage: job.stage,
-            output_path: job.output_path,
-            audio_path: job.audio_path,
-            error: job.error,
-            created_at: job.created_at.to_rfc3339(),
-            started_at: job.started_at.map(|ts| ts.to_rfc3339()),
-            finished_at: job.finished_at.map(|ts| ts.to_rfc3339()),
-            word_count: job.word_count,
-        })
+        .map(processing_job_view)
         .collect();
 
     // Get elapsed time if recording
@@ -1769,6 +1773,44 @@ pub fn cmd_status(state: tauri::State<AppState>) -> serde_json::Value {
         "elapsed": elapsed,
         "audioLevel": audio_level,
     })
+}
+
+#[tauri::command]
+pub fn cmd_processing_jobs(limit: Option<usize>) -> serde_json::Value {
+    let jobs: Vec<ProcessingJobView> = minutes_core::jobs::display_jobs(limit, true)
+        .into_iter()
+        .map(processing_job_view)
+        .collect();
+    serde_json::to_value(jobs).unwrap_or(serde_json::json!([]))
+}
+
+#[tauri::command]
+pub fn cmd_retry_processing_job(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    job_id: String,
+) -> Result<(), String> {
+    let queued = minutes_core::jobs::requeue_job(&job_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Processing job not found: {}", job_id))?;
+
+    minutes_core::pid::set_processing_status(
+        queued.stage.as_deref(),
+        Some(queued.mode),
+        queued.title.as_deref(),
+        Some(&queued.id),
+        minutes_core::jobs::active_job_count(),
+    )
+    .ok();
+    sync_processing_indicator(&state.processing, &state.processing_stage);
+    spawn_processing_worker(
+        app,
+        state.processing.clone(),
+        state.processing_stage.clone(),
+        state.latest_output.clone(),
+        state.completion_notifications_enabled.clone(),
+    );
+    Ok(())
 }
 
 /// Scan ~/.minutes/preps/ for existing prep files and return a set of

@@ -57,6 +57,21 @@ enum Commands {
     /// Check if a recording is in progress
     Status,
 
+    /// Inspect background processing jobs
+    Jobs {
+        /// Include completed and failed jobs
+        #[arg(long)]
+        all: bool,
+
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+
+        /// Maximum number of jobs to return
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
     /// Show effective Minutes paths from the loaded config
     Paths {
         /// Output raw JSON instead of formatted text
@@ -457,6 +472,7 @@ fn main() -> Result<()> {
         Commands::Stop => cmd_stop(&config),
         Commands::ProcessQueue => cmd_process_queue(&config),
         Commands::Status => cmd_status(),
+        Commands::Jobs { all, json, limit } => cmd_jobs(all, json, limit),
         Commands::Paths { json } => cmd_paths(json, &config),
         Commands::Search {
             query,
@@ -891,6 +907,60 @@ fn cmd_status() -> Result<()> {
     let status = minutes_core::pid::status();
     let json = serde_json::to_string_pretty(&status)?;
     println!("{}", json);
+    Ok(())
+}
+
+fn cmd_jobs(include_terminal: bool, json_mode: bool, limit: usize) -> Result<()> {
+    let jobs = minutes_core::jobs::display_jobs(Some(limit), include_terminal);
+
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&jobs)?);
+        return Ok(());
+    }
+
+    if jobs.is_empty() {
+        println!("No processing jobs.");
+        return Ok(());
+    }
+
+    for job in jobs {
+        let mode = match job.mode {
+            CaptureMode::Meeting => "meeting",
+            CaptureMode::QuickThought => "quick thought",
+            CaptureMode::Dictation => "dictation",
+            CaptureMode::LiveTranscript => "live transcript",
+        };
+        let title = job.title.unwrap_or_else(|| "Queued recording".into());
+        let state = match job.state {
+            minutes_core::jobs::JobState::Queued => "queued",
+            minutes_core::jobs::JobState::Transcribing => "transcribing",
+            minutes_core::jobs::JobState::TranscriptOnly => "transcript-ready",
+            minutes_core::jobs::JobState::Diarizing => "diarizing",
+            minutes_core::jobs::JobState::Summarizing => "summarizing",
+            minutes_core::jobs::JobState::Saving => "saving",
+            minutes_core::jobs::JobState::Complete => "complete",
+            minutes_core::jobs::JobState::Failed => "failed",
+        };
+
+        println!("{}  {}  {}", job.id, state, title);
+        println!("  mode: {}", mode);
+        if let Some(stage) = job.stage {
+            println!("  stage: {}", stage);
+        }
+        if let Some(path) = job.output_path {
+            println!("  output: {}", path);
+        }
+        if let Some(words) = job.word_count {
+            println!("  words: {}", words);
+        }
+        if let Some(error) = job.error {
+            println!("  error: {}", error);
+        }
+        println!("  created: {}", job.created_at.to_rfc3339());
+        println!("  audio: {}", job.audio_path);
+        println!();
+    }
+
     Ok(())
 }
 

@@ -1767,6 +1767,7 @@
       <button class="btn btn-icon" id="btn-settings" title="Settings (⌘,)">⚙</button>
       <button class="header-chip dictation-shortcut" id="dictation-shortcut-chip">Dictate</button>
       <button class="header-chip readiness" id="btn-readiness">Readiness</button>
+      <button class="header-chip" id="btn-jobs">Jobs <span id="jobs-count">0</span></button>
       <button class="header-chip" id="btn-recovery">Recovery <span id="recovery-count">0</span></button>
       <span class="status-pill" id="status-pill">idle</span>
     </div>
@@ -1964,6 +1965,22 @@
       </div>
       <div class="recovery-scroll" id="recovery-scroll">
         <div class="recovery-empty">No recovery items right now.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Jobs -->
+  <div class="recovery-overlay" id="jobs-overlay">
+    <div class="recovery-card" role="dialog" aria-modal="true" aria-labelledby="jobs-title">
+      <div class="recovery-header">
+        <div>
+          <div class="recovery-title" id="jobs-title">Jobs Center</div>
+          <div class="recovery-sub" id="jobs-subtitle">Background processing jobs for recent recordings. Open transcripts early, retry failures, and keep moving.</div>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="btn-jobs-close">Close</button>
+      </div>
+      <div class="recovery-scroll" id="jobs-scroll">
+        <div class="recovery-empty">No processing jobs right now.</div>
       </div>
     </div>
   </div>
@@ -2394,6 +2411,10 @@
     const readinessOverlay = document.getElementById('readiness-overlay');
     const readinessButton = document.getElementById('btn-readiness');
     const readinessScroll = document.getElementById('readiness-scroll');
+    const jobsButton = document.getElementById('btn-jobs');
+    const jobsCount = document.getElementById('jobs-count');
+    const jobsOverlay = document.getElementById('jobs-overlay');
+    const jobsScroll = document.getElementById('jobs-scroll');
     const dictationShortcutChip = document.getElementById('dictation-shortcut-chip');
     const recoveryOverlay = document.getElementById('recovery-overlay');
     const recoveryButton = document.getElementById('btn-recovery');
@@ -2417,6 +2438,7 @@
     let processingJobs = [];
     let readinessItems = [];
     let recoveryItems = [];
+    let jobsHistory = [];
     let notifyOnCompletion = true;
     let playCaptureCues = true;
     let hotkeyEnabled = false;
@@ -2633,6 +2655,168 @@
       }
     }
 
+    function updateJobsChip(activeCount) {
+      jobsCount.textContent = String(activeCount || 0);
+      jobsButton.classList.toggle('active', (activeCount || 0) > 0);
+    }
+
+    function closeJobs() {
+      jobsOverlay.classList.remove('active');
+    }
+
+    function formatJobTimestamp(isoString) {
+      if (!isoString) return '';
+      const date = new Date(isoString);
+      if (!Number.isFinite(date.getTime())) return '';
+      return date.toLocaleString([], {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      });
+    }
+
+    async function loadProcessingJobsCenter() {
+      try {
+        jobsHistory = await invoke('cmd_processing_jobs', { limit: 24 });
+      } catch (e) {
+        console.error('Processing jobs:', e);
+        jobsHistory = [];
+      }
+
+      jobsScroll.replaceChildren();
+      if (!jobsHistory.length) {
+        const empty = document.createElement('div');
+        empty.className = 'recovery-empty';
+        empty.textContent = 'No processing jobs right now.';
+        jobsScroll.appendChild(empty);
+        return;
+      }
+
+      const list = document.createElement('div');
+      list.className = 'recovery-list';
+
+      const activeJobs = jobsHistory.filter((job) => !['complete', 'failed'].includes(job.state));
+      const recentJobs = jobsHistory.filter((job) => ['complete', 'failed'].includes(job.state));
+
+      function addSection(titleText, jobs) {
+        if (!jobs.length) return;
+        const heading = document.createElement('div');
+        heading.className = 'about-item-title';
+        heading.style.margin = '4px 4px 10px';
+        heading.textContent = titleText;
+        list.appendChild(heading);
+
+        for (const job of jobs) {
+          const card = document.createElement('div');
+          card.className = 'recovery-item';
+
+          const top = document.createElement('div');
+          top.className = 'recovery-item-top';
+
+          const title = document.createElement('div');
+          title.className = 'recovery-item-title';
+          title.textContent = job.title || 'Queued recording';
+
+          const kind = document.createElement('div');
+          kind.className = 'recovery-kind';
+          kind.textContent = processingStateLabel(job);
+
+          top.appendChild(title);
+          top.appendChild(kind);
+
+          const detail = document.createElement('div');
+          detail.className = 'recovery-item-detail';
+          detail.textContent = job.error
+            || job.stage
+            || (job.state === 'complete'
+              ? 'Finished processing.'
+              : job.state === 'transcript-only'
+                ? 'Transcript is ready while enrichment continues.'
+                : 'Queued for background processing.');
+
+          const path = document.createElement('div');
+          path.className = 'recovery-item-path';
+          path.textContent = job.outputPath || job.audioPath;
+
+          const meta = document.createElement('div');
+          meta.className = 'recovery-item-detail';
+          meta.style.marginTop = '6px';
+          const stamp = formatJobTimestamp(job.finishedAt || job.startedAt || job.createdAt);
+          meta.textContent = `${job.mode === 'quick-thought' ? 'Quick thought' : 'Meeting'}${stamp ? ` · ${stamp}` : ''}${job.wordCount ? ` · ${job.wordCount} words` : ''}`;
+
+          const actions = document.createElement('div');
+          actions.className = 'recovery-actions';
+
+          if (job.outputPath) {
+            const openOutput = document.createElement('button');
+            openOutput.className = 'btn btn-secondary btn-sm';
+            openOutput.textContent = job.state === 'transcript-only' ? 'Open Transcript' : 'Open';
+            openOutput.addEventListener('click', async () => {
+              try {
+                await openMeetingDetail(job.outputPath);
+              } catch (e) {
+                console.error('Open processing job output:', e);
+              }
+            });
+            actions.appendChild(openOutput);
+          }
+
+          const openCapture = document.createElement('button');
+          openCapture.className = 'btn btn-secondary btn-sm';
+          openCapture.textContent = job.outputPath ? 'Open Capture' : 'Open';
+          openCapture.addEventListener('click', async () => {
+            try {
+              await invoke('cmd_open_file', { path: job.audioPath });
+            } catch (e) {
+              console.error('Open processing job capture:', e);
+            }
+          });
+          actions.appendChild(openCapture);
+
+          const folder = document.createElement('button');
+          folder.className = 'btn btn-secondary btn-sm';
+          folder.textContent = desktopCapabilities.folderRevealLabel || 'Show in Folder';
+          folder.addEventListener('click', async () => {
+            try {
+              const target = parentPath(job.outputPath || job.audioPath);
+              await invoke('cmd_open_file', { path: target });
+            } catch (e) {
+              console.error('Open processing job folder:', e);
+            }
+          });
+          actions.appendChild(folder);
+
+          if (job.state === 'failed') {
+            const retry = document.createElement('button');
+            retry.className = 'btn btn-secondary btn-sm';
+            retry.textContent = 'Queue Again';
+            retry.addEventListener('click', async () => {
+              try {
+                await invoke('cmd_retry_processing_job', { jobId: job.id });
+                await loadProcessingJobsCenter();
+                startFastPoll();
+              } catch (e) {
+                console.error('Retry processing job:', e);
+              }
+            });
+            actions.appendChild(retry);
+          }
+
+          card.appendChild(top);
+          card.appendChild(detail);
+          card.appendChild(path);
+          card.appendChild(meta);
+          card.appendChild(actions);
+          list.appendChild(card);
+        }
+      }
+
+      addSection('ACTIVE', activeJobs);
+      addSection('RECENT', recentJobs);
+      jobsScroll.appendChild(list);
+    }
+
     // ── Status polling ──
     async function checkStatus() {
       try {
@@ -2642,6 +2826,7 @@
         const mode = status.recordingMode || 'meeting';
         isRecording = status.recording;
         isProcessing = !!status.processing;
+        updateJobsChip(status.processingJobCount || 0);
         renderProcessingJobs(status.processingJobs || []);
         updateOutputNotice(status.latestOutput);
 
@@ -2747,6 +2932,7 @@
           if (wasRecording || wasProcessing || wasLive) {
             stopFastPoll();
             loadMeetings(); // Refresh list
+            if (jobsOverlay.classList.contains('active')) loadProcessingJobsCenter();
 
             // Auto-open the result when processing completes successfully
             if (wasProcessing && latestOutput && latestOutput.kind === 'saved') {
@@ -3147,6 +3333,15 @@
     document.getElementById('btn-readiness-close').addEventListener('click', closeReadiness);
     readinessOverlay.addEventListener('click', (e) => {
       if (e.target === readinessOverlay) closeReadiness();
+    });
+
+    jobsButton.addEventListener('click', () => {
+      loadProcessingJobsCenter();
+      jobsOverlay.classList.add('active');
+    });
+    document.getElementById('btn-jobs-close').addEventListener('click', closeJobs);
+    jobsOverlay.addEventListener('click', (e) => {
+      if (e.target === jobsOverlay) closeJobs();
     });
 
     notificationToggle.addEventListener('click', async () => {
@@ -4387,6 +4582,9 @@
       }
       if (e.key === 'Escape' && recoveryOverlay.classList.contains('active')) {
         closeRecovery();
+      }
+      if (e.key === 'Escape' && jobsOverlay.classList.contains('active')) {
+        closeJobs();
       }
       if (e.key === 'Escape' && detailOverlay.classList.contains('active')) {
         closeDetailView();
