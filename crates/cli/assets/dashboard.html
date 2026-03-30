@@ -116,7 +116,7 @@
   .meeting-item {
     display: grid; grid-template-columns: 56px 1fr auto; gap: 12px;
     padding: 10px 12px; border-radius: 6px; align-items: start; transition: background 0.15s ease;
-    cursor: default;
+    cursor: pointer;
   }
   .meeting-item:hover { background: var(--bg-elevated); }
   .meeting-date { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); padding-top: 2px; line-height: 1.4; }
@@ -302,7 +302,7 @@
     var sn=m.snippet?E(m.snippet):'',ta=sn?' title="'+sn.replace(/"/g,'&quot;')+'"':'';
     var sp=!isMemo&&m.speaker_count?m.speaker_count+' speaker'+(m.speaker_count>1?'s':''):'';
     var cls=isMemo?'meeting-item memo-item':'meeting-item';
-    return '<div class="'+cls+'" tabindex="0"'+ta+'><div class="meeting-date">'+D(m.date)+'</div><div class="meeting-info"><h4>'+E(m.title||'Untitled')+'</h4><div class="meeting-meta">'+(m.duration?'<span>'+E(m.duration)+'</span>':'')+(sp?'<span>'+sp+'</span>':'')+'</div></div><div class="meeting-tags">'+tags+'</div></div>';
+    return '<div class="'+cls+'" tabindex="0" data-path="'+E(m.path)+'"'+ta+'><div class="meeting-date">'+D(m.date)+'</div><div class="meeting-info"><h4>'+E(m.title||'Untitled')+'</h4><div class="meeting-meta">'+(m.duration?'<span>'+E(m.duration)+'</span>':'')+(sp?'<span>'+sp+'</span>':'')+'</div></div><div class="meeting-tags">'+tags+'</div></div>';
   }
 
   fetch('/api/data').then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).then(function(data){
@@ -405,6 +405,14 @@
       var isOverdue=!a.done&&a.due&&!isNaN(new Date(a.due))&&new Date(a.due)<now;
       return '<div class="action-item'+(isOverdue?' action-overdue':'')+'"><div class="action-check'+(a.done?' done':'')+(isOverdue?' check-overdue':'')+'"></div><div><div class="action-text'+(a.done?' done':'')+'">'+E(a.task)+'</div><div class="action-due'+(isOverdue?' due-overdue':'')+'">'+SD(a.date)+' \u00B7 '+E(a.source)+(isOverdue?' \u00B7 overdue':'')+'</div></div></div>'
     }).join(''):'<div class="muted">No open action items.</div>';
+
+    // Click to open meeting file in default app
+    document.addEventListener('click', function(e) {
+      var item = e.target.closest('.meeting-item');
+      if (!item || !item.dataset.path) return;
+      fetch('/api/open?path=' + encodeURIComponent(item.dataset.path))
+        .catch(function(){});
+    });
 
   }).catch(function(err){
     document.getElementById('loading').style.display='none';

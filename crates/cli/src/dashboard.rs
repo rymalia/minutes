@@ -327,6 +327,30 @@ fn collect_dashboard_data(config: &Config) -> DashboardData {
     }
 }
 
+// ── Percent decoding ───────────────────────────────────────
+
+fn percent_decode(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(
+                &s[i + 1..i + 3],
+                16,
+            ) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        // Also decode '+' as space (form encoding)
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
 // ── HTTP server ─────────────────────────────────────────────
 
 fn handle_request(stream: &mut std::net::TcpStream, config: &Config) {
@@ -351,7 +375,13 @@ fn handle_request(stream: &mut std::net::TcpStream, config: &Config) {
         }
     }
 
-    match path {
+    // Parse query string for paths like /api/open?path=...
+    let (route, query) = match path.split_once('?') {
+        Some((r, q)) => (r, Some(q)),
+        None => (path, None),
+    };
+
+    match route {
         "/" => {
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -367,6 +397,38 @@ fn handle_request(stream: &mut std::net::TcpStream, config: &Config) {
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 json.len(),
                 json
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+        "/api/open" => {
+            // Open a meeting file in the user's default app
+            let file_path = query
+                .and_then(|q| {
+                    q.split('&')
+                        .find_map(|param| param.strip_prefix("path="))
+                })
+                .map(percent_decode);
+
+            let meetings_dir = config.output_dir.canonicalize().ok();
+            let (status, body) = match (&meetings_dir, &file_path) {
+                (Some(meetings_dir), Some(p)) => {
+                    let candidate = std::path::Path::new(p);
+                    let canon = candidate.canonicalize().unwrap_or_default();
+                    if !canon.as_os_str().is_empty()
+                        && canon.starts_with(meetings_dir)
+                        && canon.extension().is_some_and(|e| e == "md")
+                    {
+                        let _ = std::process::Command::new("open").arg(p).spawn();
+                        ("200 OK", "{\"ok\":true}")
+                    } else {
+                        ("403 Forbidden", "{\"error\":\"path outside meetings dir\"}")
+                    }
+                }
+                _ => ("400 Bad Request", "{\"error\":\"missing path or meetings dir\"}"),
+            };
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status, body.len(), body
             );
             let _ = stream.write_all(response.as_bytes());
         }
