@@ -46,7 +46,7 @@ npx minutes-mcp
 ```
 
 ```bash
-minutes setup --model tiny    # Download whisper model (75MB)
+minutes setup --model small   # Download whisper model (466MB, recommended)
 minutes record                # Start recording
 minutes stop                  # Stop and transcribe
 ```
@@ -496,8 +496,8 @@ cargo install --path crates/cli --features coreml
 
 ```bash
 # Download whisper model (also downloads Silero VAD model for non-English audio)
-minutes setup --model tiny    # Quick start (75MB, fast, less accurate)
 minutes setup --model small   # Recommended (466MB, good accuracy)
+minutes setup --model tiny    # Fastest (75MB, but misses quiet audio)
 minutes setup --model base    # Middle ground (141MB)
 
 # Install ffmpeg for best transcription quality (strongly recommended for non-English audio)
