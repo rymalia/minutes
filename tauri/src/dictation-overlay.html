@@ -9,13 +9,13 @@
 
     :root {
       --panel: rgba(28, 28, 34, 0.96);
-      --panel-edge: rgba(255, 255, 255, 0.08);
-      --text: #f6f5f2;
-      --text-secondary: rgba(238, 236, 231, 0.62);
-      --text-tertiary: rgba(238, 236, 231, 0.32);
-      --accent: #79a9ff;
-      --red: #ff6a5c;
-      --green: #74d39a;
+      --panel-edge: rgba(255, 255, 255, 0.03);
+      --text: #f5f5f7;
+      --text-secondary: #98989d;
+      --text-tertiary: #636366;
+      --accent: #4da8d9;
+      --red: #e5534b;
+      --green: #46c072;
       --shadow:
         0 14px 28px rgba(0, 0, 0, 0.18),
         0 4px 10px rgba(0, 0, 0, 0.14),
@@ -57,12 +57,12 @@
     }
 
     .pill.error {
-      border-color: rgba(255, 106, 92, 0.45);
+      border-color: rgba(229, 83, 75, 0.45);
       box-shadow:
         0 14px 28px rgba(0, 0, 0, 0.18),
         0 4px 10px rgba(0, 0, 0, 0.14),
-        0 0 0 1px rgba(255, 106, 92, 0.14),
-        0 0 14px rgba(255, 106, 92, 0.08);
+        0 0 0 1px rgba(229, 83, 75, 0.14),
+        0 0 14px rgba(229, 83, 75, 0.08);
     }
 
     .pill.dismissing {
@@ -97,8 +97,8 @@
       flex-shrink: 0;
       background: var(--red);
       box-shadow:
-        0 0 0 4px rgba(255, 106, 92, 0.16),
-        0 0 16px rgba(255, 106, 92, 0.28);
+        0 0 0 4px rgba(229, 83, 75, 0.16),
+        0 0 16px rgba(229, 83, 75, 0.28);
     }
 
     .dot.blink {
@@ -108,14 +108,14 @@
     .dot.green {
       background: var(--green);
       box-shadow:
-        0 0 0 4px rgba(116, 211, 154, 0.18),
-        0 0 16px rgba(116, 211, 154, 0.28);
+        0 0 0 4px rgba(70, 192, 114, 0.18),
+        0 0 16px rgba(70, 192, 114, 0.28);
     }
     .dot.accent {
       background: var(--accent);
       box-shadow:
-        0 0 0 4px rgba(121, 169, 255, 0.18),
-        0 0 16px rgba(121, 169, 255, 0.28);
+        0 0 0 4px rgba(77, 168, 217, 0.18),
+        0 0 16px rgba(77, 168, 217, 0.28);
     }
 
     @keyframes pulse {
@@ -127,7 +127,7 @@
     .spinner {
       width: 16px;
       height: 16px;
-      border: 2px solid rgba(121, 169, 255, 0.18);
+      border: 2px solid rgba(77, 168, 217, 0.18);
       border-top-color: var(--accent);
       border-radius: 50%;
       animation: spin 1.0s linear infinite;

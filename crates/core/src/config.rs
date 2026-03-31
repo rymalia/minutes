@@ -245,7 +245,10 @@ pub struct RecordingConfig {
     /// Audio input device name override. When set, Minutes uses this device
     /// instead of the system default. Use `minutes devices` to list available names.
     pub device: Option<String>,
-    /// Automatically infer call intent when a known call app is active.
+    /// Automatically infer call intent when a known call app is detected.
+    /// Default: false. Process-based detection has high false-positive rates
+    /// (e.g. Zoom running but not in a call). Users trigger call capture
+    /// explicitly via the call detection banner instead.
     pub auto_call_intent: bool,
     /// Allow Minutes to start a call capture even when the selected input
     /// looks like a plain microphone rather than a system-audio route.
@@ -258,7 +261,7 @@ impl Default for RecordingConfig {
             silence_reminder_secs: 300,
             silence_threshold: 3,
             device: None,
-            auto_call_intent: true,
+            auto_call_intent: false,
             allow_degraded_call_capture: false,
         }
     }
@@ -322,7 +325,6 @@ impl Default for CallDetectionConfig {
                 "Microsoft Teams".into(),
                 "FaceTime".into(),
                 "Webex".into(),
-                "Slack".into(),
             ],
         }
     }
@@ -589,7 +591,7 @@ mod tests {
         assert!(config.call_detection.enabled);
         assert_eq!(config.watch.settle_delay_ms, 2000);
         assert!(!config.watch.extensions.is_empty());
-        assert!(config.recording.auto_call_intent);
+        assert!(!config.recording.auto_call_intent);
         assert!(!config.recording.allow_degraded_call_capture);
     }
 
