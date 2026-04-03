@@ -442,7 +442,7 @@ fn preserve_audio_alongside_output(job: &ProcessingJob) {
     // Update the job record so audio_path points to the new location
     let dest_str = audio_dest.display().to_string();
     update_job_state(&job.id, |j| {
-        j.audio_path = dest_str.clone();
+        j.audio_path = dest_str;
     })
     .ok();
     tracing::info!(
@@ -670,8 +670,10 @@ where
                 if completed_job.state == JobState::Complete {
                     preserve_audio_alongside_output(&completed_job);
                 }
+                // Reload job after preserve may have updated audio_path
+                let final_job = load_job(&completed_job.id).unwrap_or(completed_job);
                 sync_processing_status();
-                on_job_update(&completed_job);
+                on_job_update(&final_job);
             }
             Err(error) => {
                 let Some(failed_job) = update_job_state(&job.id, |job| {
