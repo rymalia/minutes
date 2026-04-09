@@ -1144,7 +1144,46 @@
     .md-viewer-toolbar {
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 2px;
+      flex-shrink: 0;
+    }
+    .md-viewer-toolbar .btn,
+    .md-viewer-toolbar .btn.btn-secondary,
+    .md-viewer-toolbar .btn.btn-sm {
+      background: transparent !important;
+      border: none !important;
+      box-shadow: none !important;
+      color: var(--text-secondary);
+      font-size: 11px;
+      font-weight: 500;
+      text-transform: none;
+      letter-spacing: 0;
+      padding: 4px 10px;
+      border-radius: 6px;
+    }
+    .md-viewer-toolbar .btn:hover:not(:disabled) {
+      background: var(--bg-hover) !important;
+      color: var(--text);
+    }
+    .md-viewer-toolbar .btn:disabled {
+      opacity: 0.3;
+      cursor: default;
+    }
+    .md-viewer-toolbar .md-viewer-mode-btn {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+    }
+    .md-viewer-toolbar .md-viewer-mode-btn.active {
+      background: var(--surface-fill-strong) !important;
+      color: var(--text);
+    }
+    .md-viewer-toolbar-sep {
+      width: 1px;
+      height: 14px;
+      background: var(--border);
+      margin: 0 4px;
       flex-shrink: 0;
     }
     .md-viewer-back {
@@ -1197,7 +1236,6 @@
     .md-viewer-mode-btn.active {
       background: var(--surface-fill-strong);
       color: var(--text);
-      border-color: var(--border-strong);
     }
     .md-viewer-status {
       font-size: 11px;
@@ -2897,12 +2935,13 @@
         <span class="md-viewer-filename" id="md-viewer-filename"></span>
       </div>
       <div class="md-viewer-toolbar">
-        <button class="btn btn-secondary btn-sm md-viewer-mode-btn active" id="md-viewer-preview-btn">Preview</button>
-        <button class="btn btn-secondary btn-sm md-viewer-mode-btn" id="md-viewer-source-btn">Source</button>
-        <button class="btn btn-secondary btn-sm" id="md-viewer-promote-btn" hidden>Make Editable Copy</button>
-        <button class="btn btn-secondary btn-sm" id="md-viewer-save-btn" disabled>Save</button>
-        <button class="btn btn-secondary btn-sm" id="md-viewer-review-btn" disabled>Review</button>
-        <button class="btn btn-secondary btn-sm" id="md-viewer-revert-btn" disabled>Revert</button>
+        <button class="btn md-viewer-mode-btn active" id="md-viewer-preview-btn">Preview</button>
+        <button class="btn md-viewer-mode-btn" id="md-viewer-source-btn">Source</button>
+        <span class="md-viewer-toolbar-sep"></span>
+        <button class="btn" id="md-viewer-promote-btn" hidden>Make Editable Copy</button>
+        <button class="btn" id="md-viewer-save-btn" disabled>Save</button>
+        <button class="btn" id="md-viewer-review-btn" disabled>Review</button>
+        <button class="btn" id="md-viewer-revert-btn" disabled>Revert</button>
         <span class="md-viewer-status" id="md-viewer-status">Viewing</span>
       </div>
     </div>

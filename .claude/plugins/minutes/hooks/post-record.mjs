@@ -190,12 +190,12 @@ try {
 
     if (hasMedium && !hasHigh) {
       alerts.push(
-        `Speaker attributions are auto-detected (medium confidence). Run \`minutes confirm --meeting ${meetingPath}\` to confirm who is who.`
+        `Speaker attributions are auto-detected (medium confidence). Open the meeting in the Minutes desktop app and use the Speakers section to confirm who is who.`
       );
     }
   } else if (meetingContent.includes("SPEAKER_")) {
     alerts.push(
-      `Meeting has anonymous speaker labels. Run \`minutes confirm --meeting ${meetingPath}\` to tag speakers with real names.`
+      `Meeting has anonymous speaker labels. Open the meeting in the Minutes desktop app and confirm the speakers there.`
     );
   }
 } catch (err) {

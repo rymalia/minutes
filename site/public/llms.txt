@@ -11,7 +11,7 @@ Minutes is conversation memory for AI. Record, transcribe, search, and query eve
 - License: MIT
 - Languages: Rust (core engine), TypeScript (MCP server)
 - Platforms: darwin, win32, linux
-- Version: 0.11.0
+- Version: 0.11.1
 - Source: https://github.com/silverstein/minutes
 - Website: https://useminutes.app
 - Privacy: https://useminutes.app/privacy

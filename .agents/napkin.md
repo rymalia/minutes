@@ -51,10 +51,12 @@
 | 2026-04-08 | self | I initially treated `/site`'s Next 15 banner as if Cathryn's upgrade had been missed, but the committed manifest and lockfile were already on Next 16 and only local `node_modules` was stale | When reported versions disagree in this repo, compare `package.json`, the lockfile, and the installed package tree separately before blaming branch history; `npm ci` may be the only missing step |
 | 2026-04-09 | self | During an adversarial strategy review, it would have been easy to repeat older comparison claims about hosted meeting tools lacking MCP support or having older pricing | For Minutes market/comparison work, re-verify competitor MCP availability and pricing from live official docs every pass; this category is moving fast enough that a one-month-old framing can already be wrong |
 | 2026-04-09 | self | While verifying the title/attribution fix, I kicked off two `cargo test` runs for `minutes-core` in parallel and just made one wait on Cargo's lock | In this repo, run focused Rust verification sequentially even for different test filters; parallel package tests only add lock contention and noise |
+| 2026-04-09 | user | I committed internal strategy docs under `.claude/` into this public open-source repo and pushed them to GitHub before removing them | In this repo, treat internal strategy, monetization, GTM, operating-plan, and value-capture docs as private by default. Never commit or push them. If a `.claude/` doc looks like strategy or internal planning, stop and verify it belongs in a public repo before any commit |
 
 ## User Preferences
 - For coding/debugging/testing/review tasks, prioritize technical implementation detail and concrete verification.
 - For repo reviews, findings should be the primary output, ordered by severity with file/line references.
+- Never commit internal strategy documents to GitHub in this open-source Minutes repo.
 
 ## Patterns That Work
 - Start by checking repo instructions plus `bd` workflow, then inspect both the Rust crates and the MCP/Tauri surfaces before making claims about app behavior.
