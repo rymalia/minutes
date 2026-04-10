@@ -1206,6 +1206,22 @@
       text-overflow: ellipsis;
       min-width: 0;
     }
+    .md-viewer-kind {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 32px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface-fill);
+      color: var(--text-secondary);
+      font-size: 10px;
+      font-family: var(--font-mono);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      flex-shrink: 0;
+    }
     .md-viewer-content {
       flex: 1;
       overflow-y: auto;
@@ -1303,6 +1319,41 @@
       white-space: pre-wrap;
       overflow: auto;
       max-height: 220px;
+    }
+    .json-tree {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font: 12px/1.55 var(--font-mono);
+      color: var(--text);
+    }
+    .json-node {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .json-node details {
+      border-left: 1px solid var(--border);
+      padding-left: 10px;
+      margin-left: 6px;
+    }
+    .json-node summary {
+      list-style: none;
+      cursor: pointer;
+      color: var(--text);
+    }
+    .json-node summary::-webkit-details-marker { display: none; }
+    .json-key { color: var(--accent); }
+    .json-string { color: var(--green); }
+    .json-number { color: var(--amber); }
+    .json-boolean { color: var(--red); }
+    .json-null { color: var(--text-secondary); font-style: italic; }
+    .json-inline {
+      display: block;
+      white-space: pre-wrap;
+      font: 12px/1.6 var(--font-mono);
+      color: var(--text);
+      margin: 0;
     }
     .artifact-template-overlay {
       position: fixed;
@@ -2933,6 +2984,7 @@
       <div class="md-viewer-header-main">
         <button class="md-viewer-back" id="md-viewer-back" title="Back to meetings">←</button>
         <span class="md-viewer-filename" id="md-viewer-filename"></span>
+        <span class="md-viewer-kind" id="md-viewer-kind">MD</span>
       </div>
       <div class="md-viewer-toolbar">
         <button class="btn md-viewer-mode-btn active" id="md-viewer-preview-btn">Preview</button>
@@ -7233,6 +7285,7 @@
     const mdViewerContent = document.getElementById('md-viewer-content');
     const mdViewerEditor = document.getElementById('md-viewer-editor');
     const mdViewerFilename = document.getElementById('md-viewer-filename');
+    const mdViewerKind = document.getElementById('md-viewer-kind');
     const mdViewerPreviewBtn = document.getElementById('md-viewer-preview-btn');
     const mdViewerSourceBtn = document.getElementById('md-viewer-source-btn');
     const mdViewerPromoteBtn = document.getElementById('md-viewer-promote-btn');
@@ -7257,6 +7310,8 @@
     let openArtifactExternalNotice = null;
     let artifactTemplateResolver = null;
     let openArtifactEditable = false;
+    let openArtifactKind = 'markdown';
+    let openArtifactParseError = null;
     let mdViewerReviewVisible = false;
     let mdViewerReviewData = null;
 
@@ -7306,6 +7361,99 @@
       }
     }
 
+    function renderTextToElement(el, text) {
+      el.textContent = '';
+      const pre = document.createElement('pre');
+      pre.className = 'json-inline';
+      pre.textContent = text;
+      el.appendChild(pre);
+    }
+
+    function buildJsonNode(value, key = null) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'json-node';
+
+      if (value === null || typeof value !== 'object') {
+        const line = document.createElement('div');
+        const keySpan = document.createElement('span');
+        if (key !== null) {
+          keySpan.className = 'json-key';
+          keySpan.textContent = `"${key}": `;
+          line.appendChild(keySpan);
+        }
+        const valueSpan = document.createElement('span');
+        if (typeof value === 'string') {
+          valueSpan.className = 'json-string';
+          valueSpan.textContent = `"${value}"`;
+        } else if (typeof value === 'number') {
+          valueSpan.className = 'json-number';
+          valueSpan.textContent = String(value);
+        } else if (typeof value === 'boolean') {
+          valueSpan.className = 'json-boolean';
+          valueSpan.textContent = String(value);
+        } else {
+          valueSpan.className = 'json-null';
+          valueSpan.textContent = 'null';
+        }
+        line.appendChild(valueSpan);
+        wrapper.appendChild(line);
+        return wrapper;
+      }
+
+      const entries = Array.isArray(value)
+        ? value.map((entry, index) => [String(index), entry])
+        : Object.entries(value);
+      const details = document.createElement('details');
+      details.open = key === null;
+      const summary = document.createElement('summary');
+      const label = document.createElement('span');
+      if (key !== null) {
+        label.className = 'json-key';
+        label.textContent = `"${key}"`;
+      } else {
+        label.className = 'json-key';
+        label.textContent = Array.isArray(value) ? 'root[]' : 'root{}';
+      }
+      const meta = document.createElement('span');
+      meta.className = 'json-null';
+      meta.textContent = Array.isArray(value)
+        ? ` [${entries.length} item${entries.length === 1 ? '' : 's'}]`
+        : ` {${entries.length} field${entries.length === 1 ? '' : 's'}}`;
+      summary.appendChild(label);
+      summary.appendChild(meta);
+      details.appendChild(summary);
+      for (const [childKey, childValue] of entries) {
+        details.appendChild(buildJsonNode(childValue, childKey));
+      }
+      wrapper.appendChild(details);
+      return wrapper;
+    }
+
+    function renderJsonToElement(el, text) {
+      el.textContent = '';
+      try {
+        const value = JSON.parse(text);
+        openArtifactParseError = null;
+        const tree = document.createElement('div');
+        tree.className = 'json-tree';
+        tree.appendChild(buildJsonNode(value));
+        el.appendChild(tree);
+      } catch (error) {
+        openArtifactParseError = String(error);
+        renderTextToElement(el, text);
+      }
+    }
+
+    function renderArtifactPreview(el, text) {
+      if (openArtifactKind === 'json') {
+        renderJsonToElement(el, text);
+      } else if (openArtifactKind === 'markdown') {
+        renderMarkdownToElement(el, text);
+      } else {
+        renderTextToElement(el, text);
+      }
+    }
+
     function setMdViewerStatus(text, tone = '') {
       mdViewerStatus.textContent = text;
       mdViewerStatus.className = 'md-viewer-status';
@@ -7316,8 +7464,32 @@
       return mdViewerMode === 'source' ? mdViewerEditor.value : (openArtifactContent || '');
     }
 
+    function formatJsonSource(text) {
+      try {
+        return JSON.stringify(JSON.parse(text), null, 2);
+      } catch (_) {
+        return text;
+      }
+    }
+
+    function jsonParseError(text) {
+      try {
+        JSON.parse(text);
+        return null;
+      } catch (error) {
+        return String(error);
+      }
+    }
+
     function refreshMdViewerChrome() {
       const sourceMode = mdViewerMode === 'source';
+      const activeParseError = openArtifactKind === 'json'
+        ? jsonParseError(currentArtifactBuffer())
+        : null;
+      openArtifactParseError = activeParseError;
+      mdViewerKind.textContent = openArtifactKind === 'json' ? 'JSON' : openArtifactKind === 'text' ? 'TXT' : 'MD';
+      mdViewerPreviewBtn.textContent = openArtifactKind === 'json' ? 'Tree' : 'Preview';
+      mdViewerSourceBtn.textContent = 'Source';
       mdViewerPreviewBtn.classList.toggle('active', !sourceMode);
       mdViewerSourceBtn.classList.toggle('active', sourceMode);
       mdViewerSourceBtn.disabled = !openArtifactEditable;
@@ -7327,7 +7499,7 @@
       mdViewerEditor.classList.toggle('active', sourceMode);
       mdViewerEditor.readOnly = !openArtifactEditable;
       mdViewerSaveBtn.disabled =
-        !openArtifactEditable || !openArtifactDirty || openArtifactSaving || !openArtifactPath;
+        !openArtifactEditable || !openArtifactDirty || openArtifactSaving || !openArtifactPath || !!activeParseError;
       if (mdViewerRevertBtn) {
         mdViewerRevertBtn.disabled = !openArtifactEditable || openArtifactSaving || !openArtifactPath;
       }
@@ -7335,6 +7507,8 @@
 
       if (openArtifactSaving) {
         setMdViewerStatus('Saving...', 'saved');
+      } else if (openArtifactParseError) {
+        setMdViewerStatus('Invalid JSON', 'warning');
       } else if (!openArtifactEditable && openArtifactPath) {
         setMdViewerStatus('Read-only', 'readonly');
       } else if (openArtifactDirty) {
@@ -7355,7 +7529,11 @@
         mdViewerMode = mode === 'source' ? 'source' : 'preview';
       }
       if (mdViewerMode === 'source') {
-        if (!openArtifactDirty) mdViewerEditor.value = openArtifactContent || '';
+        if (!openArtifactDirty) {
+          mdViewerEditor.value = openArtifactKind === 'json'
+            ? formatJsonSource(openArtifactContent || '')
+            : (openArtifactContent || '');
+        }
       } else {
         rerenderOpenArtifact(currentArtifactBuffer(), { preserveScroll: true });
       }
@@ -7392,7 +7570,7 @@
 
     function rerenderOpenArtifact(markdownText, { preserveScroll = false } = {}) {
       const previousScrollTop = preserveScroll ? mdViewerContent.scrollTop : 0;
-      renderMarkdownToElement(mdViewerContent, markdownText);
+      renderArtifactPreview(mdViewerContent, markdownText);
       if (preserveScroll) {
         mdViewerContent.scrollTop = Math.min(previousScrollTop, mdViewerContent.scrollHeight);
       } else {
@@ -7474,6 +7652,7 @@
       }
       const initialMode = options.mode === 'source' ? 'source' : 'preview';
       const editable = options.editable === true;
+      const kind = options.kind || 'markdown';
       openArtifactPath = path;
       openArtifactContent = markdownText;
       openArtifactLastError = null;
@@ -7481,12 +7660,14 @@
       openArtifactSaving = false;
       openArtifactExternalNotice = null;
       openArtifactEditable = editable;
+      openArtifactKind = kind;
+      openArtifactParseError = null;
       mdViewerReviewData = null;
       mdViewerReviewVisible = false;
       mdViewerMode = initialMode;
       mdViewerFilename.textContent = filename;
       rerenderOpenArtifact(markdownText);
-      mdViewerEditor.value = markdownText;
+      mdViewerEditor.value = kind === 'json' ? formatJsonSource(markdownText) : markdownText;
       mdViewer.classList.add('active');
       meetingsScroll.style.display = 'none';
       mdSearchWrap.style.display = 'none';
@@ -7625,8 +7806,8 @@
       try {
         const { open } = window.__TAURI__.dialog;
         const selected = await open({
-          title: 'Open markdown file',
-          filters: [{ name: 'Markdown', extensions: ['md', 'txt', 'markdown'] }],
+          title: 'Open artifact file',
+          filters: [{ name: 'Artifacts', extensions: ['md', 'txt', 'markdown', 'json'] }],
         });
         if (!selected) return;
         const path = Array.isArray(selected) ? selected[0] : selected;
@@ -7634,7 +7815,10 @@
         const access = await invoke('cmd_get_text_file_access', { path });
         const content = await invoke('cmd_read_text_file', { path });
         const filename = path.split(/[\\/]/).pop() || path;
-        await showMdViewer(path, filename, content, { editable: !!access.editable });
+        await showMdViewer(path, filename, content, {
+          editable: !!access.editable,
+          kind: access.kind || 'text',
+        });
       } catch (e) {
         console.error('Open markdown:', e);
       }

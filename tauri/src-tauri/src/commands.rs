@@ -166,6 +166,7 @@ pub struct ArtifactDraft {
 pub struct TextFileAccess {
     pub path: String,
     pub editable: bool,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -265,6 +266,20 @@ fn artifact_slug(text: &str) -> String {
         }
     }
     slug.trim_matches('-').to_string()
+}
+
+fn text_file_kind(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("md") | Some("markdown") => Some("markdown"),
+        Some("txt") => Some("text"),
+        Some("json") => Some("json"),
+        _ => None,
+    }
 }
 
 fn resolve_unique_path(dir: &Path, stem: &str, extension: &str) -> PathBuf {
@@ -1485,6 +1500,17 @@ fn preview_text_for_review(text: &str, max_lines: usize, max_chars: usize) -> St
         joined.push_str("\n…");
     }
     joined
+}
+
+fn review_preview_for_kind(kind: &str, text: &str, max_lines: usize, max_chars: usize) -> String {
+    if kind == "json" {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+            if let Ok(pretty) = serde_json::to_string_pretty(&parsed) {
+                return preview_text_for_review(&pretty, max_lines, max_chars);
+            }
+        }
+    }
+    preview_text_for_review(text, max_lines, max_chars)
 }
 
 fn write_text_file_atomic(path: &Path, content: &str) -> Result<(), String> {
@@ -3023,9 +3049,9 @@ fn validate_text_file_path(path: &Path) -> Result<PathBuf, String> {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
         .ok_or_else(|| format!("Unsupported text file: {}", path_str))?;
-    if !matches!(extension.as_str(), "md" | "markdown" | "txt") {
+    if !matches!(extension.as_str(), "md" | "markdown" | "txt" | "json") {
         return Err(format!(
-            "Unsupported text file: {} (expected .md, .markdown, or .txt)",
+            "Unsupported text file: {} (expected .md, .markdown, .txt, or .json)",
             path_str
         ));
     }
@@ -3083,6 +3109,7 @@ pub fn cmd_get_text_file_access(path: String) -> Result<TextFileAccess, String> 
     Ok(TextFileAccess {
         path: canonical.display().to_string(),
         editable: is_editable_text_file_path(&canonical, &config),
+        kind: text_file_kind(&canonical).unwrap_or("text").to_string(),
     })
 }
 
@@ -3101,6 +3128,7 @@ pub fn cmd_get_text_file_review(path: String) -> Result<TextFileReview, String> 
         .map_err(|e| format!("Cannot read snapshot {}: {}", snapshot.display(), e))?;
     let current = std::fs::read_to_string(&canonical)
         .map_err(|e| format!("Cannot read {}: {}", canonical.display(), e))?;
+    let kind = text_file_kind(&canonical).unwrap_or("text");
     let snapshot_label = snapshot
         .file_name()
         .and_then(|name| name.to_str())
@@ -3108,8 +3136,8 @@ pub fn cmd_get_text_file_review(path: String) -> Result<TextFileReview, String> 
     Ok(TextFileReview {
         available: true,
         snapshot_label,
-        before_preview: Some(preview_text_for_review(&before, 80, 4000)),
-        current_preview: Some(preview_text_for_review(&current, 80, 4000)),
+        before_preview: Some(review_preview_for_kind(kind, &before, 80, 4000)),
+        current_preview: Some(review_preview_for_kind(kind, &current, 80, 4000)),
     })
 }
 
@@ -3460,7 +3488,15 @@ pub fn cmd_write_text_file(path: String, content: String) -> Result<String, Stri
             canonical.display()
         ));
     }
-    write_text_file_atomic(&canonical, &content)?;
+    let normalized = if text_file_kind(&canonical) == Some("json") {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| format!("Invalid JSON: {}", e))?;
+        serde_json::to_string_pretty(&parsed)
+            .map_err(|e| format!("Could not format JSON: {}", e))?
+    } else {
+        content
+    };
+    write_text_file_atomic(&canonical, &normalized)?;
     Ok(format!("Saved {}", canonical.display()))
 }
 
@@ -3526,7 +3562,11 @@ pub fn cmd_promote_text_file_to_artifact(path: String) -> Result<ArtifactDraft, 
         chrono::Local::now().format("%Y-%m-%d"),
         artifact_slug(&title)
     );
-    let artifact_path = resolve_unique_path(&artifacts_dir, &stem, "md");
+    let extension = canonical
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("md");
+    let artifact_path = resolve_unique_path(&artifacts_dir, &stem, extension);
     write_text_file_atomic(&artifact_path, &source_content)?;
     Ok(ArtifactDraft {
         path: artifact_path.display().to_string(),
@@ -4486,6 +4526,13 @@ mod tests {
     }
 
     #[test]
+    fn text_file_kind_detects_json() {
+        assert_eq!(text_file_kind(Path::new("/tmp/test.json")), Some("json"));
+        assert_eq!(text_file_kind(Path::new("/tmp/test.md")), Some("markdown"));
+        assert_eq!(text_file_kind(Path::new("/tmp/test.txt")), Some("text"));
+    }
+
+    #[test]
     fn prune_artifact_snapshots_keeps_latest_per_file_identity() {
         let temp = TempDir::new().unwrap();
         for idx in 0..25 {
@@ -4515,6 +4562,14 @@ mod tests {
 
         let mut matching = matching_snapshots(&snapshot_root, &identity, &extension).unwrap();
         assert_eq!(matching.pop().unwrap(), newer);
+    }
+
+    #[test]
+    fn review_preview_for_kind_pretty_prints_json() {
+        let preview = review_preview_for_kind("json", "{\"b\":2,\"a\":1}", 80, 4000);
+        assert!(preview.contains("\"a\": 1"));
+        assert!(preview.contains("\"b\": 2"));
+        assert!(preview.contains('\n'));
     }
 
     #[test]
