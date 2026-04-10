@@ -835,12 +835,17 @@ fn main() -> Result<()> {
             {
                 cmd_service(&action)
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
+            {
+                cmd_service_linux(&action)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
                 let _ = action;
-                eprintln!("The service command uses macOS launchd and is only available on macOS.");
-                eprintln!("On Linux, use systemd or cron to run `minutes watch`.");
-                eprintln!("On Windows, use Task Scheduler to run `minutes watch`.");
+                eprintln!("On Windows, use Task Scheduler to schedule:");
+                eprintln!("  minutes watch                              (always running)");
+                eprintln!("  minutes automate weekly-summary --json     (weekly)");
+                eprintln!("  minutes automate proactive-context --json  (daily)");
                 Ok(())
             }
         }
@@ -3240,27 +3245,29 @@ fn cmd_qmd(action: &str, collection: &str, config: &Config) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn cmd_service(action: &str) -> Result<()> {
-    let plist_name = "dev.getminutes.watcher";
-    let plist_dest = dirs::home_dir()
-        .unwrap_or_default()
-        .join("Library/LaunchAgents")
-        .join(format!("{}.plist", plist_name));
+    let minutes_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("minutes"));
+    let home = dirs::home_dir().unwrap_or_default();
+    let log_dir = Config::minutes_dir().join("logs");
+    let agents_dir = home.join("Library/LaunchAgents");
+    let bin_str = minutes_bin.display().to_string();
+    let home_str = home.display().to_string();
+    let log_dir_str = log_dir.display().to_string();
+    let path_env = format!(
+        "{h}/.local/bin:{h}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        h = home_str
+    );
 
-    match action {
-        "install" => {
-            let minutes_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("minutes"));
-            let home = dirs::home_dir().unwrap_or_default();
-            let log_dir = Config::minutes_dir().join("logs");
-            std::fs::create_dir_all(&log_dir)?;
-            std::fs::create_dir_all(home.join("Library/LaunchAgents"))?;
-
-            let plist = format!(
+    // (label, plist_xml)
+    let agents: Vec<(&str, String)> = vec![
+        (
+            "dev.getminutes.watcher",
+            format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{label}</string>
+    <string>dev.getminutes.watcher</string>
     <key>ProgramArguments</key>
     <array>
         <string>{bin}</string>
@@ -3273,12 +3280,12 @@ fn cmd_service(action: &str) -> Result<()> {
         <key>HOME</key>
         <string>{home}</string>
         <key>PATH</key>
-        <string>{home}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>{path}</string>
     </dict>
     <key>StandardOutPath</key>
-    <string>{log}</string>
+    <string>{logs}/watcher.log</string>
     <key>StandardErrorPath</key>
-    <string>{log}</string>
+    <string>{logs}/watcher.log</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -3292,113 +3299,368 @@ fn cmd_service(action: &str) -> Result<()> {
     <integer>10</integer>
 </dict>
 </plist>"#,
-                label = plist_name,
-                bin = minutes_bin.display(),
-                home = home.display(),
-                log = log_dir.join("watcher.log").display(),
-            );
+                bin = bin_str,
+                home = home_str,
+                path = path_env,
+                logs = log_dir_str,
+            ),
+        ),
+        (
+            "dev.getminutes.weekly-summary",
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.getminutes.weekly-summary</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>automate</string>
+        <string>weekly-summary</string>
+        <string>--json</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{home}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{home}</string>
+        <key>PATH</key>
+        <string>{path}</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{logs}/weekly-summary.log</string>
+    <key>StandardErrorPath</key>
+    <string>{logs}/weekly-summary.log</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>19</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>"#,
+                bin = bin_str,
+                home = home_str,
+                path = path_env,
+                logs = log_dir_str,
+            ),
+        ),
+        (
+            "dev.getminutes.proactive-context",
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.getminutes.proactive-context</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>automate</string>
+        <string>proactive-context</string>
+        <string>--json</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{home}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{home}</string>
+        <key>PATH</key>
+        <string>{path}</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{logs}/proactive-context.log</string>
+    <key>StandardErrorPath</key>
+    <string>{logs}/proactive-context.log</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>"#,
+                bin = bin_str,
+                home = home_str,
+                path = path_env,
+                logs = log_dir_str,
+            ),
+        ),
+    ];
 
-            // Idempotent: if a previous version of the plist is already loaded,
-            // unload it first so the new binary path takes effect. Without this,
-            // upgrading the binary leaves the old process running until logout/reboot.
-            let was_loaded = plist_dest.exists()
-                && std::process::Command::new("launchctl")
-                    .args(["list", plist_name])
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
+    match action {
+        "install" => {
+            std::fs::create_dir_all(&log_dir)?;
+            std::fs::create_dir_all(&agents_dir)?;
 
-            if was_loaded {
+            // Remove legacy weekly-lint if present (replaced by weekly-summary)
+            let legacy = agents_dir.join("dev.getminutes.weekly-lint.plist");
+            if legacy.exists() {
                 let _ = std::process::Command::new("launchctl")
-                    .args(["unload", &plist_dest.to_string_lossy()])
+                    .args(["unload", &legacy.to_string_lossy()])
                     .status();
+                let _ = std::fs::remove_file(&legacy);
+                eprintln!(
+                    "Removed legacy dev.getminutes.weekly-lint (replaced by weekly-summary)."
+                );
             }
 
-            std::fs::write(&plist_dest, &plist)?;
+            for (label, plist) in &agents {
+                let dest = agents_dir.join(format!("{}.plist", label));
+                let was_loaded = dest.exists()
+                    && std::process::Command::new("launchctl")
+                        .args(["list", label])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
 
-            let status = std::process::Command::new("launchctl")
-                .args(["load", "-w", &plist_dest.to_string_lossy()])
-                .status()?;
-
-            if status.success() {
                 if was_loaded {
-                    eprintln!("Watcher service reloaded with the current binary.");
+                    let _ = std::process::Command::new("launchctl")
+                        .args(["unload", &dest.to_string_lossy()])
+                        .status();
+                }
+
+                std::fs::write(&dest, plist)?;
+
+                let status = std::process::Command::new("launchctl")
+                    .args(["load", "-w", &dest.to_string_lossy()])
+                    .status()?;
+
+                let verb = if was_loaded { "reloaded" } else { "installed" };
+                if status.success() {
+                    eprintln!("  {} {}", verb, label);
                 } else {
-                    eprintln!("Watcher service installed and started.");
+                    eprintln!("  FAILED {}", label);
                 }
-                eprintln!("  Plist:  {}", plist_dest.display());
-                eprintln!("  Binary: {}", minutes_bin.display());
-                eprintln!("  Logs:   {}", log_dir.join("watcher.log").display());
-                if !was_loaded {
-                    eprintln!(
-                        "  It will auto-start on login and process audio in ~/.minutes/inbox/"
-                    );
-                }
-            } else {
-                anyhow::bail!("launchctl load failed");
             }
+
+            eprintln!();
+            eprintln!("All services installed.");
+            eprintln!("  Binary: {}", minutes_bin.display());
+            eprintln!("  Logs:   {}", log_dir.display());
+            eprintln!("  Watcher auto-starts on login; weekly-summary runs Sundays 7pm;");
+            eprintln!("  proactive-context runs daily at 8am.");
         }
         "uninstall" => {
-            if plist_dest.exists() {
-                let _ = std::process::Command::new("launchctl")
-                    .args(["unload", &plist_dest.to_string_lossy()])
-                    .status();
-                std::fs::remove_file(&plist_dest)?;
-                eprintln!("Watcher service uninstalled.");
+            let mut removed = 0;
+            for (label, _) in &agents {
+                let dest = agents_dir.join(format!("{}.plist", label));
+                if dest.exists() {
+                    let _ = std::process::Command::new("launchctl")
+                        .args(["unload", &dest.to_string_lossy()])
+                        .status();
+                    std::fs::remove_file(&dest)?;
+                    eprintln!("  removed {}", label);
+                    removed += 1;
+                }
+            }
+            if removed == 0 {
+                eprintln!("No services installed.");
             } else {
-                eprintln!("Service not installed.");
+                eprintln!("Uninstalled {} service(s).", removed);
             }
         }
         "restart" => {
-            if !plist_dest.exists() {
-                anyhow::bail!("Service is not installed. Run `minutes service install` first.");
-            }
-            // Use launchctl kickstart to restart in place. Falls back to unload/load
-            // if kickstart isn't available (older macOS) or fails for any reason.
             let uid = unsafe { libc::getuid() };
-            let target = format!("gui/{}/{}", uid, plist_name);
-            let kickstart = std::process::Command::new("launchctl")
-                .args(["kickstart", "-k", &target])
-                .status();
-            let success = match kickstart {
-                Ok(s) if s.success() => true,
-                _ => {
-                    let _ = std::process::Command::new("launchctl")
-                        .args(["unload", &plist_dest.to_string_lossy()])
-                        .status();
-                    std::process::Command::new("launchctl")
-                        .args(["load", "-w", &plist_dest.to_string_lossy()])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
+            for (label, _) in &agents {
+                let dest = agents_dir.join(format!("{}.plist", label));
+                if !dest.exists() {
+                    continue;
                 }
-            };
-            if success {
-                eprintln!("Watcher service restarted.");
-            } else {
-                anyhow::bail!("launchctl restart failed");
+                let target = format!("gui/{}/{}", uid, label);
+                let kicked = std::process::Command::new("launchctl")
+                    .args(["kickstart", "-k", &target])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !kicked {
+                    let _ = std::process::Command::new("launchctl")
+                        .args(["unload", &dest.to_string_lossy()])
+                        .status();
+                    let _ = std::process::Command::new("launchctl")
+                        .args(["load", "-w", &dest.to_string_lossy()])
+                        .status();
+                }
+                eprintln!("  restarted {}", label);
             }
         }
         "status" => {
-            let output = std::process::Command::new("launchctl")
-                .args(["list", plist_name])
-                .output()?;
-            if output.status.success() {
-                eprintln!("Watcher service is running.");
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if line.contains("PID") || line.contains("LastExitStatus") {
-                        eprintln!("  {}", line.trim());
+            for (label, _) in &agents {
+                let output = std::process::Command::new("launchctl")
+                    .args(["list", label])
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        let pid = stdout
+                            .lines()
+                            .find(|l| l.contains("PID"))
+                            .map(|l| l.trim().to_string())
+                            .unwrap_or_default();
+                        eprintln!("  running  {}  {}", label, pid);
+                    }
+                    _ => {
+                        let dest = agents_dir.join(format!("{}.plist", label));
+                        if dest.exists() {
+                            eprintln!(
+                                "  stopped  {}  (plist exists, try: minutes service install)",
+                                label
+                            );
+                        } else {
+                            eprintln!("  missing  {}", label);
+                        }
                     }
                 }
-            } else {
-                eprintln!("Watcher service is not running.");
-                if plist_dest.exists() {
-                    eprintln!("  Plist exists at: {}", plist_dest.display());
-                    eprintln!("  Try: minutes service install");
-                } else {
-                    eprintln!("  Not installed. Run: minutes service install");
+            }
+        }
+        _ => anyhow::bail!(
+            "Unknown action: {}. Use install, uninstall, restart, or status.",
+            action
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cmd_service_linux(action: &str) -> Result<()> {
+    let minutes_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("minutes"));
+    let home = dirs::home_dir().unwrap_or_default();
+    let bin_str = minutes_bin.display().to_string();
+    let home_str = home.display().to_string();
+    let systemd_dir = home.join(".config/systemd/user");
+    let path_env = format!(
+        "{h}/.local/bin:{h}/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
+        h = home_str
+    );
+
+    // (unit_name, unit_content, optional timer_content)
+    let units: Vec<(&str, String, Option<String>)> = vec![
+        (
+            "minutes-watcher",
+            format!(
+                "[Unit]\nDescription=Minutes voice memo watcher\n\n[Service]\nType=simple\nExecStart={bin} watch\nRestart=on-failure\nRestartSec=10\nNice=5\nEnvironment=PATH={path}\n\n[Install]\nWantedBy=default.target\n",
+                bin = bin_str, path = path_env
+            ),
+            None,
+        ),
+        (
+            "minutes-weekly-summary",
+            format!(
+                "[Unit]\nDescription=Minutes weekly summary\n\n[Service]\nType=oneshot\nExecStart={bin} automate weekly-summary --json\nEnvironment=PATH={path}\n",
+                bin = bin_str, path = path_env
+            ),
+            Some("[Unit]\nDescription=Minutes weekly summary timer\n\n[Timer]\nOnCalendar=Sun 19:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n".to_string()),
+        ),
+        (
+            "minutes-proactive-context",
+            format!(
+                "[Unit]\nDescription=Minutes proactive context\n\n[Service]\nType=oneshot\nExecStart={bin} automate proactive-context --json\nEnvironment=PATH={path}\n",
+                bin = bin_str, path = path_env
+            ),
+            Some("[Unit]\nDescription=Minutes proactive context timer\n\n[Timer]\nOnCalendar=*-*-* 08:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n".to_string()),
+        ),
+    ];
+
+    match action {
+        "install" => {
+            std::fs::create_dir_all(&systemd_dir)?;
+
+            for (name, service, timer) in &units {
+                let svc_path = systemd_dir.join(format!("{}.service", name));
+                std::fs::write(&svc_path, service)?;
+                eprintln!("  wrote {}.service", name);
+
+                if let Some(timer_content) = timer {
+                    let timer_path = systemd_dir.join(format!("{}.timer", name));
+                    std::fs::write(&timer_path, timer_content)?;
+                    eprintln!("  wrote {}.timer", name);
                 }
+            }
+
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status();
+
+            for (name, _, timer) in &units {
+                let target = if timer.is_some() {
+                    format!("{}.timer", name)
+                } else {
+                    format!("{}.service", name)
+                };
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "enable", "--now", &target])
+                    .status();
+                eprintln!("  enabled {}", target);
+            }
+
+            eprintln!();
+            eprintln!("All services installed.");
+            eprintln!("  Binary: {}", minutes_bin.display());
+            eprintln!("  Units:  {}", systemd_dir.display());
+        }
+        "uninstall" => {
+            for (name, _, timer) in &units {
+                let targets: Vec<String> = if timer.is_some() {
+                    vec![format!("{}.timer", name), format!("{}.service", name)]
+                } else {
+                    vec![format!("{}.service", name)]
+                };
+                for t in &targets {
+                    let path = systemd_dir.join(t);
+                    if path.exists() {
+                        let _ = std::process::Command::new("systemctl")
+                            .args(["--user", "disable", "--now", t])
+                            .status();
+                        std::fs::remove_file(&path)?;
+                        eprintln!("  removed {}", t);
+                    }
+                }
+            }
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status();
+        }
+        "restart" => {
+            for (name, _, timer) in &units {
+                let target = if timer.is_some() {
+                    format!("{}.timer", name)
+                } else {
+                    format!("{}.service", name)
+                };
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "restart", &target])
+                    .status();
+                eprintln!("  restarted {}", target);
+            }
+        }
+        "status" => {
+            for (name, _, timer) in &units {
+                let target = if timer.is_some() {
+                    format!("{}.timer", name)
+                } else {
+                    format!("{}.service", name)
+                };
+                let output = std::process::Command::new("systemctl")
+                    .args(["--user", "is-active", &target])
+                    .output();
+                let state = match output {
+                    Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                    Err(_) => "unknown".to_string(),
+                };
+                eprintln!("  {}  {}", state, target);
             }
         }
         _ => anyhow::bail!(
