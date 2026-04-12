@@ -647,42 +647,29 @@ fn main() -> Result<()> {
                 config.transcription.language = Some(lang);
             }
 
-            // CLI flags > [recording.sources] > device
-            if !source.is_empty() {
-                if source.len() >= 2 {
-                    // Multi-source CLI recording: use voice device, warn that
-                    // call device capture is handled by the desktop app
-                    eprintln!(
-                        "[minutes] Multi-source CLI recording is not yet implemented.\n\
-                         Using '{}' as the recording device.\n\
-                         For dual-source call capture, use the Minutes desktop app.",
-                        source[0]
-                    );
-                }
-                config.recording.device = source.first().cloned();
-            } else if call {
+            resolve_recording_device_overrides(&mut config, &source, device, call)?;
+
+            if call && source.len() < 2 {
                 // --call with auto-detect: resolve loopback device
                 if let Some(loopback) = minutes_core::capture::detect_loopback_device() {
                     eprintln!(
-                        "[minutes] Multi-source CLI recording is not yet implemented.\n\
-                         Detected system audio device: {}\n\
-                         For dual-source call capture, use the Minutes desktop app.\n\
-                         Recording from microphone with --intent call.",
-                        loopback
+                        "[minutes] Detected system audio device: {}\n\
+                         Starting CLI dual-source call capture.\n\
+                         {}\n\
+                         If you intended a mic-only fallback instead, omit `--call` and choose one explicit input device.",
+                        loopback,
+                        desktop_call_capture_workaround()
                     );
                 } else {
                     eprintln!(
                         "[minutes] No system audio device detected.\n\
                          To capture call audio, install a loopback driver:\n\
                            macOS: brew install blackhole-2ch\n\
-                         Or use the Minutes desktop app for native call capture."
+                         {}\n\
+                         Without a loopback route, the CLI can only record a single input device.",
+                        desktop_call_capture_workaround()
                     );
                 }
-                if let Some(dev) = device {
-                    config.recording.device = Some(dev);
-                }
-            } else if let Some(dev) = device {
-                config.recording.device = Some(dev);
             }
 
             if let Some(wav_path) = diagnose {
@@ -979,6 +966,93 @@ fn cleanup_live_capture_state() {
     minutes_core::pid::remove().ok();
     minutes_core::pid::clear_recording_metadata().ok();
     minutes_core::notes::cleanup();
+}
+
+fn desktop_call_capture_workaround() -> &'static str {
+    "For native dual-source call capture, use the Minutes desktop app. The published Homebrew cask/update feed is Apple Silicon-only right now, but Intel Macs on macOS 15+ can still build the desktop app from source (see README \"Desktop app\")."
+}
+
+fn normalize_source_override(source: Option<&str>) -> Option<String> {
+    match source.map(str::trim) {
+        Some("") | None => None,
+        Some(value) if value.eq_ignore_ascii_case("default") => None,
+        Some(value) => Some(value.to_string()),
+    }
+}
+
+fn resolve_recording_device_overrides(
+    config: &mut Config,
+    source: &[String],
+    device: Option<String>,
+    call: bool,
+) -> Result<()> {
+    if source.len() >= 2 {
+        let voice = normalize_source_override(source.first().map(String::as_str));
+        let call_source = normalize_source_override(source.get(1).map(String::as_str))
+            .ok_or_else(|| anyhow::anyhow!("dual-source capture requires a call/system source"))?;
+        config.recording.sources = Some(minutes_core::config::SourcesConfig {
+            voice,
+            call: Some(call_source),
+        });
+        config.recording.device = None;
+        return Ok(());
+    }
+
+    if call {
+        if let Some(loopback) = minutes_core::capture::detect_loopback_device() {
+            let voice = source
+                .first()
+                .map(String::as_str)
+                .and_then(|value| normalize_source_override(Some(value)))
+                .or(device.clone());
+            config.recording.sources = Some(minutes_core::config::SourcesConfig {
+                voice,
+                call: Some(loopback),
+            });
+            config.recording.device = None;
+            return Ok(());
+        }
+    }
+
+    if !source.is_empty() {
+        config.recording.sources = None;
+        config.recording.device = normalize_source_override(source.first().map(String::as_str));
+        return Ok(());
+    }
+
+    if let Some(dev) = device {
+        config.recording.sources = None;
+        config.recording.device = Some(dev);
+        return Ok(());
+    }
+
+    if let Some(sources) = config.recording.sources.clone() {
+        match (sources.voice.as_deref(), sources.call.as_deref()) {
+            (Some(voice), Some(call)) => {
+                config.recording.device = None;
+                config.recording.sources = Some(minutes_core::config::SourcesConfig {
+                    voice: normalize_source_override(Some(voice)),
+                    call: Some(call.to_string()),
+                });
+            }
+            (Some(voice), None) => {
+                config.recording.sources = None;
+                config.recording.device = normalize_source_override(Some(voice));
+            }
+            (None, Some(call)) => {
+                config.recording.device = None;
+                config.recording.sources = Some(minutes_core::config::SourcesConfig {
+                    voice: None,
+                    call: Some(call.to_string()),
+                });
+            }
+            (None, None) => {
+                config.recording.sources = None;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn cmd_preflight_record(
@@ -3794,6 +3868,83 @@ life (qmd://life/)
             assert!(minutes_core::notes::read_context().is_none());
             assert!(minutes_core::notes::read_notes().is_none());
         });
+    }
+
+    #[test]
+    fn resolve_recording_device_overrides_uses_single_cli_source() {
+        let mut config = Config::default();
+        resolve_recording_device_overrides(&mut config, &[String::from("Yeti Nano")], None, false)
+            .expect("single source should map to recording.device");
+        assert_eq!(config.recording.device.as_deref(), Some("Yeti Nano"));
+        assert!(config.recording.sources.is_none());
+    }
+
+    #[test]
+    fn resolve_recording_device_overrides_maps_dual_cli_sources() {
+        let mut config = Config::default();
+        resolve_recording_device_overrides(
+            &mut config,
+            &[String::from("Mic"), String::from("BlackHole 2ch")],
+            None,
+            false,
+        )
+        .expect("dual CLI sources should map to recording.sources");
+        let sources = config
+            .recording
+            .sources
+            .expect("dual sources should remain configured");
+        assert_eq!(sources.voice.as_deref(), Some("Mic"));
+        assert_eq!(sources.call.as_deref(), Some("BlackHole 2ch"));
+        assert!(config.recording.device.is_none());
+    }
+
+    #[test]
+    fn resolve_recording_device_overrides_preserves_dual_config_sources() {
+        let mut config = Config::default();
+        config.recording.sources = Some(minutes_core::config::SourcesConfig {
+            voice: Some("Mic".into()),
+            call: Some("BlackHole 2ch".into()),
+        });
+
+        resolve_recording_device_overrides(&mut config, &[], None, false)
+            .expect("dual config sources should remain intact");
+        let sources = config
+            .recording
+            .sources
+            .expect("dual config should remain configured");
+        assert_eq!(sources.voice.as_deref(), Some("Mic"));
+        assert_eq!(sources.call.as_deref(), Some("BlackHole 2ch"));
+    }
+
+    #[test]
+    fn resolve_recording_device_overrides_allows_explicit_device_to_win() {
+        let mut config = Config::default();
+        config.recording.sources = Some(minutes_core::config::SourcesConfig {
+            voice: Some("Mic".into()),
+            call: Some("BlackHole 2ch".into()),
+        });
+
+        resolve_recording_device_overrides(&mut config, &[], Some("USB Mic".into()), false)
+            .expect("explicit --device should override config sources");
+        assert_eq!(config.recording.device.as_deref(), Some("USB Mic"));
+        assert!(config.recording.sources.is_none());
+    }
+
+    #[test]
+    fn resolve_recording_device_overrides_uses_single_voice_config_source() {
+        let mut config = Config::default();
+        config.recording.sources = Some(minutes_core::config::SourcesConfig {
+            voice: Some("Built-in Microphone".into()),
+            call: None,
+        });
+
+        resolve_recording_device_overrides(&mut config, &[], None, false)
+            .expect("single voice source should map to recording.device");
+        assert_eq!(
+            config.recording.device.as_deref(),
+            Some("Built-in Microphone")
+        );
+        assert!(config.recording.sources.is_none());
     }
 
     #[test]

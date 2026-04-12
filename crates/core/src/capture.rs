@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(feature = "streaming")]
+use crate::streaming::AudioStream;
+
 /// Shared audio level (0–100 scale) for UI visualization.
 /// Updated ~10x per second from the cpal callback.
 static AUDIO_LEVEL: AtomicU32 = AtomicU32::new(0);
@@ -395,6 +398,141 @@ pub struct CapturePreflight {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SingleCapturePlan {
+    device_override: Option<String>,
+    device_name: String,
+}
+
+#[cfg(feature = "streaming")]
+#[derive(Debug, Clone)]
+struct DualCapturePlan {
+    voice_override: Option<String>,
+    voice_device_name: String,
+    call_override: String,
+    call_device_name: String,
+}
+
+#[derive(Debug, Clone)]
+enum CapturePlan {
+    Single(SingleCapturePlan),
+    #[cfg(feature = "streaming")]
+    Dual(DualCapturePlan),
+}
+
+impl CapturePlan {
+    fn input_summary(&self) -> String {
+        match self {
+            Self::Single(plan) => plan.device_name.clone(),
+            #[cfg(feature = "streaming")]
+            Self::Dual(plan) => format!("{} + {}", plan.voice_device_name, plan.call_device_name),
+        }
+    }
+
+    fn system_audio_ready(&self) -> bool {
+        match self {
+            Self::Single(plan) => is_system_audio_device_name(&plan.device_name),
+            #[cfg(feature = "streaming")]
+            Self::Dual(plan) => is_system_audio_device_name(&plan.call_device_name),
+        }
+    }
+}
+
+pub fn stem_paths_for(audio_path: &Path) -> Option<crate::diarize::StemPaths> {
+    let stem = audio_path.file_stem()?.to_str()?;
+    let dir = audio_path.parent()?;
+    Some(crate::diarize::StemPaths {
+        voice: dir.join(format!("{}.voice.wav", stem)),
+        system: dir.join(format!("{}.system.wav", stem)),
+    })
+}
+
+fn normalize_source_name(value: Option<&str>) -> Option<String> {
+    match value.map(str::trim) {
+        Some("") | None => None,
+        Some(value) if value.eq_ignore_ascii_case("default") => None,
+        Some(value) => Some(value.to_string()),
+    }
+}
+
+fn select_device_with_override(
+    host: &cpal::Host,
+    device_override: Option<&str>,
+) -> Result<(cpal::Device, String), CaptureError> {
+    use cpal::traits::DeviceTrait;
+
+    let device = select_input_device(host, device_override)?;
+    let name = device
+        .description()
+        .map_or_else(|_| "unknown".to_string(), |d| d.name().to_string());
+    Ok((device, name))
+}
+
+fn resolve_capture_plan(config: &Config) -> Result<CapturePlan, CaptureError> {
+    let host = cpal::default_host();
+    resolve_capture_plan_with_host(&host, config)
+}
+
+fn resolve_capture_plan_with_host(
+    host: &cpal::Host,
+    config: &Config,
+) -> Result<CapturePlan, CaptureError> {
+    let voice_override = normalize_source_name(
+        config
+            .recording
+            .sources
+            .as_ref()
+            .and_then(|sources| sources.voice.as_deref()),
+    );
+    let call_override = config
+        .recording
+        .sources
+        .as_ref()
+        .and_then(|sources| sources.call.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    #[cfg(not(feature = "streaming"))]
+    if call_override.is_some() {
+        return Err(CaptureError::Io(std::io::Error::other(
+            "dual-source capture requires the streaming feature",
+        )));
+    }
+
+    #[cfg(feature = "streaming")]
+    if let Some(call_override) = call_override {
+        let (_, voice_name) = select_device_with_override(host, voice_override.as_deref())?;
+        let resolved_call = if call_override.eq_ignore_ascii_case("auto") {
+            detect_loopback_device().ok_or_else(|| {
+                CaptureError::Io(std::io::Error::other(
+                    "no loopback/system-audio device detected for dual-source capture",
+                ))
+            })?
+        } else {
+            call_override.to_string()
+        };
+        let (_, call_name) = select_device_with_override(host, Some(&resolved_call))?;
+        if voice_name == call_name {
+            return Err(CaptureError::Io(std::io::Error::other(
+                "voice and call sources resolved to the same device",
+            )));
+        }
+        return Ok(CapturePlan::Dual(DualCapturePlan {
+            voice_override,
+            voice_device_name: voice_name,
+            call_override: resolved_call,
+            call_device_name: call_name,
+        }));
+    }
+
+    let single_override = voice_override.or_else(|| config.recording.device.clone());
+    let (_, device_name) = select_device_with_override(host, single_override.as_deref())?;
+    Ok(CapturePlan::Single(SingleCapturePlan {
+        device_override: single_override,
+        device_name,
+    }))
+}
+
 // ──────────────────────────────────────────────────────────────
 // Audio capture using cpal (cross-platform audio I/O).
 //
@@ -522,6 +660,449 @@ fn try_reconnect(
     }
 }
 
+#[cfg(feature = "streaming")]
+const DUAL_SOURCE_SLOT_SAMPLES: usize = 1600;
+
+#[cfg(feature = "streaming")]
+struct DualCaptureWriters {
+    mixed: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    voice: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    system: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    mixed_sample_count: u64,
+}
+
+fn wav_spec_16k_mono() -> hound::WavSpec {
+    hound::WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    }
+}
+
+fn create_wav_writer(
+    output_path: &Path,
+) -> Result<hound::WavWriter<std::io::BufWriter<std::fs::File>>, CaptureError> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    hound::WavWriter::create(output_path, wav_spec_16k_mono())
+        .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV create: {}", e))))
+}
+
+#[cfg(feature = "streaming")]
+impl DualCaptureWriters {
+    fn new(output_path: &Path) -> Result<Self, CaptureError> {
+        let stems = stem_paths_for(output_path).ok_or_else(|| {
+            CaptureError::Io(std::io::Error::other(
+                "could not derive per-source stem paths for dual-source capture",
+            ))
+        })?;
+
+        Ok(Self {
+            mixed: create_wav_writer(output_path)?,
+            voice: create_wav_writer(&stems.voice)?,
+            system: create_wav_writer(&stems.system)?,
+            mixed_sample_count: 0,
+        })
+    }
+
+    fn write_slot(
+        &mut self,
+        voice_samples: &[f32],
+        system_samples: &[f32],
+        live_tx: &Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
+    ) -> Result<(), CaptureError> {
+        write_samples_to_wav(&mut self.voice, voice_samples)?;
+        write_samples_to_wav(&mut self.system, system_samples)?;
+
+        let mixed = mix_dual_source_slot(voice_samples, system_samples);
+        update_audio_level_from_samples(&mixed);
+        write_samples_to_wav(&mut self.mixed, &mixed)?;
+        self.mixed_sample_count += mixed.len() as u64;
+
+        if let Some(ref tx) = live_tx {
+            if tx.try_send(mixed).is_err() {
+                SIDECAR_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn finalize(self) -> Result<u64, CaptureError> {
+        finalize_wav_writer(self.voice)?;
+        finalize_wav_writer(self.system)?;
+        let mixed_sample_count = self.mixed_sample_count;
+        finalize_wav_writer(self.mixed)?;
+        Ok(mixed_sample_count)
+    }
+}
+
+#[cfg(feature = "streaming")]
+fn update_audio_level_from_samples(samples: &[f32]) {
+    if samples.is_empty() {
+        AUDIO_LEVEL.store(0, Ordering::Relaxed);
+        return;
+    }
+
+    let rms = (samples
+        .iter()
+        .map(|sample| (*sample as f64) * (*sample as f64))
+        .sum::<f64>()
+        / samples.len() as f64)
+        .sqrt();
+    let level = (rms * 2000.0).min(100.0) as u32;
+    AUDIO_LEVEL.store(level, Ordering::Relaxed);
+}
+
+#[cfg(feature = "streaming")]
+fn write_samples_to_wav(
+    writer: &mut hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    samples: &[f32],
+) -> Result<(), CaptureError> {
+    for &sample in samples {
+        let s16 = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        writer
+            .write_sample(s16)
+            .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV write: {}", e))))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "streaming")]
+fn finalize_wav_writer(
+    writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+) -> Result<(), CaptureError> {
+    writer
+        .finalize()
+        .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV finalize: {}", e))))
+}
+
+fn set_capture_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
+    }
+}
+
+#[cfg(feature = "streaming")]
+fn mix_dual_source_slot(voice_samples: &[f32], system_samples: &[f32]) -> Vec<f32> {
+    let slot_len = voice_samples
+        .len()
+        .max(system_samples.len())
+        .max(DUAL_SOURCE_SLOT_SAMPLES);
+    let mut mixed = vec![0.0f32; slot_len];
+
+    for (index, sample) in voice_samples.iter().enumerate() {
+        mixed[index] += *sample;
+    }
+    for (index, sample) in system_samples.iter().enumerate() {
+        mixed[index] += *sample;
+    }
+
+    for sample in &mut mixed {
+        *sample = sample.clamp(-1.0, 1.0);
+    }
+
+    mixed
+}
+
+#[cfg(feature = "streaming")]
+fn padded_slot(samples: Option<Vec<f32>>) -> Vec<f32> {
+    let mut padded = vec![0.0f32; DUAL_SOURCE_SLOT_SAMPLES];
+    if let Some(samples) = samples {
+        for (index, sample) in samples
+            .into_iter()
+            .enumerate()
+            .take(DUAL_SOURCE_SLOT_SAMPLES)
+        {
+            padded[index] = sample;
+        }
+    }
+    padded
+}
+
+#[cfg(feature = "streaming")]
+fn flush_dual_source_slots(
+    next_slot: &mut Option<u64>,
+    max_slot: Option<u64>,
+    pending_voice: &mut std::collections::BTreeMap<u64, Vec<f32>>,
+    pending_system: &mut std::collections::BTreeMap<u64, Vec<f32>>,
+    writers: &mut DualCaptureWriters,
+    live_tx: &Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
+) -> Result<(), CaptureError> {
+    let (Some(current_slot), Some(max_slot)) = (*next_slot, max_slot) else {
+        return Ok(());
+    };
+    if current_slot > max_slot {
+        return Ok(());
+    }
+
+    let mut slot = current_slot;
+    while slot <= max_slot {
+        let voice = padded_slot(pending_voice.remove(&slot));
+        let system = padded_slot(pending_system.remove(&slot));
+        writers.write_slot(&voice, &system, live_tx)?;
+        slot += 1;
+    }
+    *next_slot = Some(slot);
+    Ok(())
+}
+
+#[cfg(feature = "streaming")]
+fn record_to_wav_dual_source(
+    output_path: &Path,
+    stop_flag: Arc<AtomicBool>,
+    config: &Config,
+    plan: DualCapturePlan,
+) -> Result<(), CaptureError> {
+    crate::pid::check_and_clear_sentinel();
+
+    let mut writers = DualCaptureWriters::new(output_path)?;
+    AUDIO_LEVEL.store(0, Ordering::Relaxed);
+
+    let (live_tx, sidecar_handle) = start_live_sidecar(config, &stop_flag);
+
+    let mut voice_stream = Some(AudioStream::start(plan.voice_override.as_deref())?);
+    let mut system_stream = Some(AudioStream::start(Some(&plan.call_override))?);
+    let mut device_monitor = crate::device_monitor::MultiDeviceMonitor::new(
+        &voice_stream.as_ref().expect("voice stream").device_name,
+        &system_stream.as_ref().expect("system stream").device_name,
+    );
+
+    eprintln!(
+        "[minutes] Using voice input device: {}",
+        voice_stream.as_ref().expect("voice stream").device_name
+    );
+    eprintln!(
+        "[minutes] Using system audio device: {}",
+        system_stream.as_ref().expect("system stream").device_name
+    );
+    tracing::info!(
+        voice = %voice_stream.as_ref().expect("voice stream").device_name,
+        system = %system_stream.as_ref().expect("system stream").device_name,
+        "using dual-source audio input devices"
+    );
+
+    let _screen_handle = if config.screen_context.enabled {
+        if !crate::screen::check_screen_permission() {
+            eprintln!("[minutes] Screen context disabled — grant Screen Recording permission in System Settings > Privacy & Security");
+            None
+        } else {
+            let screen_dir = crate::screen::screens_dir_for(output_path);
+            match crate::screen::start_capture(
+                &screen_dir,
+                std::time::Duration::from_secs(config.screen_context.interval_secs),
+                Arc::clone(&stop_flag),
+            ) {
+                Ok(handle) => {
+                    eprintln!(
+                        "[minutes] Screen context capture enabled (every {}s)",
+                        config.screen_context.interval_secs
+                    );
+                    Some(handle)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "screen capture init failed: {} — continuing without screen context",
+                        e
+                    );
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    let preflight_intent = config
+        .recording
+        .auto_call_intent
+        .then(|| detect_active_call_app(config).map(|_| RecordingIntent::Call))
+        .flatten();
+    let mut safety_guard = RecordingSafetyGuard::new(&config.recording, output_path);
+    if let Some(intent) = preflight_intent {
+        safety_guard = safety_guard.with_intent(intent);
+    }
+
+    let session_start = Instant::now();
+    let mut next_slot: Option<u64> = None;
+    let mut max_seen_slot: Option<u64> = None;
+    let mut pending_voice = std::collections::BTreeMap::<u64, Vec<f32>>::new();
+    let mut pending_system = std::collections::BTreeMap::<u64, Vec<f32>>::new();
+
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
+        if crate::pid::check_and_clear_sentinel() {
+            tracing::info!("stop sentinel detected — stopping dual-source recording");
+            break;
+        }
+
+        if check_and_clear_extend_sentinel() {
+            tracing::info!("extend sentinel detected — resetting safety timers");
+            safety_guard.extend();
+        }
+
+        let call_app_active = detect_active_call_app(config).is_some();
+        match safety_guard.check(audio_level(), call_app_active) {
+            SafetyAction::None => {}
+            SafetyAction::Nudge(msg) => {
+                tracing::info!("{}", msg);
+                send_silence_notification_msg(&msg);
+            }
+            SafetyAction::Warning(msg) => {
+                tracing::warn!("{}", msg);
+                send_silence_notification_msg(&msg);
+            }
+            SafetyAction::Stop(reason, msg) => {
+                tracing::warn!(reason = ?reason, "{}", msg);
+                send_silence_notification_msg(&msg);
+                break;
+            }
+        }
+
+        if voice_stream
+            .as_ref()
+            .is_some_and(crate::streaming::AudioStream::has_error)
+            || system_stream
+                .as_ref()
+                .is_some_and(crate::streaming::AudioStream::has_error)
+            || device_monitor.check_changes().is_some()
+        {
+            tracing::warn!("dual-source stream issue detected — attempting restart");
+            voice_stream.take();
+            system_stream.take();
+
+            match (
+                AudioStream::start(plan.voice_override.as_deref()),
+                AudioStream::start(Some(&plan.call_override)),
+            ) {
+                (Ok(new_voice), Ok(new_system)) => {
+                    eprintln!(
+                        "[minutes] Dual-source capture reconnected: {} + {}",
+                        new_voice.device_name, new_system.device_name
+                    );
+                    device_monitor = crate::device_monitor::MultiDeviceMonitor::new(
+                        &new_voice.device_name,
+                        &new_system.device_name,
+                    );
+                    voice_stream = Some(new_voice);
+                    system_stream = Some(new_system);
+                    safety_guard.extend();
+                }
+                (voice_result, system_result) => {
+                    if let Err(error) = voice_result {
+                        tracing::error!(error = %error, "failed to restart voice stream");
+                    }
+                    if let Err(error) = system_result {
+                        tracing::error!(error = %error, "failed to restart system stream");
+                    }
+                    break;
+                }
+            }
+        }
+
+        let voice_rx = voice_stream
+            .as_ref()
+            .expect("voice stream should stay active")
+            .receiver
+            .clone();
+        let system_rx = system_stream
+            .as_ref()
+            .expect("system stream should stay active")
+            .receiver
+            .clone();
+        crossbeam_channel::select! {
+            recv(voice_rx) -> chunk => {
+                if let Ok(chunk) = chunk {
+                    let slot = chunk
+                        .timestamp
+                        .checked_duration_since(session_start)
+                        .unwrap_or_default()
+                        .as_millis() as u64 / 100;
+                    next_slot.get_or_insert(slot);
+                    max_seen_slot = Some(max_seen_slot.map_or(slot, |current| current.max(slot)));
+                    pending_voice.insert(slot, chunk.samples);
+                }
+            }
+            recv(system_rx) -> chunk => {
+                if let Ok(chunk) = chunk {
+                    let slot = chunk
+                        .timestamp
+                        .checked_duration_since(session_start)
+                        .unwrap_or_default()
+                        .as_millis() as u64 / 100;
+                    next_slot.get_or_insert(slot);
+                    max_seen_slot = Some(max_seen_slot.map_or(slot, |current| current.max(slot)));
+                    pending_system.insert(slot, chunk.samples);
+                }
+            }
+            default(std::time::Duration::from_millis(100)) => {}
+        }
+
+        let flush_up_to = max_seen_slot.map(|slot| slot.saturating_sub(1));
+        flush_dual_source_slots(
+            &mut next_slot,
+            flush_up_to,
+            &mut pending_voice,
+            &mut pending_system,
+            &mut writers,
+            &live_tx,
+        )?;
+    }
+
+    flush_dual_source_slots(
+        &mut next_slot,
+        max_seen_slot,
+        &mut pending_voice,
+        &mut pending_system,
+        &mut writers,
+        &live_tx,
+    )?;
+
+    voice_stream.take();
+    system_stream.take();
+    drop(live_tx);
+    if let Some(handle) = sidecar_handle {
+        handle.join().ok();
+    }
+
+    let sidecar_drops = SIDECAR_DROPS.swap(0, Ordering::Relaxed);
+    if sidecar_drops > 0 {
+        tracing::warn!(
+            dropped_chunks = sidecar_drops,
+            "live sidecar: audio chunks dropped (transcript may have gaps)"
+        );
+    }
+
+    let total_samples = writers.finalize()?;
+    let duration_secs = total_samples as f64 / 16000.0;
+
+    set_capture_permissions(output_path);
+    if let Some(stems) = stem_paths_for(output_path) {
+        set_capture_permissions(&stems.voice);
+        set_capture_permissions(&stems.system);
+    }
+
+    eprintln!(
+        "[minutes] Captured {} mixed samples ({:.1}s), peak audio level during recording: {}",
+        total_samples,
+        duration_secs,
+        AUDIO_LEVEL.load(Ordering::Relaxed)
+    );
+
+    if total_samples == 0 {
+        return Err(CaptureError::EmptyRecording);
+    }
+
+    Ok(())
+}
+
 /// Start recording audio from the default input device.
 /// Blocks until `stop_flag` is set to true (via signal handler) or a stop
 /// sentinel file is detected (from `minutes stop`).
@@ -535,11 +1116,21 @@ pub fn record_to_wav(
 ) -> Result<(), CaptureError> {
     use cpal::traits::DeviceTrait;
 
+    let capture_plan = resolve_capture_plan(config)?;
+    #[cfg(feature = "streaming")]
+    if let CapturePlan::Dual(plan) = capture_plan.clone() {
+        return record_to_wav_dual_source(output_path, stop_flag, config, plan);
+    }
+
     // Clear any stale stop sentinel from a previous session
     crate::pid::check_and_clear_sentinel();
 
     let host = cpal::default_host();
-    let device_override = config.recording.device.as_deref();
+    let device_override = match &capture_plan {
+        CapturePlan::Single(plan) => plan.device_override.as_deref(),
+        #[cfg(feature = "streaming")]
+        CapturePlan::Dual(_) => None,
+    };
     let device = select_input_device(&host, device_override)?;
 
     let device_name = device
@@ -553,15 +1144,7 @@ pub fn record_to_wav(
         std::fs::create_dir_all(parent)?;
     }
 
-    let wav_spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: 16000,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    let writer = hound::WavWriter::create(output_path, wav_spec)
-        .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV create: {}", e))))?;
+    let writer = create_wav_writer(output_path)?;
     let writer = Arc::new(std::sync::Mutex::new(Some(writer)));
 
     let sample_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -772,16 +1355,15 @@ pub fn record_to_wav(
     // Finalize the WAV file
     let mut guard = writer.lock().unwrap();
     if let Some(w) = guard.take() {
+        #[cfg(feature = "streaming")]
+        finalize_wav_writer(w)?;
+        #[cfg(not(feature = "streaming"))]
         w.finalize()
             .map_err(|e| CaptureError::Io(std::io::Error::other(format!("WAV finalize: {}", e))))?;
     }
 
     // Set restrictive permissions on the recording (contains sensitive audio)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o600)).ok();
-    }
+    set_capture_permissions(output_path);
 
     eprintln!(
         "[minutes] Captured {} samples ({:.1}s), peak audio level during recording: {}",
@@ -1207,15 +1789,35 @@ pub fn preflight_recording(
     config: &Config,
 ) -> Result<CapturePreflight, String> {
     let detected_call_app = detect_active_call_app(config);
-    let input_device = selected_input_device_name(config).map_err(|error| error.to_string())?;
-    evaluate_capture_preflight(
+    let capture_plan = resolve_capture_plan(config).map_err(|error| error.to_string())?;
+    let mut preflight = evaluate_capture_preflight(
         mode,
         requested_intent,
         detected_call_app,
-        input_device,
+        capture_plan.input_summary(),
         allow_degraded,
         config,
-    )
+    )?;
+
+    preflight.system_audio_ready = capture_plan.system_audio_ready();
+    if preflight.intent == RecordingIntent::Call {
+        if preflight.system_audio_ready {
+            preflight.blocking_reason = None;
+            if preflight.warnings.is_empty() {
+                preflight.warnings.push(format!(
+                    "Using '{}' as the capture route for call recording.",
+                    preflight.input_device
+                ));
+            }
+        } else if !preflight.allow_degraded {
+            preflight.blocking_reason = Some(format!(
+                "Minutes inferred a call capture, but '{}' does not include a recognized system-audio route. To record both sides, choose a loopback/system-audio device like BlackHole for the call source or use the desktop app's native call capture path. If you intentionally want mic-only capture, explicitly allow degraded call capture.",
+                preflight.input_device
+            ));
+        }
+    }
+
+    Ok(preflight)
 }
 
 /// Send a macOS notification when silence is detected during recording.

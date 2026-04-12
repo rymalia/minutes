@@ -126,6 +126,7 @@ pub fn queue_live_capture(
     if let Err(error) = write_job(&job) {
         if audio_path.exists() {
             fs::rename(&audio_path, current_wav).ok();
+            move_stems_with_audio(&audio_path, current_wav).ok();
         }
         if new_screen_dir.exists() {
             if old_screen_dir.exists() {
@@ -168,6 +169,11 @@ pub fn move_capture_into_job(job_id: &str, current_wav: &Path) -> std::io::Resul
         fs::create_dir_all(parent)?;
     }
     fs::rename(current_wav, &dest)?;
+    if let Err(error) = move_stems_with_audio(current_wav, &dest) {
+        fs::rename(&dest, current_wav).ok();
+        move_stems_with_audio(&dest, current_wav).ok();
+        return Err(error);
+    }
 
     let old_screen_dir = crate::screen::screens_dir_for(current_wav);
     if old_screen_dir.exists() {
@@ -182,6 +188,60 @@ pub fn move_capture_into_job(job_id: &str, current_wav: &Path) -> std::io::Resul
     }
 
     Ok(dest)
+}
+
+fn move_stems_with_audio(src_audio: &Path, dest_audio: &Path) -> std::io::Result<()> {
+    let Some(src_stems) = crate::capture::stem_paths_for(src_audio) else {
+        return Ok(());
+    };
+    let Some(dest_stems) = crate::capture::stem_paths_for(dest_audio) else {
+        return Ok(());
+    };
+
+    if src_stems.voice.exists() {
+        fs::rename(&src_stems.voice, &dest_stems.voice)?;
+    }
+    if src_stems.system.exists() {
+        fs::rename(&src_stems.system, &dest_stems.system)?;
+    }
+
+    Ok(())
+}
+
+fn preserve_sidecar_stems(audio_src: &Path, audio_dest: &Path) {
+    let Some(src_stems) = crate::capture::stem_paths_for(audio_src) else {
+        return;
+    };
+    let Some(dest_stems) = crate::capture::stem_paths_for(audio_dest) else {
+        return;
+    };
+
+    for (src, dest) in [
+        (src_stems.voice, dest_stems.voice),
+        (src_stems.system, dest_stems.system),
+    ] {
+        if !src.exists() {
+            continue;
+        }
+        if let Err(rename_error) = fs::rename(&src, &dest) {
+            if let Err(copy_error) = fs::copy(&src, &dest) {
+                tracing::warn!(
+                    src = %src.display(),
+                    dest = %dest.display(),
+                    rename_error = %rename_error,
+                    copy_error = %copy_error,
+                    "failed to preserve capture stem alongside output"
+                );
+                continue;
+            }
+            fs::remove_file(&src).ok();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).ok();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -441,6 +501,7 @@ fn preserve_audio_alongside_output(job: &ProcessingJob) {
         j.audio_path = dest_str;
     })
     .ok();
+    preserve_sidecar_stems(&audio_src, &audio_dest);
     tracing::info!(
         path = %audio_dest.display(),
         "preserved audio alongside transcript"
@@ -749,6 +810,93 @@ mod tests {
             assert!(job_path(&job.id).exists());
             assert!(PathBuf::from(&job.audio_path).exists());
             assert!(crate::screen::screens_dir_for(Path::new(&job.audio_path)).exists());
+        });
+    }
+
+    #[test]
+    fn queue_live_capture_moves_stems_with_audio() {
+        with_temp_home(|_| {
+            let current_wav = pid::current_wav_path();
+            if let Some(parent) = current_wav.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&current_wav, b"fake-wav").unwrap();
+
+            let stems = crate::capture::stem_paths_for(&current_wav).unwrap();
+            fs::write(&stems.voice, b"voice").unwrap();
+            fs::write(&stems.system, b"system").unwrap();
+
+            let job = queue_live_capture(
+                CaptureMode::Meeting,
+                Some("Dual source".into()),
+                &current_wav,
+                None,
+                None,
+                Some(Local::now()),
+                Some(Local::now()),
+                None,
+            )
+            .unwrap();
+
+            let job_audio = PathBuf::from(&job.audio_path);
+            let moved_stems = crate::capture::stem_paths_for(&job_audio).unwrap();
+            assert!(job_audio.exists());
+            assert!(moved_stems.voice.exists());
+            assert!(moved_stems.system.exists());
+            assert!(!stems.voice.exists());
+            assert!(!stems.system.exists());
+        });
+    }
+
+    #[test]
+    fn preserve_audio_alongside_output_moves_stems_too() {
+        with_temp_home(|tmp| {
+            let jobs_root = jobs_dir();
+            fs::create_dir_all(&jobs_root).unwrap();
+
+            let audio_path = jobs_root.join("job-preserve.wav");
+            fs::write(&audio_path, b"mixed").unwrap();
+            let stems = crate::capture::stem_paths_for(&audio_path).unwrap();
+            fs::write(&stems.voice, b"voice").unwrap();
+            fs::write(&stems.system, b"system").unwrap();
+
+            let output_path = tmp.path().join("meetings/final.md");
+            fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+            fs::write(&output_path, "# final").unwrap();
+
+            let job = ProcessingJob {
+                id: "job-preserve".into(),
+                mode: CaptureMode::Meeting,
+                content_type: ContentType::Meeting,
+                title: Some("preserve".into()),
+                audio_path: audio_path.display().to_string(),
+                output_path: Some(output_path.display().to_string()),
+                state: JobState::Complete,
+                stage: None,
+                created_at: Local::now(),
+                started_at: None,
+                finished_at: None,
+                recording_started_at: None,
+                recording_finished_at: None,
+                user_notes: None,
+                pre_context: None,
+                calendar_event: None,
+                word_count: None,
+                error: None,
+                owner_pid: None,
+            };
+            write_job(&job).unwrap();
+
+            preserve_audio_alongside_output(&job);
+
+            let preserved_audio = output_path.with_extension("wav");
+            let preserved_stems = crate::capture::stem_paths_for(&preserved_audio).unwrap();
+            assert!(preserved_audio.exists());
+            assert!(preserved_stems.voice.exists());
+            assert!(preserved_stems.system.exists());
+            assert!(!audio_path.exists());
+            assert!(!stems.voice.exists());
+            assert!(!stems.system.exists());
         });
     }
 
