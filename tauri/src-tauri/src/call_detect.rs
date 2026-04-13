@@ -928,6 +928,38 @@ mod tests {
     }
 
     #[test]
+    fn sticky_google_meet_still_wins_when_no_native_app_is_active() {
+        let detector = CallDetector::new(CallDetectionConfig {
+            enabled: true,
+            poll_interval_secs: 1,
+            cooldown_minutes: 5,
+            apps: vec!["zoom.us".into(), "google-meet".into()],
+        });
+
+        detector.remember_google_meet_detection();
+        let running = vec!["Safari".into()];
+        let config = detector.current_config();
+        let native_apps: Vec<&String> = config
+            .apps
+            .iter()
+            .filter(|app| app.as_str() != "google-meet")
+            .collect();
+
+        let native_detected = native_apps.iter().any(|config_app| {
+            let config_lower = config_app.to_lowercase();
+            running.iter().any(|p: &String| {
+                let p_lower = p.to_lowercase();
+                p_lower == config_lower
+                    || p_lower.starts_with(&format!("{}.", config_lower))
+                    || p_lower.starts_with(&format!("{} ", config_lower))
+            })
+        });
+
+        assert!(!native_detected);
+        assert!(detector.google_meet_detection_is_sticky());
+    }
+
+    #[test]
     fn process_list_returns_real_results() {
         let procs = running_process_names();
         // ps should always return at least a few processes
