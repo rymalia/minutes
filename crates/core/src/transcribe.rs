@@ -934,6 +934,9 @@ struct TranscriptCleanupResult {
     stats: Vec<TranscriptCleanupStageStat>,
 }
 
+type TranscriptCleanupFn = fn(Vec<String>) -> Vec<String>;
+type TranscriptCleanupStep = (TranscriptCleanupStage, TranscriptCleanupFn);
+
 impl TranscriptCleanupResult {
     fn after(&self, stage: TranscriptCleanupStage) -> usize {
         self.stats
@@ -952,7 +955,7 @@ fn run_transcript_cleanup_pipeline(lines: Vec<String>) -> TranscriptCleanupResul
     let mut stats = Vec::new();
     let mut current = lines;
 
-    let stages: &[(TranscriptCleanupStage, fn(Vec<String>) -> Vec<String>)] = &[
+    let stages: &[TranscriptCleanupStep] = &[
         (TranscriptCleanupStage::DedupSegments, dedup_segments),
         (TranscriptCleanupStage::DedupInterleaved, dedup_interleaved),
         (
