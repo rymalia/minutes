@@ -84,13 +84,30 @@ Interpretation:
 
 ### 4. Power / energy signal
 
-What we learned:
-- `powermetrics` is present on this machine but requires superuser privileges
-- the non-privileged `top -stats power` signal was not trustworthy for this short-lived subprocess benchmark
+We captured a privileged `powermetrics` sample during the same helper-backed
+Parakeet run on Apple Silicon.
+
+Observed sample:
+
+```text
+CPU Power: 5216 mW
+GPU Power: 2648 mW
+ANE Power: 0 mW
+Combined Power (CPU + GPU + ANE): 7864 mW
+```
 
 Interpretation:
-- we do **not** have a credible power comparison from this environment
-- any claim about energy efficiency right now would be fake precision
+- the current helper-backed path is using CPU + GPU
+- it is **not** using the Apple Neural Engine today
+- that strengthens the architectural case for a future native Apple backend,
+  because an Apple-native path could plausibly shift work toward different
+  runtime characteristics than the current subprocess + Metal setup
+
+Important caution:
+- this is one point sample, not a full power study
+- it is enough to establish “current path uses CPU/GPU, not ANE”
+- it is not enough to claim a future native backend will automatically be more
+  energy efficient without measuring that backend too
 
 ## Comparison against Muesli-style Apple-native ideas
 
@@ -123,7 +140,8 @@ Keep:
 Do next:
 - keep measuring through the coordinator contracts
 - only pursue a true macOS-native backend when we can do it as a contained backend implementation, not as a repo-wide rewrite
-- run a privileged power study later if energy efficiency becomes a real product decision point
+- treat the current power sample as the baseline that any future native backend
+  has to beat or justify
 
 ## Why this is the right call
 
