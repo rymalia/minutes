@@ -1,11 +1,11 @@
 use crate::config::Config;
 use crate::error::TranscribeError;
-use crate::transcription_coordinator::{run_transcript_cleanup_pipeline, TranscriptCleanupStage};
 #[cfg(test)]
 use crate::transcription_coordinator::{
     collapse_noise_markers, dedup_interleaved, dedup_segments, strip_foreign_script,
     trim_trailing_noise,
 };
+use crate::transcription_coordinator::{run_transcript_cleanup_pipeline, TranscriptCleanupStage};
 #[cfg(feature = "parakeet")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "parakeet")]

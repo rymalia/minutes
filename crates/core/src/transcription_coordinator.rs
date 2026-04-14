@@ -377,11 +377,12 @@ pub fn benchmark_parakeet(
     model_id: &str,
     gpu: bool,
     config: &Config,
-) -> Result<ParakeetBenchmarkReport, Box<dyn std::error::Error>> {
+) -> Result<ParakeetBenchmarkReport, String> {
     let started = std::time::Instant::now();
     let direct = transcribe::run_parakeet_cli_structured(
         binary, model_path, audio_path, vocab_path, model_id, gpu, config,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let direct_elapsed_ms = started.elapsed().as_millis() as u64;
 
     let helper_started = std::time::Instant::now();
@@ -390,29 +391,36 @@ pub fn benchmark_parakeet(
         .args(["--binary", binary])
         .args([
             "--model-path",
-            model_path.to_str().ok_or("model path is not valid UTF-8")?,
+            model_path
+                .to_str()
+                .ok_or_else(|| "model path is not valid UTF-8".to_string())?,
         ])
         .args([
             "--audio-path",
-            audio_path.to_str().ok_or("audio path is not valid UTF-8")?,
+            audio_path
+                .to_str()
+                .ok_or_else(|| "audio path is not valid UTF-8".to_string())?,
         ])
         .args([
             "--vocab-path",
-            vocab_path.to_str().ok_or("vocab path is not valid UTF-8")?,
+            vocab_path
+                .to_str()
+                .ok_or_else(|| "vocab path is not valid UTF-8".to_string())?,
         ])
         .args(["--model-id", model_id])
         .args(if gpu { vec!["--gpu"] } else { Vec::new() })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output()?;
+        .output()
+        .map_err(|error| error.to_string())?;
     if !helper.status.success() {
         return Err(format!(
             "helper benchmark failed: {}",
             String::from_utf8_lossy(&helper.stderr)
-        )
-        .into());
+        ));
     }
-    let helper_json: serde_json::Value = serde_json::from_slice(&helper.stdout)?;
+    let helper_json: serde_json::Value =
+        serde_json::from_slice(&helper.stdout).map_err(|error| error.to_string())?;
 
     Ok(ParakeetBenchmarkReport {
         backend_id: "parakeet".into(),

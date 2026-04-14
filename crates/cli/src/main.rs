@@ -2860,7 +2860,8 @@ fn cmd_parakeet_benchmark(
         model_id,
         gpu,
         config,
-    )?;
+    )
+    .map_err(anyhow::Error::msg)?;
     let envelope = json_envelope("minutes parakeet-benchmark", report);
     println!("{}", serde_json::to_string_pretty(&envelope)?);
     Ok(())
