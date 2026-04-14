@@ -1,12 +1,21 @@
 use crate::config::Config;
 use crate::error::WatchError;
 use crate::markdown::ContentType;
+#[cfg(feature = "parakeet")]
+use crate::pipeline::BackgroundPipelineContext;
 use crate::pipeline::{self, SidecarMetadata};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
+
+#[derive(Debug, Clone)]
+struct WatchCandidate {
+    path: PathBuf,
+    content_type: ContentType,
+    sidecar: Option<SidecarMetadata>,
+}
 
 // ──────────────────────────────────────────────────────────────
 // Folder watcher event loop:
@@ -290,15 +299,18 @@ fn determine_content_type(path: &Path, config: &Config) -> ContentType {
 }
 
 /// Process a single file through the pipeline.
-fn process_file(path: &Path, config: &Config) -> Result<(), WatchError> {
-    let content_type = determine_content_type(path, config);
-    let sidecar = read_sidecar(path);
-
-    match pipeline::process_with_sidecar(path, content_type, None, config, sidecar.as_ref(), |_| {})
-    {
+fn process_candidate(candidate: &WatchCandidate, config: &Config) -> Result<(), WatchError> {
+    match pipeline::process_with_sidecar(
+        &candidate.path,
+        candidate.content_type,
+        None,
+        config,
+        candidate.sidecar.as_ref(),
+        |_| {},
+    ) {
         Ok(result) => {
             tracing::info!(
-                input = %path.display(),
+                input = %candidate.path.display(),
                 output = %result.path.display(),
                 words = result.word_count,
                 "file processed successfully"
@@ -309,17 +321,17 @@ fn process_file(path: &Path, config: &Config) -> Result<(), WatchError> {
                 path: result.path.display().to_string(),
                 title: result.title.clone(),
                 word_count: result.word_count,
-                source_path: path.display().to_string(),
+                source_path: candidate.path.display().to_string(),
             });
 
             // Emit VoiceMemoProcessed event for voice memos (enables agent reactivity)
-            if content_type == ContentType::Memo {
+            if candidate.content_type == ContentType::Memo {
                 crate::events::append_event(crate::events::MinutesEvent::VoiceMemoProcessed {
                     path: result.path.display().to_string(),
                     title: result.title.clone(),
                     word_count: result.word_count,
-                    source_path: path.display().to_string(),
-                    device: sidecar.as_ref().and_then(|s| s.device.clone()),
+                    source_path: candidate.path.display().to_string(),
+                    device: candidate.sidecar.as_ref().and_then(|s| s.device.clone()),
                 });
             }
 
@@ -328,22 +340,153 @@ fn process_file(path: &Path, config: &Config) -> Result<(), WatchError> {
                 tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
             }
 
-            move_to(path, "processed")?;
+            move_to(&candidate.path, "processed")?;
             Ok(())
         }
         Err(e) => {
             tracing::error!(
-                input = %path.display(),
+                input = %candidate.path.display(),
                 error = %e,
                 "pipeline failed — moving to failed/"
             );
-            move_to(path, "failed")?;
+            move_to(&candidate.path, "failed")?;
             Err(WatchError::Io(std::io::Error::other(format!(
                 "pipeline error: {}",
                 e
             ))))
         }
     }
+}
+
+#[cfg(feature = "parakeet")]
+fn process_parakeet_memo_batch(candidates: &[WatchCandidate], config: &Config) -> Result<(), WatchError> {
+    let audio_paths: Vec<PathBuf> = candidates.iter().map(|candidate| candidate.path.clone()).collect();
+    let batch_started = std::time::Instant::now();
+    let batch_results =
+        crate::transcribe::transcribe_parakeet_batch(&audio_paths, config).map_err(|error| {
+            WatchError::Io(std::io::Error::other(format!("parakeet batch error: {}", error)))
+        })?;
+    let per_file_transcribe_ms = (batch_started.elapsed().as_millis() as u64)
+        .checked_div(candidates.len() as u64)
+        .unwrap_or(0);
+
+    for (candidate, transcribe_result) in candidates.iter().zip(batch_results.into_iter()) {
+        let transcribe_result = match transcribe_result {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    path = %candidate.path.display(),
+                    error = %error,
+                    "batched parakeet transcription failed — falling back to single-file processing"
+                );
+                process_candidate(candidate, config)?;
+                continue;
+            }
+        };
+
+        let context = BackgroundPipelineContext {
+            sidecar: candidate.sidecar.clone(),
+            recorded_at: candidate.sidecar.as_ref().and_then(|sidecar| sidecar.captured_at),
+            ..BackgroundPipelineContext::default()
+        };
+
+        let artifact = pipeline::write_transcript_artifact(
+            &candidate.path,
+            candidate.content_type,
+            None,
+            config,
+            &context,
+            None,
+            transcribe_result.text,
+            transcribe_result.stats,
+            per_file_transcribe_ms,
+        )
+        .map_err(|error| WatchError::Io(std::io::Error::other(format!(
+            "pipeline error: {}",
+            error
+        ))))?;
+        let result = pipeline::enrich_transcript_artifact(&candidate.path, &artifact, config, &context, |_| {})
+            .map_err(|error| WatchError::Io(std::io::Error::other(format!(
+                "pipeline error: {}",
+                error
+            ))))?;
+
+        tracing::info!(
+            input = %candidate.path.display(),
+            output = %result.path.display(),
+            words = result.word_count,
+            "file processed successfully via parakeet batch"
+        );
+        crate::events::append_event(crate::events::MinutesEvent::WatchProcessed {
+            path: result.path.display().to_string(),
+            title: result.title.clone(),
+            word_count: result.word_count,
+            source_path: candidate.path.display().to_string(),
+        });
+        crate::events::append_event(crate::events::MinutesEvent::VoiceMemoProcessed {
+            path: result.path.display().to_string(),
+            title: result.title.clone(),
+            word_count: result.word_count,
+            source_path: candidate.path.display().to_string(),
+            device: candidate.sidecar.as_ref().and_then(|s| s.device.clone()),
+        });
+        if let Err(e) = crate::graph::rebuild_index(config) {
+            tracing::warn!(error = %e, "graph index rebuild failed (non-fatal)");
+        }
+        move_to(&candidate.path, "processed")?;
+    }
+
+    Ok(())
+}
+
+fn process_candidates(candidates: Vec<WatchCandidate>, config: &Config) {
+    if candidates.is_empty() {
+        return;
+    }
+
+    #[cfg(feature = "parakeet")]
+    let batchable = config.transcription.engine == "parakeet"
+        && crate::transcribe::resolve_parakeet_native_vad_path(config).is_some();
+    #[cfg(not(feature = "parakeet"))]
+    let batchable = false;
+
+    let (parakeet_memos, others): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|candidate| batchable && candidate.content_type == ContentType::Memo);
+
+    if parakeet_memos.len() > 1 {
+        tracing::info!(
+            files = parakeet_memos.len(),
+            "processing watcher memo burst with parakeet batch inference"
+        );
+        if let Err(error) = process_parakeet_memo_batch(&parakeet_memos, config) {
+            tracing::warn!(error = %error, "parakeet batch processing failed — falling back to single-file processing");
+            for candidate in &parakeet_memos {
+                if let Err(e) = process_candidate(candidate, config) {
+                    tracing::error!(path = %candidate.path.display(), error = %e, "processing failed");
+                }
+            }
+        }
+    } else {
+        for candidate in &parakeet_memos {
+            if let Err(e) = process_candidate(candidate, config) {
+                tracing::error!(path = %candidate.path.display(), error = %e, "processing failed");
+            }
+        }
+    }
+
+    for candidate in &others {
+        if let Err(e) = process_candidate(candidate, config) {
+            tracing::error!(path = %candidate.path.display(), error = %e, "processing failed");
+        }
+    }
+}
+
+#[cfg(not(feature = "parakeet"))]
+fn process_parakeet_memo_batch(_candidates: &[WatchCandidate], _config: &Config) -> Result<(), WatchError> {
+    Err(WatchError::Io(std::io::Error::other(
+        "parakeet batch processing requires the parakeet feature",
+    )))
 }
 
 /// Run the folder watcher. Blocks until interrupted (Ctrl-C).
@@ -408,11 +551,24 @@ pub fn run(watch_dir: Option<&Path>, config: &Config) -> Result<(), WatchError> 
     loop {
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(event) => {
+                let mut candidates = Vec::new();
                 if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
                     for path in event.paths {
-                        handle_file_event(&path, settle_delay, config);
+                        if let Some(candidate) = handle_file_event(&path, settle_delay, config) {
+                            candidates.push(candidate);
+                        }
                     }
                 }
+                while let Ok(event) = rx.try_recv() {
+                    if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                        for path in event.paths {
+                            if let Some(candidate) = handle_file_event(&path, settle_delay, config) {
+                                candidates.push(candidate);
+                            }
+                        }
+                    }
+                }
+                process_candidates(candidates, config);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Normal timeout — continue watching
@@ -434,6 +590,7 @@ fn process_existing_files(dir: &Path, config: &Config) {
         Err(_) => return,
     };
 
+    let mut candidates = Vec::new();
     for entry in entries {
         let path = entry.path();
         // Reject symlinks — prevents traversal attacks
@@ -446,92 +603,77 @@ fn process_existing_files(dir: &Path, config: &Config) {
         }
         if path.is_file() && has_valid_extension(&path, config) {
             tracing::info!(path = %path.display(), "processing existing file");
-            if wait_for_settle(&path, config.watch.settle_delay_ms) {
-                // Validate file is actual audio (same check as handle_file_event)
-                if audio_duration(&path).is_none() {
-                    let is_wav = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
-                    if !is_wav {
-                        tracing::warn!(path = %path.display(), "file failed audio probe — skipping");
-                        continue;
-                    }
-                }
-                if let Err(e) = process_file(&path, config) {
-                    tracing::error!(path = %path.display(), error = %e, "failed to process existing file");
-                }
+            if let Some(candidate) = build_candidate(&path, config.watch.settle_delay_ms, config) {
+                candidates.push(candidate);
             }
         }
     }
+    process_candidates(candidates, config);
 }
 
-/// Handle a single file event from the watcher.
-fn handle_file_event(path: &Path, settle_delay: u64, config: &Config) {
+fn build_candidate(path: &Path, settle_delay: u64, config: &Config) -> Option<WatchCandidate> {
     // Skip directories, processed/, failed/ subdirs
     if !path.is_file() {
-        return;
+        return None;
     }
     if let Some(parent) = path.parent() {
         if let Some(name) = parent.file_name() {
             let name = name.to_string_lossy();
             if name == "processed" || name == "failed" {
-                return;
+                return None;
             }
         }
     }
 
-    // Reject symlinks — prevents traversal attacks via crafted links
     if path
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
     {
         tracing::warn!(path = %path.display(), "skipping symlink — only regular files are processed");
-        return;
+        return None;
     }
 
-    // Skip iCloud eviction stubs (.NAME.icloud placeholder files)
     if is_icloud_stub(path) {
         tracing::debug!(path = %path.display(), "skipping iCloud stub");
-        return;
+        return None;
     }
 
-    // Skip sidecar JSON files (processed alongside their audio)
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
-        return;
+        return None;
     }
 
-    // Check extension
     if !has_valid_extension(path, config) {
         tracing::debug!(path = %path.display(), "skipping — unsupported extension");
-        return;
+        return None;
     }
 
-    // Settle check
     if !wait_for_settle(path, settle_delay) {
         tracing::debug!(path = %path.display(), "file not stable yet");
-        return;
+        return None;
     }
 
-    // Validate file is actual audio by probing with symphonia (magic bytes / container check).
-    // Files that merely have the right extension but aren't valid audio are rejected early.
     if audio_duration(path).is_none() {
-        // WAV files produced by cpal may not have duration metadata in the header,
-        // so only reject non-WAV files that fail the probe.
         let is_wav = path
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
         if !is_wav {
             tracing::warn!(path = %path.display(), "file failed audio probe — not a valid audio container, skipping");
-            return;
+            return None;
         }
     }
 
+    Some(WatchCandidate {
+        path: path.to_path_buf(),
+        content_type: determine_content_type(path, config),
+        sidecar: read_sidecar(path),
+    })
+}
+
+/// Handle a single file event from the watcher.
+fn handle_file_event(path: &Path, settle_delay: u64, config: &Config) -> Option<WatchCandidate> {
     tracing::info!(path = %path.display(), "new file detected, processing");
-    if let Err(e) = process_file(path, config) {
-        tracing::error!(path = %path.display(), error = %e, "processing failed");
-    }
+    build_candidate(path, settle_delay, config)
 }
 
 /// RAII guard that releases the lock file on drop.

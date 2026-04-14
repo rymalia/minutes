@@ -716,9 +716,32 @@ pub fn transcribe_to_artifact(
         content_type,
         config,
     )?;
-    let transcribe_ms = step_start.elapsed().as_millis() as u64;
     let transcript = result.text;
     let filter_stats = result.stats;
+    write_transcript_artifact(
+        audio_path,
+        content_type,
+        title,
+        config,
+        context,
+        existing_output_path,
+        transcript,
+        filter_stats,
+        step_start.elapsed().as_millis() as u64,
+    )
+}
+
+pub fn write_transcript_artifact(
+    audio_path: &Path,
+    content_type: ContentType,
+    title: Option<&str>,
+    config: &Config,
+    context: &BackgroundPipelineContext,
+    existing_output_path: Option<&Path>,
+    transcript: String,
+    filter_stats: crate::transcribe::FilterStats,
+    transcribe_ms: u64,
+) -> Result<TranscriptArtifact, MinutesError> {
     let word_count = transcript.split_whitespace().count();
     logging::log_step(
         "transcribe",
