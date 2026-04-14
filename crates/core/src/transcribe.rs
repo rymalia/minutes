@@ -189,6 +189,12 @@ fn temp_wav_path(prefix: &str) -> Result<PathBuf, TranscribeError> {
 const PARAKEET_LONG_AUDIO_CHUNK_THRESHOLD_SECS: f64 = 60.0;
 #[cfg(feature = "parakeet")]
 const PARAKEET_LONG_AUDIO_CHUNK_SECS: usize = 45;
+#[cfg(feature = "parakeet")]
+const PARAKEET_NATIVE_VAD_CHUNK_THRESHOLD_SECS: f64 = 240.0;
+#[cfg(feature = "parakeet")]
+const PARAKEET_NATIVE_VAD_CHUNK_SECS: usize = 180;
+#[cfg(feature = "parakeet")]
+const PARAKEET_NATIVE_VAD_THRESHOLD: f32 = 0.5;
 
 #[cfg(feature = "parakeet")]
 fn fixed_length_chunks(total_samples: usize, max_chunk_samples: usize) -> Vec<(usize, usize)> {
@@ -204,6 +210,33 @@ fn fixed_length_chunks(total_samples: usize, max_chunk_samples: usize) -> Vec<(u
         start = end;
     }
     chunks
+}
+
+#[cfg(feature = "parakeet")]
+fn parakeet_chunk_ranges(
+    total_samples: usize,
+    audio_duration_secs: f64,
+    has_native_vad: bool,
+) -> Option<Vec<(usize, usize)>> {
+    // Native Parakeet VAD lets us keep moderately long files intact, but the
+    // offline models still become unreliable beyond roughly 4-5 minutes.
+    let (threshold_secs, chunk_secs) = if has_native_vad {
+        (
+            PARAKEET_NATIVE_VAD_CHUNK_THRESHOLD_SECS,
+            PARAKEET_NATIVE_VAD_CHUNK_SECS,
+        )
+    } else {
+        (
+            PARAKEET_LONG_AUDIO_CHUNK_THRESHOLD_SECS,
+            PARAKEET_LONG_AUDIO_CHUNK_SECS,
+        )
+    };
+
+    if audio_duration_secs <= threshold_secs {
+        return None;
+    }
+
+    Some(fixed_length_chunks(total_samples, 16000 * chunk_secs))
 }
 
 fn transcribe_chunk_ranges(
@@ -427,13 +460,22 @@ fn transcribe_parakeet_dispatch(
         }
         let samples = load_audio_samples(audio_path)?;
         let audio_duration_secs = samples.len() as f64 / 16000.0;
-        if audio_duration_secs > PARAKEET_LONG_AUDIO_CHUNK_THRESHOLD_SECS {
-            let chunk_ranges =
-                fixed_length_chunks(samples.len(), 16000 * PARAKEET_LONG_AUDIO_CHUNK_SECS);
+        let native_vad_path = resolve_parakeet_native_vad_path(config);
+        if let Some(chunk_ranges) = parakeet_chunk_ranges(
+            samples.len(),
+            audio_duration_secs,
+            native_vad_path.is_some(),
+        ) {
+            let chunk_secs = if native_vad_path.is_some() {
+                PARAKEET_NATIVE_VAD_CHUNK_SECS
+            } else {
+                PARAKEET_LONG_AUDIO_CHUNK_SECS
+            };
             tracing::info!(
                 chunks = chunk_ranges.len(),
                 audio_secs = format!("{:.1}", audio_duration_secs),
-                chunk_secs = PARAKEET_LONG_AUDIO_CHUNK_SECS,
+                chunk_secs,
+                native_vad = native_vad_path.is_some(),
                 "chunking long parakeet transcription to avoid monolithic decode"
             );
             if let Some(result) =
@@ -1346,8 +1388,13 @@ fn transcribe_with_parakeet(
         );
     }
 
-    // Strip silence (parakeet benefits from the same pre-processing)
-    let samples = strip_silence(&samples, 16000);
+    let native_vad_path = resolve_parakeet_native_vad_path(config);
+    let samples = if native_vad_path.is_some() {
+        tracing::debug!("native parakeet VAD available — skipping energy-based silence stripping");
+        samples
+    } else {
+        strip_silence(&samples, 16000)
+    };
     stats.samples_after_silence_strip = samples.len();
     if samples.is_empty() {
         return Err(TranscribeError::EmptyAudio);
@@ -1396,7 +1443,8 @@ fn transcribe_with_parakeet(
         && std::env::var_os("MINUTES_PARAKEET_HELPER_ACTIVE").is_none();
     let parsed = if helper_allowed {
         if let Some(helper_path) = resolve_minutes_parakeet_helper() {
-            let helper_output = std::process::Command::new(helper_path)
+            let mut helper_command = std::process::Command::new(helper_path);
+            helper_command
                 .arg("parakeet-helper")
                 .args(["--binary", binary])
                 .args([
@@ -1421,8 +1469,14 @@ fn transcribe_with_parakeet(
                 .args(if use_gpu { vec!["--gpu"] } else { Vec::new() })
                 .env("MINUTES_PARAKEET_HELPER_ACTIVE", "1")
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output();
+                .stderr(std::process::Stdio::piped());
+            if let Some(vad_path) = native_vad_path.as_ref().and_then(|path| path.to_str()) {
+                helper_command.args(["--vad-path", vad_path]).args([
+                    "--vad-threshold",
+                    &PARAKEET_NATIVE_VAD_THRESHOLD.to_string(),
+                ]);
+            }
+            let helper_output = helper_command.output();
 
             match helper_output {
                 Ok(output) if output.status.success() => serde_json::from_slice(&output.stdout)
@@ -1441,6 +1495,8 @@ fn transcribe_with_parakeet(
                         &vocab_path,
                         &config.transcription.parakeet_model,
                         use_gpu,
+                        native_vad_path.as_deref(),
+                        PARAKEET_NATIVE_VAD_THRESHOLD,
                         config,
                     ) {
                         Ok(parsed) => parsed,
@@ -1466,6 +1522,8 @@ fn transcribe_with_parakeet(
                     &vocab_path,
                     &config.transcription.parakeet_model,
                     use_gpu,
+                    native_vad_path.as_deref(),
+                    PARAKEET_NATIVE_VAD_THRESHOLD,
                     config,
                 )?,
             }
@@ -1477,6 +1535,8 @@ fn transcribe_with_parakeet(
                 &vocab_path,
                 &config.transcription.parakeet_model,
                 use_gpu,
+                native_vad_path.as_deref(),
+                PARAKEET_NATIVE_VAD_THRESHOLD,
                 config,
             )?
         }
@@ -1488,6 +1548,8 @@ fn transcribe_with_parakeet(
             &vocab_path,
             &config.transcription.parakeet_model,
             use_gpu,
+            native_vad_path.as_deref(),
+            PARAKEET_NATIVE_VAD_THRESHOLD,
             config,
         )?
     };
@@ -1634,6 +1696,8 @@ pub fn run_parakeet_cli_structured(
     vocab_path: &Path,
     model_id: &str,
     use_gpu: bool,
+    vad_path: Option<&Path>,
+    vad_threshold: f32,
     config: &Config,
 ) -> Result<ParakeetCliTranscript, TranscribeError> {
     use std::process::Command;
@@ -1657,6 +1721,11 @@ pub fn run_parakeet_cli_structured(
         .arg("--timestamps");
     if use_gpu {
         command.arg("--gpu");
+    }
+    if let Some(vad_path) = vad_path.and_then(|path| path.to_str()) {
+        command
+            .args(["--vad", vad_path])
+            .args(["--vad-threshold", &vad_threshold.to_string()]);
     }
     let output = command
         .stdout(std::process::Stdio::piped())
@@ -1890,12 +1959,31 @@ fn resolve_parakeet_vocab_path(config: &Config) -> Result<PathBuf, TranscribeErr
 }
 
 #[cfg(feature = "parakeet")]
+fn resolve_parakeet_native_vad_path(config: &Config) -> Option<PathBuf> {
+    let mut candidates =
+        vec![crate::parakeet::installs_root(config).join("silero_vad_v5.safetensors")];
+
+    let configured_vad = PathBuf::from(&config.transcription.vad_model);
+    if configured_vad
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("safetensors"))
+        .unwrap_or(false)
+    {
+        candidates.push(configured_vad);
+    }
+
+    candidates.into_iter().find(|candidate| candidate.exists())
+}
+
+#[cfg(feature = "parakeet")]
 pub fn warmup_parakeet(config: &Config) -> Result<ParakeetWarmupStats, TranscribeError> {
     use std::process::Command;
 
     let model_path = resolve_parakeet_model_path(config)?;
     let vocab_path = resolve_parakeet_vocab_path(config)?;
     let binary = &config.transcription.parakeet_binary;
+    let native_vad_path = resolve_parakeet_native_vad_path(config);
 
     let tmp_wav = tempfile::Builder::new()
         .prefix("minutes-parakeet-warmup-")
@@ -1926,6 +2014,12 @@ pub fn warmup_parakeet(config: &Config) -> Result<ParakeetWarmupStats, Transcrib
         .arg("--timestamps");
     if used_gpu {
         command.arg("--gpu");
+    }
+    if let Some(vad_path) = native_vad_path.as_ref().and_then(|path| path.to_str()) {
+        command.args(["--vad", vad_path]).args([
+            "--vad-threshold",
+            &PARAKEET_NATIVE_VAD_THRESHOLD.to_string(),
+        ]);
     }
     let output = command
         .stdout(std::process::Stdio::null())
@@ -2571,6 +2665,58 @@ hello there friend
             resolved.file_name().and_then(|name| name.to_str()),
             Some("tdt-ctc-110m.tokenizer.vocab")
         );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn resolve_parakeet_native_vad_prefers_packaged_weights() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let model_dir = dir.path().join("parakeet");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("silero_vad_v5.safetensors"), "vad").unwrap();
+
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                model_path: dir.path().to_path_buf(),
+                ..crate::config::TranscriptionConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let resolved = resolve_parakeet_native_vad_path(&config).unwrap();
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("silero_vad_v5.safetensors")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parakeet_chunk_ranges_keep_shorter_audio_intact_with_native_vad() {
+        let total_samples = 16000 * 120;
+        let chunk_ranges = parakeet_chunk_ranges(total_samples, 120.0, true);
+        assert!(
+            chunk_ranges.is_none(),
+            "native VAD should avoid 45s hard chunking for 2 minute audio"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parakeet_chunk_ranges_raise_long_audio_boundary_with_native_vad() {
+        let total_samples = 16000 * 301;
+        let chunk_ranges = parakeet_chunk_ranges(total_samples, 301.0, true).unwrap();
+        assert_eq!(chunk_ranges.len(), 2);
+        assert_eq!(chunk_ranges[0], (0, 16000 * PARAKEET_NATIVE_VAD_CHUNK_SECS));
+    }
+
+    #[test]
+    #[cfg(feature = "parakeet")]
+    fn parakeet_chunk_ranges_preserve_legacy_guardrails_without_native_vad() {
+        let total_samples = 16000 * 61;
+        let chunk_ranges = parakeet_chunk_ranges(total_samples, 61.0, false).unwrap();
+        assert_eq!(chunk_ranges.len(), 2);
+        assert_eq!(chunk_ranges[0], (0, 16000 * PARAKEET_LONG_AUDIO_CHUNK_SECS));
     }
 
     #[test]

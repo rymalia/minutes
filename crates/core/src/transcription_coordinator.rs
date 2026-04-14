@@ -376,17 +376,28 @@ pub fn benchmark_parakeet(
     vocab_path: &Path,
     model_id: &str,
     gpu: bool,
+    vad_path: Option<&Path>,
+    vad_threshold: f32,
     config: &Config,
 ) -> Result<ParakeetBenchmarkReport, String> {
     let started = std::time::Instant::now();
     let direct = transcribe::run_parakeet_cli_structured(
-        binary, model_path, audio_path, vocab_path, model_id, gpu, config,
+        binary,
+        model_path,
+        audio_path,
+        vocab_path,
+        model_id,
+        gpu,
+        vad_path,
+        vad_threshold,
+        config,
     )
     .map_err(|error| error.to_string())?;
     let direct_elapsed_ms = started.elapsed().as_millis() as u64;
 
     let helper_started = std::time::Instant::now();
-    let helper = std::process::Command::new(helper_binary)
+    let mut helper_command = std::process::Command::new(helper_binary);
+    helper_command
         .arg("parakeet-helper")
         .args(["--binary", binary])
         .args([
@@ -410,9 +421,13 @@ pub fn benchmark_parakeet(
         .args(["--model-id", model_id])
         .args(if gpu { vec!["--gpu"] } else { Vec::new() })
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|error| error.to_string())?;
+        .stderr(std::process::Stdio::piped());
+    if let Some(vad_path) = vad_path.and_then(|path| path.to_str()) {
+        helper_command
+            .args(["--vad-path", vad_path])
+            .args(["--vad-threshold", &vad_threshold.to_string()]);
+    }
+    let helper = helper_command.output().map_err(|error| error.to_string())?;
     if !helper.status.success() {
         return Err(format!(
             "helper benchmark failed: {}",

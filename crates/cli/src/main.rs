@@ -184,6 +184,10 @@ enum Commands {
         model_id: String,
         #[arg(long, default_value_t = false)]
         gpu: bool,
+        #[arg(long)]
+        vad_path: Option<PathBuf>,
+        #[arg(long, default_value_t = 0.5)]
+        vad_threshold: f32,
     },
 
     /// Hidden Parakeet benchmark for helper-vs-direct comparisons.
@@ -201,6 +205,10 @@ enum Commands {
         model_id: String,
         #[arg(long, default_value_t = false)]
         gpu: bool,
+        #[arg(long)]
+        vad_path: Option<PathBuf>,
+        #[arg(long, default_value_t = 0.5)]
+        vad_threshold: f32,
     },
 
     /// Hidden preflight for call-aware recording start decisions.
@@ -811,6 +819,8 @@ fn main() -> Result<()> {
             vocab_path,
             model_id,
             gpu,
+            vad_path,
+            vad_threshold,
         } => cmd_parakeet_helper(
             &binary,
             &model_path,
@@ -818,6 +828,8 @@ fn main() -> Result<()> {
             &vocab_path,
             &model_id,
             gpu,
+            vad_path.as_deref(),
+            vad_threshold,
             &config,
         ),
         Commands::ParakeetBenchmark {
@@ -827,6 +839,8 @@ fn main() -> Result<()> {
             vocab_path,
             model_id,
             gpu,
+            vad_path,
+            vad_threshold,
         } => cmd_parakeet_benchmark(
             &binary,
             &model_path,
@@ -834,6 +848,8 @@ fn main() -> Result<()> {
             &vocab_path,
             &model_id,
             gpu,
+            vad_path.as_deref(),
+            vad_threshold,
             &config,
         ),
         Commands::PreflightRecord {
@@ -2815,10 +2831,20 @@ fn cmd_parakeet_helper(
     vocab_path: &Path,
     model_id: &str,
     gpu: bool,
+    vad_path: Option<&Path>,
+    vad_threshold: f32,
     config: &Config,
 ) -> Result<()> {
     let parsed = minutes_core::transcribe::run_parakeet_cli_structured(
-        binary, model_path, audio_path, vocab_path, model_id, gpu, config,
+        binary,
+        model_path,
+        audio_path,
+        vocab_path,
+        model_id,
+        gpu,
+        vad_path,
+        vad_threshold,
+        config,
     )?;
     let envelope = parakeet_helper_envelope("minutes parakeet-helper", parsed);
     println!("{}", serde_json::to_string(&envelope)?);
@@ -2833,6 +2859,8 @@ fn cmd_parakeet_helper(
     _vocab_path: &Path,
     _model_id: &str,
     _gpu: bool,
+    _vad_path: Option<&Path>,
+    _vad_threshold: f32,
     _config: &Config,
 ) -> Result<()> {
     anyhow::bail!(
@@ -2848,6 +2876,8 @@ fn cmd_parakeet_benchmark(
     vocab_path: &Path,
     model_id: &str,
     gpu: bool,
+    vad_path: Option<&Path>,
+    vad_threshold: f32,
     config: &Config,
 ) -> Result<()> {
     let helper_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("minutes"));
@@ -2859,6 +2889,8 @@ fn cmd_parakeet_benchmark(
         vocab_path,
         model_id,
         gpu,
+        vad_path,
+        vad_threshold,
         config,
     )
     .map_err(anyhow::Error::msg)?;
@@ -2875,6 +2907,8 @@ fn cmd_parakeet_benchmark(
     _vocab_path: &Path,
     _model_id: &str,
     _gpu: bool,
+    _vad_path: Option<&Path>,
+    _vad_threshold: f32,
     _config: &Config,
 ) -> Result<()> {
     anyhow::bail!(
