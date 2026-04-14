@@ -969,6 +969,7 @@ model = "small"           # whisper: tiny (75MB), base, small (466MB), medium, l
                           # Default: auto-detect. Set this for similar-sounding languages (Urdu/Hindi, etc.)
 # parakeet_model = "tdt-600m"                    # parakeet: tdt-ctc-110m (English), tdt-600m (multilingual v3)
 # parakeet_binary = "parakeet"                   # Path to parakeet.cpp binary (or name in PATH)
+# parakeet_fp16 = true                           # Experimental: lower GPU memory, but slower cold starts today
 # parakeet_vocab = "tdt-600m.tokenizer.vocab"      # Safer when multiple Parakeet models are installed
 # vad_model = "silero-v6.2.0"     # Silero VAD model (auto-downloaded by setup). Empty = disable.
                                    # Prevents whisper hallucination loops on non-English/noisy audio.

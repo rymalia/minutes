@@ -1439,6 +1439,7 @@ fn transcribe_with_parakeet(
     };
 
     let use_gpu = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let use_fp16 = use_gpu && config.transcription.parakeet_fp16;
     let helper_allowed = std::env::var_os("MINUTES_PARAKEET_FORCE_DIRECT").is_none()
         && std::env::var_os("MINUTES_PARAKEET_HELPER_ACTIVE").is_none();
     let parsed = if helper_allowed {
@@ -1467,6 +1468,7 @@ fn transcribe_with_parakeet(
                 ])
                 .args(["--model-id", &config.transcription.parakeet_model])
                 .args(if use_gpu { vec!["--gpu"] } else { Vec::new() })
+                .args(if use_fp16 { vec!["--fp16"] } else { Vec::new() })
                 .env("MINUTES_PARAKEET_HELPER_ACTIVE", "1")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
@@ -1712,6 +1714,7 @@ pub fn run_parakeet_cli_structured(
         .to_str()
         .ok_or_else(|| TranscribeError::ParakeetFailed("vocab path is not valid UTF-8".into()))?;
 
+    let use_fp16 = use_gpu && config.transcription.parakeet_fp16;
     let mut command = Command::new(binary);
     command
         .arg(model_str)
@@ -1721,6 +1724,9 @@ pub fn run_parakeet_cli_structured(
         .arg("--timestamps");
     if use_gpu {
         command.arg("--gpu");
+        if use_fp16 {
+            command.arg("--fp16");
+        }
     }
     if let Some(vad_path) = vad_path.and_then(|path| path.to_str()) {
         command
@@ -2004,6 +2010,7 @@ pub fn warmup_parakeet(config: &Config) -> Result<ParakeetWarmupStats, Transcrib
         .ok_or_else(|| TranscribeError::ParakeetFailed("vocab path is not valid UTF-8".into()))?;
 
     let used_gpu = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let used_fp16 = used_gpu && config.transcription.parakeet_fp16;
     let started = Instant::now();
     let mut command = Command::new(binary);
     command
@@ -2014,6 +2021,9 @@ pub fn warmup_parakeet(config: &Config) -> Result<ParakeetWarmupStats, Transcrib
         .arg("--timestamps");
     if used_gpu {
         command.arg("--gpu");
+        if used_fp16 {
+            command.arg("--fp16");
+        }
     }
     if let Some(vad_path) = native_vad_path.as_ref().and_then(|path| path.to_str()) {
         command.args(["--vad", vad_path]).args([

@@ -175,6 +175,7 @@ Edit `~/.config/minutes/config.toml`:
 engine = "parakeet"              # "whisper" (default) or "parakeet"
 parakeet_model = "tdt-600m"      # "tdt-ctc-110m" (English) or "tdt-600m" (multilingual v3)
 parakeet_binary = "/Users/you/.local/bin/parakeet"  # Prefer an absolute path for desktop app launches
+parakeet_fp16 = true             # Experimental: lower GPU memory, but slower cold starts today
 parakeet_vocab = "tdt-600m.tokenizer.vocab"  # Safer when multiple Parakeet models are installed
 ```
 
