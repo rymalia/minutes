@@ -81,6 +81,47 @@ fn parakeet_helper_envelope<T: Serialize>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptAction {
+    Continue,
+    ForceExit(i32),
+}
+
+fn handle_graceful_interrupt_with_shutdown(
+    stop_flag: &std::sync::atomic::AtomicBool,
+    first_message: &str,
+    shutdown: impl Fn(),
+) -> InterruptAction {
+    use std::sync::atomic::Ordering;
+
+    shutdown();
+    if stop_flag.load(Ordering::Relaxed) {
+        eprintln!("\nForce quit.");
+        InterruptAction::ForceExit(1)
+    } else {
+        eprintln!("\n{}", first_message);
+        stop_flag.store(true, Ordering::Relaxed);
+        InterruptAction::Continue
+    }
+}
+
+fn handle_graceful_interrupt(
+    stop_flag: &std::sync::atomic::AtomicBool,
+    first_message: &str,
+) -> InterruptAction {
+    handle_graceful_interrupt_with_shutdown(stop_flag, first_message, || {
+        minutes_core::parakeet_sidecar::shutdown_global_parakeet_sidecar();
+    })
+}
+
+fn install_parakeet_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        minutes_core::parakeet_sidecar::shutdown_global_parakeet_sidecar();
+        previous(panic_info);
+    }));
+}
+
 /// minutes — conversation memory for AI assistants.
 /// Every meeting, every idea, every voice note — searchable by your AI.
 #[derive(Parser)]
@@ -740,6 +781,7 @@ fn main() -> Result<()> {
         .init();
 
     let mut config = Config::load();
+    install_parakeet_panic_hook();
 
     // Rotate old log files at startup
     minutes_core::logging::rotate_logs().ok();
@@ -1314,12 +1356,12 @@ fn cmd_record(
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_clone = std::sync::Arc::clone(&stop_flag);
     ctrlc::set_handler(move || {
-        if stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("\nForce quit.");
-            std::process::exit(1);
+        if let InterruptAction::ForceExit(code) = handle_graceful_interrupt(
+            &stop_clone,
+            "Stopping recording... (Ctrl+C again to force quit)",
+        ) {
+            std::process::exit(code);
         }
-        eprintln!("\nStopping recording... (Ctrl+C again to force quit)");
-        stop_clone.store(true, std::sync::atomic::Ordering::Relaxed);
     })?;
 
     // Ignore SIGTERM — `minutes stop` uses sentinel file for graceful shutdown
@@ -2940,6 +2982,7 @@ fn cmd_watch(dir: Option<&Path>, config: &Config) -> Result<()> {
     // Set up Ctrl-C to release the lock and exit cleanly
     ctrlc::set_handler(move || {
         eprintln!("\nStopping watcher...");
+        minutes_core::parakeet_sidecar::shutdown_global_parakeet_sidecar();
         // Release the watch lock before exiting
         let lock_path = minutes_core::watch::lock_path();
         std::fs::remove_file(&lock_path).ok();
@@ -4076,6 +4119,7 @@ fn cmd_logs(errors: bool, lines: usize) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     #[cfg(feature = "parakeet")]
@@ -4331,6 +4375,25 @@ life (qmd://life/)
                 "nothing in archive for force delete"
             );
         });
+    }
+
+    #[test]
+    fn graceful_interrupt_requests_shutdown_before_force_exit() {
+        let stop = AtomicBool::new(false);
+        let shutdowns = AtomicUsize::new(0);
+
+        let first = handle_graceful_interrupt_with_shutdown(&stop, "Stopping...", || {
+            shutdowns.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(first, InterruptAction::Continue);
+        assert!(stop.load(Ordering::Relaxed));
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
+
+        let second = handle_graceful_interrupt_with_shutdown(&stop, "Stopping...", || {
+            shutdowns.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(second, InterruptAction::ForceExit(1));
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 2);
     }
 }
 
@@ -5101,7 +5164,7 @@ fn cmd_demo(config: &Config) -> Result<()> {
 }
 
 fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
     eprintln!("[minutes] Starting dictation (Ctrl-C to stop)...");
@@ -5118,12 +5181,12 @@ fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
 
     // Handle Ctrl-C (double press to force quit)
     ctrlc::set_handler(move || {
-        if stop_clone.load(Ordering::Relaxed) {
-            eprintln!("\nForce quit.");
-            std::process::exit(1);
+        if let InterruptAction::ForceExit(code) = handle_graceful_interrupt(
+            &stop_clone,
+            "Stopping dictation... (Ctrl+C again to force quit)",
+        ) {
+            std::process::exit(code);
         }
-        eprintln!("\nStopping dictation... (Ctrl+C again to force quit)");
-        stop_clone.store(true, Ordering::Relaxed);
     })?;
 
     // Ignore SIGTERM — `minutes stop` uses sentinel file for graceful shutdown
@@ -5608,7 +5671,7 @@ fn cmd_confirm(
 }
 
 fn cmd_live(config: &Config) -> Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
     eprintln!("Starting live transcript session...");
@@ -5619,12 +5682,12 @@ fn cmd_live(config: &Config) -> Result<()> {
 
     // Handle Ctrl-C (double press to force quit)
     ctrlc::set_handler(move || {
-        if stop_clone.load(Ordering::Relaxed) {
-            eprintln!("\nForce quit.");
-            std::process::exit(1);
+        if let InterruptAction::ForceExit(code) = handle_graceful_interrupt(
+            &stop_clone,
+            "Stopping gracefully... (Ctrl+C again to force quit)",
+        ) {
+            std::process::exit(code);
         }
-        eprintln!("\nStopping gracefully... (Ctrl+C again to force quit)");
-        stop_clone.store(true, Ordering::Relaxed);
     })
     .ok();
 

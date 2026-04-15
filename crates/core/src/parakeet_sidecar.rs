@@ -7,12 +7,13 @@ mod imp {
         ParakeetCliTranscript,
     };
     use serde::{Deserialize, Serialize};
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::{BTreeSet, HashMap, VecDeque};
     use std::fmt;
     use std::fs;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -28,6 +29,9 @@ mod imp {
     const DEFAULT_MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
     const DEFAULT_MIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
     const HEALTHCHECK_WAV_FILENAME: &str = "parakeet-sidecar-healthcheck.wav";
+    const FP16_BLACKLIST_FILENAME: &str = "parakeet-fp16-blacklist.json";
+    const SIDECAR_SOCKET_PREFIX: &str = "parakeet-sidecar-";
+    const SIDECAR_SOCKET_SUFFIX: &str = ".sock";
     const FP16_CRASH_SIGNATURES: &[&str] = &[
         "MPSGraph",
         "requires the same element type",
@@ -38,6 +42,7 @@ mod imp {
     #[derive(Debug, Clone)]
     pub struct SidecarLaunchSpec {
         pub server_binary: PathBuf,
+        pub version_binary: PathBuf,
         pub socket_path: PathBuf,
         pub model_path: PathBuf,
         pub vocab_path: PathBuf,
@@ -50,6 +55,7 @@ mod imp {
     impl SidecarLaunchSpec {
         fn matches(&self, other: &Self) -> bool {
             self.server_binary == other.server_binary
+                && self.version_binary == other.version_binary
                 && self.model_path == other.model_path
                 && self.vocab_path == other.vocab_path
                 && self.model_id == other.model_id
@@ -65,21 +71,6 @@ mod imp {
                 self.model_id,
                 self.use_gpu,
                 self.use_fp16
-            )
-        }
-
-        fn fp16_downgrade_key(&self) -> String {
-            format!(
-                "{}:{}:{}:{}:{}:{}",
-                self.server_binary.display(),
-                self.model_path.display(),
-                self.vocab_path.display(),
-                self.model_id,
-                self.use_gpu,
-                self.vad_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default()
             )
         }
     }
@@ -208,12 +199,44 @@ mod imp {
         uptime: Duration,
     }
 
+    #[derive(Debug, Clone)]
+    struct SidecarManagerPaths {
+        minutes_dir: PathBuf,
+    }
+
+    impl Default for SidecarManagerPaths {
+        fn default() -> Self {
+            Self {
+                minutes_dir: Config::minutes_dir(),
+            }
+        }
+    }
+
+    impl SidecarManagerPaths {
+        fn fp16_blacklist_path(&self) -> PathBuf {
+            self.minutes_dir.join(FP16_BLACKLIST_FILENAME)
+        }
+
+        fn tmp_dir(&self) -> PathBuf {
+            self.minutes_dir.join("tmp")
+        }
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    struct PersistedFp16Blacklist {
+        #[serde(default)]
+        fingerprints: BTreeSet<String>,
+    }
+
     #[derive(Debug)]
     pub struct ParakeetSidecarManager {
         state: SidecarState,
         request_counter: u64,
         timeouts: SidecarTimeouts,
-        fp16_downgrade_keys: HashSet<String>,
+        fp16_blacklist_fingerprints: BTreeSet<String>,
+        version_cache: HashMap<PathBuf, String>,
+        startup_housekeeping_done: bool,
+        paths: SidecarManagerPaths,
     }
 
     impl Default for ParakeetSidecarManager {
@@ -222,12 +245,28 @@ mod imp {
                 state: SidecarState::Cold,
                 request_counter: 0,
                 timeouts: SidecarTimeouts::default(),
-                fp16_downgrade_keys: HashSet::new(),
+                fp16_blacklist_fingerprints: BTreeSet::new(),
+                version_cache: HashMap::new(),
+                startup_housekeeping_done: false,
+                paths: SidecarManagerPaths::default(),
             }
         }
     }
 
+    impl Drop for ParakeetSidecarManager {
+        fn drop(&mut self) {
+            let _ = catch_unwind(AssertUnwindSafe(|| self.stop_running_sidecar()));
+        }
+    }
+
     impl ParakeetSidecarManager {
+        #[cfg(test)]
+        fn with_minutes_dir(minutes_dir: PathBuf) -> Self {
+            let mut manager = Self::default();
+            manager.paths = SidecarManagerPaths { minutes_dir };
+            manager
+        }
+
         pub fn transcribe(
             &mut self,
             spec: SidecarLaunchSpec,
@@ -282,6 +321,7 @@ mod imp {
             mut spec: SidecarLaunchSpec,
             config: &Config,
         ) -> Result<(), SidecarError> {
+            self.run_startup_housekeeping(config);
             self.apply_sticky_fp16_downgrade(&mut spec);
 
             if let SidecarState::Healthy(running) = &mut self.state {
@@ -543,22 +583,108 @@ mod imp {
         }
 
         fn remember_fp16_downgrade(&mut self, spec: &SidecarLaunchSpec) {
-            self.fp16_downgrade_keys.insert(spec.fp16_downgrade_key());
+            let fingerprint = self.machine_fp16_fingerprint(spec);
+            if self.fp16_blacklist_fingerprints.insert(fingerprint.clone()) {
+                let path = self.paths.fp16_blacklist_path();
+                if let Err(error) =
+                    write_persisted_fp16_blacklist(&path, &self.fp16_blacklist_fingerprints)
+                {
+                    tracing::warn!(
+                        "{} failed to persist fp16 blacklist at {}: {}",
+                        LOG_PREFIX,
+                        path.display(),
+                        error
+                    );
+                } else {
+                    tracing::warn!(
+                        "{} persisted fp16 blacklist fingerprint={}",
+                        LOG_PREFIX,
+                        fingerprint
+                    );
+                }
+            }
         }
 
-        fn apply_sticky_fp16_downgrade(&self, spec: &mut SidecarLaunchSpec) {
-            if spec.use_fp16
-                && self
-                    .fp16_downgrade_keys
-                    .contains(&spec.fp16_downgrade_key())
-            {
+        fn apply_sticky_fp16_downgrade(&mut self, spec: &mut SidecarLaunchSpec) {
+            let fingerprint = self.machine_fp16_fingerprint(spec);
+            if spec.use_fp16 && self.fp16_blacklist_fingerprints.contains(&fingerprint) {
                 tracing::warn!(
-                    "{} reusing prior fp16 downgrade decision for model={}",
+                    "{} reusing prior fp16 downgrade decision fingerprint={}",
                     LOG_PREFIX,
-                    spec.model_id
+                    fingerprint
                 );
                 spec.use_fp16 = false;
             }
+        }
+
+        fn run_startup_housekeeping(&mut self, config: &Config) {
+            if self.startup_housekeeping_done {
+                return;
+            }
+
+            let blacklist_path = self.paths.fp16_blacklist_path();
+            if config.transcription.parakeet_fp16_blacklist_reset {
+                self.fp16_blacklist_fingerprints.clear();
+                match fs::remove_file(&blacklist_path) {
+                    Ok(()) => tracing::info!(
+                        "{} cleared fp16 blacklist at {}",
+                        LOG_PREFIX,
+                        blacklist_path.display()
+                    ),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => tracing::warn!(
+                        "{} failed to clear fp16 blacklist at {}: {}",
+                        LOG_PREFIX,
+                        blacklist_path.display(),
+                        error
+                    ),
+                }
+            } else {
+                match load_persisted_fp16_blacklist(&blacklist_path) {
+                    Ok(fingerprints) => {
+                        self.fp16_blacklist_fingerprints = fingerprints;
+                    }
+                    Err(error) => tracing::warn!(
+                        "{} failed to load fp16 blacklist at {}: {}",
+                        LOG_PREFIX,
+                        blacklist_path.display(),
+                        error
+                    ),
+                }
+            }
+
+            let tmp_dir = self.paths.tmp_dir();
+            match sweep_stale_sidecar_sockets_in_dir(&tmp_dir) {
+                Ok(removed) if removed > 0 => tracing::info!(
+                    "{} removed {} stale sidecar sockets from {}",
+                    LOG_PREFIX,
+                    removed,
+                    tmp_dir.display()
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    "{} failed to sweep stale sidecar sockets in {}: {}",
+                    LOG_PREFIX,
+                    tmp_dir.display(),
+                    error
+                ),
+            }
+
+            self.startup_housekeeping_done = true;
+        }
+
+        fn machine_fp16_fingerprint(&mut self, spec: &SidecarLaunchSpec) -> String {
+            let version = self
+                .version_cache
+                .entry(spec.version_binary.clone())
+                .or_insert_with(|| query_binary_version(&spec.version_binary))
+                .clone();
+            format!(
+                "{}-{}-{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                version
+            )
         }
 
         fn health_check(&mut self, running: &mut RunningSidecar) -> Result<(), String> {
@@ -751,10 +877,125 @@ mod imp {
         }
     }
 
+    fn query_binary_version(binary: &Path) -> String {
+        let output = Command::new(binary)
+            .arg("--version")
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                first_non_empty_line(stdout.lines())
+                    .or_else(|| first_non_empty_line(stderr.lines()))
+                    .unwrap_or("unknown")
+                    .to_string()
+            }
+            Ok(_) | Err(_) => "unknown".to_string(),
+        }
+    }
+
+    fn first_non_empty_line<'a>(lines: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+        lines.map(str::trim).find(|line| !line.is_empty())
+    }
+
     fn format_exit_status(status: Option<std::process::ExitStatus>) -> String {
         match status {
             Some(status) => format!(" (status: {})", status),
             None => String::new(),
+        }
+    }
+
+    fn load_persisted_fp16_blacklist(path: &Path) -> io::Result<BTreeSet<String>> {
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+            Err(error) => return Err(error),
+        };
+        let persisted: PersistedFp16Blacklist =
+            serde_json::from_str(&raw).map_err(io::Error::other)?;
+        Ok(persisted.fingerprints)
+    }
+
+    fn write_persisted_fp16_blacklist(
+        path: &Path,
+        fingerprints: &BTreeSet<String>,
+    ) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let raw = serde_json::to_string_pretty(&PersistedFp16Blacklist {
+            fingerprints: fingerprints.clone(),
+        })
+        .map_err(io::Error::other)?;
+        fs::write(path, raw)
+    }
+
+    fn sweep_stale_sidecar_sockets_in_dir(tmp_dir: &Path) -> io::Result<usize> {
+        let entries = match fs::read_dir(tmp_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+
+        let mut removed = 0usize;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(pid) = parse_sidecar_socket_pid(name) else {
+                continue;
+            };
+
+            match pid_is_alive(pid) {
+                Ok(true) => continue,
+                Ok(false) => match fs::remove_file(&path) {
+                    Ok(()) => removed += 1,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => tracing::debug!(
+                        "{} failed to remove stale socket {}: {}",
+                        LOG_PREFIX,
+                        path.display(),
+                        error
+                    ),
+                },
+                Err(error) => tracing::debug!(
+                    "{} skipping socket {} because PID {} could not be checked: {}",
+                    LOG_PREFIX,
+                    path.display(),
+                    pid,
+                    error
+                ),
+            }
+        }
+
+        Ok(removed)
+    }
+
+    fn parse_sidecar_socket_pid(name: &str) -> Option<u32> {
+        let trimmed = name
+            .strip_prefix(SIDECAR_SOCKET_PREFIX)?
+            .strip_suffix(SIDECAR_SOCKET_SUFFIX)?;
+        let (pid, _) = trimmed.split_once('-')?;
+        pid.parse().ok()
+    }
+
+    fn pid_is_alive(pid: u32) -> io::Result<bool> {
+        #[allow(clippy::cast_possible_wrap)]
+        let pid = pid as i32;
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == 0 {
+            return Ok(true);
+        }
+
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            Some(libc::EPERM) => Ok(true),
+            _ => Err(error),
         }
     }
 
@@ -920,6 +1161,11 @@ mod imp {
                      Set MINUTES_PARAKEET_SERVER_BINARY or put example-server on PATH"
                 ))
             })?;
+        let version_binary = crate::parakeet::resolve_parakeet_binary(
+            &config.transcription.parakeet_binary,
+            crate::parakeet::ResolveParakeetBinaryMode::WarnAndFallback,
+        )
+        .unwrap_or_else(|_| server_binary.clone());
 
         let socket_path = Config::minutes_dir().join("tmp").join(format!(
             "parakeet-sidecar-{}-{}.sock",
@@ -929,6 +1175,7 @@ mod imp {
 
         Ok(SidecarLaunchSpec {
             server_binary,
+            version_binary,
             socket_path,
             model_path: model_path.to_path_buf(),
             vocab_path: vocab_path.to_path_buf(),
@@ -1078,6 +1325,7 @@ mod imp {
         fn make_spec(binary: PathBuf, use_fp16: bool) -> SidecarLaunchSpec {
             SidecarLaunchSpec {
                 server_binary: binary,
+                version_binary: PathBuf::from("/tmp/parakeet"),
                 socket_path: Config::minutes_dir().join("tmp").join(format!(
                     "test-{}-{}.sock",
                     std::process::id(),
@@ -1089,6 +1337,17 @@ mod imp {
                 use_gpu: true,
                 use_fp16,
                 vad_path: None,
+            }
+        }
+
+        fn make_running_sidecar(spec: SidecarLaunchSpec, child: Child) -> RunningSidecar {
+            RunningSidecar {
+                spec,
+                child,
+                started_at: Instant::now(),
+                stderr_lines: Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_RING_CAPACITY))),
+                stderr_thread: None,
+                requests_served: 0,
             }
         }
 
@@ -1205,6 +1464,75 @@ mod imp {
             handle.join().unwrap();
             assert!(line.contains("\"request_id\":\"x\""));
             assert!(line.contains("\"word_timestamps\""));
+        }
+
+        #[test]
+        fn manager_drop_reaps_running_child_after_panic() {
+            let minutes_dir = TempDir::new().unwrap();
+            let script = make_temp_script("#!/bin/sh\nsleep 30\n");
+            let child = Command::new(&script).spawn().unwrap();
+            let pid = child.id();
+
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut manager =
+                    ParakeetSidecarManager::with_minutes_dir(minutes_dir.path().join(".minutes"));
+                manager.state = SidecarState::Healthy(make_running_sidecar(
+                    make_spec(script.clone(), false),
+                    child,
+                ));
+                panic!("boom");
+            }));
+
+            assert!(result.is_err());
+            thread::sleep(Duration::from_millis(100));
+            assert!(!pid_is_alive(pid).unwrap());
+        }
+
+        #[test]
+        fn fp16_blacklist_persists_across_managers() {
+            let minutes_dir = TempDir::new().unwrap();
+            let version_script = make_temp_script("#!/bin/sh\necho parakeet 9.9.9\n");
+            let blacklist_path = minutes_dir
+                .path()
+                .join(".minutes")
+                .join(FP16_BLACKLIST_FILENAME);
+
+            let mut manager =
+                ParakeetSidecarManager::with_minutes_dir(minutes_dir.path().join(".minutes"));
+            let mut spec = make_spec(PathBuf::from("/tmp/example-server"), true);
+            spec.version_binary = version_script.clone();
+
+            manager.remember_fp16_downgrade(&spec);
+            assert!(blacklist_path.exists());
+
+            let fingerprints = load_persisted_fp16_blacklist(&blacklist_path).unwrap();
+            assert_eq!(fingerprints.len(), 1);
+
+            let mut next_manager =
+                ParakeetSidecarManager::with_minutes_dir(minutes_dir.path().join(".minutes"));
+            next_manager.fp16_blacklist_fingerprints =
+                load_persisted_fp16_blacklist(&blacklist_path).unwrap();
+            let mut next_spec = spec.clone();
+            next_manager.apply_sticky_fp16_downgrade(&mut next_spec);
+            assert!(!next_spec.use_fp16);
+        }
+
+        #[test]
+        fn stale_socket_sweep_removes_dead_pids_but_keeps_live_ones() {
+            let tmp_root = TempDir::new().unwrap();
+            let tmp_dir = tmp_root.path().join("tmp");
+            fs::create_dir_all(&tmp_dir).unwrap();
+
+            let dead_path = tmp_dir.join("parakeet-sidecar-999999-dead.sock");
+            let live_path =
+                tmp_dir.join(format!("parakeet-sidecar-{}-live.sock", std::process::id()));
+            fs::write(&dead_path, "").unwrap();
+            fs::write(&live_path, "").unwrap();
+
+            let removed = sweep_stale_sidecar_sockets_in_dir(&tmp_dir).unwrap();
+            assert_eq!(removed, 1);
+            assert!(!dead_path.exists());
+            assert!(live_path.exists());
         }
     }
 }

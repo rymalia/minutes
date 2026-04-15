@@ -128,6 +128,11 @@ pub struct TranscriptionConfig {
     ///
     /// This is beta and remains opt-in until more real-world validation lands.
     pub parakeet_sidecar_enabled: bool,
+    /// Clear the persistent parakeet fp16 blacklist before the next sidecar start.
+    ///
+    /// This is useful after upgrading the parakeet binary to a version that may
+    /// have fixed prior fp16 startup crashes.
+    pub parakeet_fp16_blacklist_reset: bool,
     /// SentencePiece vocab filename (resolved under model_path/parakeet/).
     ///
     /// If left at the default generic name, Minutes still prefers model-specific
@@ -573,6 +578,7 @@ impl Default for TranscriptionConfig {
             parakeet_boost_score: 2.0,
             parakeet_fp16: true,
             parakeet_sidecar_enabled: false,
+            parakeet_fp16_blacklist_reset: false,
             parakeet_vocab: "tdt-600m.tokenizer.vocab".into(),
         }
     }
@@ -1071,6 +1077,23 @@ parakeet_sidecar_enabled = true
 
         let config = Config::load_from(&config_path);
         assert!(config.transcription.parakeet_sidecar_enabled);
+    }
+
+    #[test]
+    fn parakeet_fp16_blacklist_reset_flag_can_be_enabled_from_toml() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[transcription]
+parakeet_fp16_blacklist_reset = true
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from(&config_path);
+        assert!(config.transcription.parakeet_fp16_blacklist_reset);
     }
 
     #[test]
