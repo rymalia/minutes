@@ -4064,13 +4064,13 @@ mod tests {
     #[test]
     fn build_entity_links_folds_email_and_slash_forms_onto_canonical_person() {
         let entities = build_entity_links(
-            "Samantha <> Mat",
+            "Alex <> Casey",
             None,
             &[
-                "mathieu@followthedata.co".into(),
-                "redacted@example.com".into(),
-                "Samantha".into(),
-                "Mat / Matthew".into(),
+                "alex@example.org".into(),
+                "casey@example.com".into(),
+                "Casey".into(),
+                "Alex / Alexander".into(),
                 "Dan".into(),
             ],
             &[],
@@ -4081,58 +4081,46 @@ mod tests {
         );
 
         let slugs: Vec<&str> = entities.people.iter().map(|e| e.slug.as_str()).collect();
-        assert!(
-            slugs.contains(&"mathieu"),
-            "email localpart kept: {:?}",
-            slugs
-        );
-        assert!(slugs.contains(&"samantha"), "samantha present: {:?}", slugs);
-        assert!(slugs.contains(&"mat"), "bare Mat present: {:?}", slugs);
+        assert!(slugs.contains(&"alex"), "email localpart kept: {:?}", slugs);
+        assert!(slugs.contains(&"casey"), "casey present: {:?}", slugs);
         assert!(slugs.contains(&"dan"), "dan present: {:?}", slugs);
-        // The email form and the bare name collapsed for Samantha.
+        // The email form and the bare name collapsed for Casey.
         assert_eq!(
-            slugs.iter().filter(|s| **s == "samantha").count(),
+            slugs.iter().filter(|s| **s == "casey").count(),
             1,
-            "samantha deduped: {:?}",
+            "casey deduped: {:?}",
             slugs
         );
         // The slash-disambiguated form does not spawn its own slug.
         assert!(
-            !slugs.contains(&"mat-matthew"),
+            !slugs.contains(&"alex-alexander"),
             "slash-disambiguation stripped: {:?}",
             slugs
         );
         // The email form does not spawn a slug that includes the domain.
         assert!(
-            !slugs.contains(&"mathieu-followthedata-co"),
+            !slugs.contains(&"alex-example-org"),
             "email domain stripped: {:?}",
             slugs
         );
         assert!(
-            !slugs.contains(&"redacted-example-com"),
-            "email domain stripped for samantha: {:?}",
+            !slugs.contains(&"casey-example-com"),
+            "email domain stripped for casey: {:?}",
             slugs
         );
 
-        let samantha = entities
-            .people
-            .iter()
-            .find(|e| e.slug == "samantha")
-            .unwrap();
+        let casey = entities.people.iter().find(|e| e.slug == "casey").unwrap();
         assert!(
-            samantha
-                .aliases
-                .iter()
-                .any(|a| a == "redacted@example.com"),
+            casey.aliases.iter().any(|a| a == "casey@example.com"),
             "original email preserved as alias: {:?}",
-            samantha.aliases
+            casey.aliases
         );
 
-        let mat = entities.people.iter().find(|e| e.slug == "mat").unwrap();
+        let alex = entities.people.iter().find(|e| e.slug == "alex").unwrap();
         assert!(
-            mat.aliases.iter().any(|a| a == "mat / matthew"),
+            alex.aliases.iter().any(|a| a == "alex / alexander"),
             "original slash form preserved as alias: {:?}",
-            mat.aliases
+            alex.aliases
         );
     }
 
@@ -4259,29 +4247,29 @@ mod tests {
 
     #[test]
     fn strip_email_domain_returns_localpart_only_for_valid_emails() {
-        assert_eq!(strip_email_domain("mathieu@followthedata.co"), "mathieu");
-        assert_eq!(strip_email_domain("redacted@example.com"), "samantha");
+        assert_eq!(strip_email_domain("alex@example.org"), "alex");
+        assert_eq!(strip_email_domain("casey@example.com"), "casey");
         // Missing dot in domain → not treated as email.
-        assert_eq!(strip_email_domain("mat@localhost"), "mat@localhost");
+        assert_eq!(strip_email_domain("user@localhost"), "user@localhost");
         // Missing local part → unchanged.
         assert_eq!(strip_email_domain("@bad.tld"), "@bad.tld");
         // No '@' at all.
-        assert_eq!(strip_email_domain("Mat"), "Mat");
+        assert_eq!(strip_email_domain("Alex"), "Alex");
     }
 
     #[test]
     fn merge_attendees_strips_name_disambiguation_hedge() {
         let merged = merge_attendees(
             &["Andrea".into()],
-            &["Mat / Matthew".into(), "Samantha".into()],
+            &["Alex / Alexander".into(), "Casey".into()],
         );
         assert!(
-            merged.iter().any(|a| a == "Mat"),
+            merged.iter().any(|a| a == "Alex"),
             "slash suffix stripped in attendees: {:?}",
             merged
         );
         assert!(
-            !merged.iter().any(|a| a == "Mat / Matthew"),
+            !merged.iter().any(|a| a == "Alex / Alexander"),
             "slash-hedge form not kept: {:?}",
             merged
         );
