@@ -1854,6 +1854,10 @@ struct TitleGenerationDecision {
     model: Option<String>,
     input_chars: usize,
     detail: Option<String>,
+    /// Wall-clock duration of the LLM refine call itself. Zero when the
+    /// fallback paths (explicit title, missing summary) short-circuit before
+    /// any LLM invocation.
+    llm_duration_ms: u64,
 }
 
 fn maybe_refine_title_with_llm<F>(
@@ -1881,6 +1885,7 @@ where
             model: None,
             input_chars: 0,
             detail: Some("explicit-title".into()),
+            llm_duration_ms: 0,
         };
     }
 
@@ -1892,6 +1897,7 @@ where
             model: None,
             input_chars: 0,
             detail: Some("missing-summary-text".into()),
+            llm_duration_ms: 0,
         };
     };
     let Some(raw_summary) = raw_summary else {
@@ -1902,13 +1908,18 @@ where
             model: None,
             input_chars: 0,
             detail: Some("missing-summary-struct".into()),
+            llm_duration_ms: 0,
         };
     };
 
     let attempted_model = summarize::title_refinement_model(config);
     let input_chars = summarize::title_refinement_input_chars(summary_text, raw_summary, entities);
 
-    match refine(summary_text, raw_summary, entities, config) {
+    let llm_started = std::time::Instant::now();
+    let refine_result = refine(summary_text, raw_summary, entities, config);
+    let llm_duration_ms = llm_started.elapsed().as_millis() as u64;
+
+    match refine_result {
         Ok(refined) => {
             let cleaned = sanitize_llm_title_candidate(&refined.title);
             if llm_title_passes_quality(&cleaned) {
@@ -1919,6 +1930,7 @@ where
                     model: Some(refined.model),
                     input_chars: refined.input_chars,
                     detail: None,
+                    llm_duration_ms,
                 }
             } else {
                 TitleGenerationDecision {
@@ -1928,6 +1940,7 @@ where
                     model: Some(refined.model),
                     input_chars: refined.input_chars,
                     detail: Some(format!("rejected-title: {}", cleaned)),
+                    llm_duration_ms,
                 }
             }
         }
@@ -1938,6 +1951,7 @@ where
             model: attempted_model,
             input_chars,
             detail: Some(error.to_string()),
+            llm_duration_ms,
         },
     }
 }
@@ -1949,7 +1963,7 @@ fn apply_title_generation(
     decision: TitleGenerationDecision,
     mut log_step: impl FnMut(u64, serde_json::Value),
 ) {
-    let start = std::time::Instant::now();
+    let apply_start = std::time::Instant::now();
     let mut outcome = decision.outcome;
     let mut detail = decision.detail.clone();
 
@@ -1979,11 +1993,13 @@ fn apply_title_generation(
         frontmatter.title = decision.final_title.clone();
     }
 
+    let apply_ms = apply_start.elapsed().as_millis() as u64;
     let mut extra = serde_json::json!({
         "outcome": outcome,
         "model": decision.model,
         "input_chars": decision.input_chars,
         "title": result.title,
+        "apply_ms": apply_ms,
     });
     if let Some(detail) = detail {
         extra["detail"] = serde_json::json!(detail);
@@ -1992,7 +2008,7 @@ fn apply_title_generation(
         extra["output"] = serde_json::json!(result.path.display().to_string());
     }
 
-    log_step(start.elapsed().as_millis() as u64, extra);
+    log_step(decision.llm_duration_ms, extra);
 }
 
 fn sanitize_llm_title_candidate(candidate: &str) -> String {
