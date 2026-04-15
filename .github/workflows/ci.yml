@@ -55,6 +55,15 @@ jobs:
         # breakage here only surfaces when Prompter next runs cargo build.
         run: cargo build -p minutes-core --no-default-features --features streaming
 
+      - name: Build core with parakeet (cross-platform)
+        # Guards against Linux-parakeet breakage that today only surfaces
+        # at tag push via release-cli.yml. The parakeet feature compiles
+        # on Unix (subprocess + optional sidecar via cfg all(parakeet,unix))
+        # and as a no-op stub elsewhere. Without this step, a feature-gated
+        # compile error in parakeet_sidecar or related code stays invisible
+        # on non-macOS until release.
+        run: cargo build -p minutes-core --no-default-features --features parakeet
+
       - name: Build full workspace (macOS only)
         if: runner.os == 'macOS'
         run: cargo build --no-default-features
