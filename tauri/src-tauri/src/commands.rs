@@ -1356,6 +1356,8 @@ pub struct OutputNotice {
     pub title: String,
     pub path: String,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "jobId")]
+    pub job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -2515,6 +2517,7 @@ fn start_native_call_recording(
                         detail:
                             "ScreenCaptureKit capture ended early, but the raw output was preserved."
                                 .into(),
+                        job_id: None,
                     };
                     set_latest_output(latest_output, Some(notice.clone()));
                     maybe_show_completion_notification(
@@ -2557,6 +2560,7 @@ fn start_native_call_recording(
                 title: "Native call capture preserved".into(),
                 path: saved.display().to_string(),
                 detail: format!("Stopping native call capture failed: {}", error),
+                job_id: None,
             };
             set_latest_output(latest_output, Some(notice.clone()));
             maybe_show_completion_notification(
@@ -2673,6 +2677,7 @@ fn start_native_call_recording(
                         "Failed to queue native call capture for processing: {}",
                         error
                     ),
+                    job_id: None,
                 };
                 set_latest_output(latest_output, Some(notice.clone()));
                 maybe_show_completion_notification(
@@ -2942,6 +2947,7 @@ fn output_notice_from_job(job: &minutes_core::jobs::ProcessingJob) -> Option<Out
             detail: job.error.clone().unwrap_or_else(|| {
                 "Transcript was marked as no speech. Raw capture preserved for retry.".into()
             }),
+            job_id: Some(job.id.clone()),
         }),
         minutes_core::jobs::JobState::Complete => {
             job.output_path.as_ref().map(|path| OutputNotice {
@@ -2952,6 +2958,7 @@ fn output_notice_from_job(job: &minutes_core::jobs::ProcessingJob) -> Option<Out
                     .unwrap_or_else(|| "Processed recording".into()),
                 path: path.clone(),
                 detail: "Saved meeting markdown".into(),
+                job_id: None,
             })
         }
         minutes_core::jobs::JobState::Failed => {
@@ -2970,9 +2977,59 @@ fn output_notice_from_job(job: &minutes_core::jobs::ProcessingJob) -> Option<Out
                     .error
                     .clone()
                     .unwrap_or_else(|| "Processing failed, recoverable capture preserved.".into()),
+                job_id: Some(job.id.clone()),
             })
         }
         _ => None,
+    }
+}
+
+fn startup_retryable_output_notice_from_job(
+    job: &minutes_core::jobs::ProcessingJob,
+) -> Option<OutputNotice> {
+    let mut notice = output_notice_from_job(job)?;
+    notice.detail = match job.state {
+        minutes_core::jobs::JobState::NeedsReview => {
+            "Previous transcript needs review. Raw capture is preserved and can be retried.".into()
+        }
+        minutes_core::jobs::JobState::Failed => {
+            "Previous processing failed. Raw capture is preserved and can be retried.".into()
+        }
+        _ => notice.detail,
+    };
+    Some(notice)
+}
+
+fn latest_retryable_output_notice() -> Option<OutputNotice> {
+    let mut jobs = minutes_core::jobs::list_jobs()
+        .into_iter()
+        .filter(|job| {
+            matches!(
+                job.state,
+                minutes_core::jobs::JobState::Failed | minutes_core::jobs::JobState::NeedsReview
+            )
+        })
+        .collect::<Vec<_>>();
+
+    jobs.sort_by(|a, b| {
+        let a_time = a.finished_at.as_ref().unwrap_or(&a.created_at);
+        let b_time = b.finished_at.as_ref().unwrap_or(&b.created_at);
+        b_time.cmp(a_time)
+    });
+
+    jobs.into_iter()
+        .next()
+        .and_then(|job| startup_retryable_output_notice_from_job(&job))
+}
+
+pub fn seed_latest_retryable_output(latest_output: &Arc<Mutex<Option<OutputNotice>>>) {
+    let should_seed = latest_output
+        .lock()
+        .ok()
+        .is_some_and(|current| current.is_none());
+
+    if should_seed {
+        set_latest_output(latest_output, latest_retryable_output_notice());
     }
 }
 
@@ -4363,6 +4420,7 @@ pub fn start_recording(
                                     "Failed to queue background processing. Raw {} capture preserved.",
                                     mode.noun()
                                 ),
+                                job_id: None,
                             };
                             set_latest_output(&latest_output, Some(notice.clone()));
                             maybe_show_completion_notification(
@@ -4414,6 +4472,7 @@ pub fn start_recording(
                     title: "Partial capture preserved".into(),
                     path: saved.display().to_string(),
                     detail: detail.into(),
+                    job_id: None,
                 };
                 set_latest_output(&latest_output, Some(notice.clone()));
                 maybe_show_completion_notification(
@@ -5964,6 +6023,7 @@ pub fn cmd_retry_recovery(
                     title: result.title.clone(),
                     path: result.path.display().to_string(),
                     detail: "Recovery item was processed successfully.".into(),
+                    job_id: None,
                 };
                 set_latest_output(&latest_output, Some(notice));
                 eprintln!("Recovery retry succeeded: {}", result.path.display());
@@ -5974,6 +6034,7 @@ pub fn cmd_retry_recovery(
                     title: "Retry failed".into(),
                     path: audio_path.display().to_string(),
                     detail: format!("Recovery retry failed: {}", e),
+                    job_id: None,
                 };
                 set_latest_output(&latest_output, Some(notice));
                 eprintln!("Recovery retry failed: {}", e);
@@ -8440,6 +8501,7 @@ mod tests {
                 title: "Demo".into(),
                 path: "/tmp/demo.md".into(),
                 detail: "Saved".into(),
+                job_id: None,
             }),
         );
 
@@ -8630,6 +8692,7 @@ mod tests {
             speaker_map: vec![],
             template: None,
             filter_diagnosis: None,
+            recording_health: None,
         };
         let sections = vec![MeetingSection {
             heading: "Summary".into(),
@@ -8686,6 +8749,7 @@ mod tests {
             speaker_map: vec![],
             template: None,
             filter_diagnosis: None,
+            recording_health: None,
         };
         let sections = vec![MeetingSection {
             heading: "Summary".into(),
@@ -8733,6 +8797,7 @@ mod tests {
             speaker_map: vec![],
             template: None,
             filter_diagnosis: None,
+            recording_health: None,
         };
         let sections = vec![MeetingSection {
             heading: "Summary".into(),
@@ -9001,6 +9066,46 @@ mod tests {
         assert_eq!(notice.kind, "preserved-capture");
         assert_eq!(notice.path, "/tmp/interview.wav");
         assert!(notice.detail.contains("silence strip"));
+    }
+
+    #[test]
+    fn startup_retryable_notices_do_not_surface_stale_failure_details() {
+        let job = minutes_core::jobs::ProcessingJob {
+            id: "job-failed".into(),
+            title: Some("Legacy Method Agent Capacity".into()),
+            mode: CaptureMode::Meeting,
+            content_type: ContentType::Meeting,
+            state: minutes_core::jobs::JobState::Failed,
+            stage: minutes_core::jobs::JobState::Failed.default_stage(),
+            output_path: None,
+            audio_path: "/tmp/capture.wav".into(),
+            error: Some("engine 'parakeet' not compiled in".into()),
+            created_at: chrono::Local::now(),
+            started_at: None,
+            finished_at: Some(chrono::Local::now()),
+            recording_started_at: None,
+            recording_finished_at: None,
+            context_session_id: None,
+            user_notes: None,
+            pre_context: None,
+            calendar_event: None,
+            template_slug: None,
+            word_count: Some(0),
+            owner_pid: None,
+        };
+
+        let live_notice = output_notice_from_job(&job).expect("live failed notice");
+        assert!(live_notice.detail.contains("parakeet"));
+
+        let startup_notice =
+            startup_retryable_output_notice_from_job(&job).expect("startup retryable notice");
+        assert_eq!(startup_notice.kind, "preserved-capture");
+        assert_eq!(startup_notice.path, "/tmp/capture.wav");
+        assert_eq!(
+            startup_notice.detail,
+            "Previous processing failed. Raw capture is preserved and can be retried."
+        );
+        assert!(!startup_notice.detail.contains("parakeet"));
     }
 
     #[test]
