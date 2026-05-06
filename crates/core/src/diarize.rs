@@ -114,6 +114,7 @@ type StemEnergyWindows = (Vec<EnergyWindow>, Vec<EnergyWindow>);
 const STEM_PROBE_SECS: usize = 5;
 const STEM_PROBE_RMS_FLOOR: f32 = 0.001;
 const PRIMARY_DEGRADED_MIN_DURATION_SECS: f64 = 60.0;
+const DEGRADED_ML_FALLBACK_MIN_DURATION_SECS: f64 = 120.0;
 
 // ── Speaker attribution ──────────────────────────────────────
 
@@ -1549,6 +1550,67 @@ fn degraded_capture_for_primary_result(
     Some(degraded_reason)
 }
 
+fn should_attempt_degraded_ml_fallback(audio_path: &Path, ctx: DiarizationContext<'_>) -> bool {
+    if ctx.purpose != DiarizationPurpose::PrimaryMeeting {
+        return false;
+    }
+
+    // If the duration probe fails, stay conservative: this path only runs
+    // after the primary degraded-capture guard already decided the source-aware
+    // result is unsafe, so unknown duration should not block recovery.
+    let duration_secs = audio_duration_secs(audio_path).unwrap_or(f64::INFINITY);
+    duration_secs > DEGRADED_ML_FALLBACK_MIN_DURATION_SECS
+}
+
+fn degraded_voice_stem_ml_fallback_with_runner(
+    audio_path: &Path,
+    voice_stem: &Path,
+    config: &Config,
+    resolved_engine: Option<&str>,
+    reason: &DegradedCapture,
+    ctx: DiarizationContext<'_>,
+    mut run_engine: impl FnMut(&Path, &Config, &str) -> Option<DiarizationResult>,
+) -> Option<DiarizationResult> {
+    let resolved_engine = resolved_engine?;
+    if !should_attempt_degraded_ml_fallback(audio_path, ctx) {
+        return None;
+    }
+
+    let mut result = run_engine(voice_stem, config, resolved_engine)?;
+    result.degraded_capture = Some(reason.clone());
+    result.from_stems = false;
+    result.source_aware = false;
+
+    tracing::warn!(
+        failure_kind = ?reason.failure_kind,
+        voice_stem = %voice_stem.display(),
+        speakers = result.num_speakers,
+        segments = result.segments.len(),
+        "source-aware diarization degraded; recovered with low-confidence voice-stem ML diarization"
+    );
+
+    Some(result)
+}
+
+fn degraded_voice_stem_ml_fallback(
+    audio_path: &Path,
+    voice_stem: &Path,
+    config: &Config,
+    resolved_engine: Option<&str>,
+    reason: &DegradedCapture,
+    ctx: DiarizationContext<'_>,
+) -> Option<DiarizationResult> {
+    degraded_voice_stem_ml_fallback_with_runner(
+        audio_path,
+        voice_stem,
+        config,
+        resolved_engine,
+        reason,
+        ctx,
+        run_diarization_engine,
+    )
+}
+
 /// Run speaker diarization on an audio file.
 /// Returns None if diarization is disabled or models are not available.
 ///
@@ -1587,6 +1649,16 @@ pub fn diarize_with_context(
                     if let Some(reason) =
                         degraded_capture_for_primary_result(audio_path, &result, ctx)
                     {
+                        if let Some(recovered) = degraded_voice_stem_ml_fallback(
+                            audio_path,
+                            &stems.voice,
+                            config,
+                            resolved_engine,
+                            &reason,
+                            ctx,
+                        ) {
+                            return DiarizationOutcome::Result(recovered);
+                        }
                         tracing::warn!(
                             failure_kind = ?reason.failure_kind,
                             system_dominant_ratio = result.system_dominant_ratio,
@@ -1629,6 +1701,16 @@ pub fn diarize_with_context(
                 if let Some(reason) =
                     degraded_capture_for_silent_system_stem(audio_path, &stems.system, ctx)
                 {
+                    if let Some(recovered) = degraded_voice_stem_ml_fallback(
+                        audio_path,
+                        &stems.voice,
+                        config,
+                        resolved_engine,
+                        &reason,
+                        ctx,
+                    ) {
+                        return DiarizationOutcome::Result(recovered);
+                    }
                     tracing::warn!(
                         failure_kind = ?reason.failure_kind,
                         voice = %stems.voice.display(),
@@ -3651,6 +3733,104 @@ mod tests {
         );
         assert!(!transcript.contains("[UNKNOWN"));
         assert!(!transcript.contains("[SPEAKER_0"));
+    }
+
+    #[test]
+    fn degraded_voice_stem_ml_fallback_marks_result_backend_agnostic_and_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("call.wav");
+        let voice = dir.path().join("call.voice.wav");
+        let system = dir.path().join("call.system.wav");
+        let sample_rate = 1_000;
+        let frames = 121_000;
+        write_i16_wav(&audio, sample_rate, 1, frames, |_, _| 0);
+        write_i16_wav(&voice, sample_rate, 1, frames, |_, _| 3_000);
+        write_i16_wav(&system, sample_rate, 1, frames, |_, _| 0);
+
+        let reason = silent_system_stem_degraded_capture(&system);
+        let config = Config::default();
+        let windows = vec![TranscriptWindow {
+            start_secs: 0.0,
+            end_secs: 8.0,
+        }];
+        let mut attempted_paths = Vec::new();
+        let recovered = degraded_voice_stem_ml_fallback_with_runner(
+            &audio,
+            &voice,
+            &config,
+            Some("test-engine"),
+            &reason,
+            DiarizationContext {
+                purpose: DiarizationPurpose::PrimaryMeeting,
+                transcript_windows: Some(&windows),
+            },
+            |path, _config, _engine| {
+                attempted_paths.push(path.to_path_buf());
+                Some(DiarizationResult {
+                    segments: vec![
+                        SpeakerSegment {
+                            speaker: "SPEAKER_0".into(),
+                            start: 0.0,
+                            end: 10.0,
+                        },
+                        SpeakerSegment {
+                            speaker: "SPEAKER_1".into(),
+                            start: 10.0,
+                            end: 20.0,
+                        },
+                    ],
+                    num_speakers: 2,
+                    system_dominant_ratio: 0.0,
+                    voice_dominant_ratio: 0.0,
+                    degraded_capture: None,
+                    from_stems: true,
+                    source_aware: true,
+                    speaker_embeddings: std::collections::HashMap::new(),
+                })
+            },
+        )
+        .expect("expected degraded capture to recover through voice-stem ML");
+
+        assert_eq!(attempted_paths, vec![voice]);
+        assert!(!recovered.from_stems);
+        assert!(!recovered.source_aware);
+        assert_eq!(recovered.num_speakers, 2);
+        assert_eq!(recovered.degraded_capture, Some(reason));
+    }
+
+    #[test]
+    fn degraded_voice_stem_ml_fallback_respects_two_minute_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("call.wav");
+        let voice = dir.path().join("call.voice.wav");
+        let system = dir.path().join("call.system.wav");
+        let sample_rate = 1_000;
+        let frames = 90_000;
+        write_i16_wav(&audio, sample_rate, 1, frames, |_, _| 0);
+        write_i16_wav(&voice, sample_rate, 1, frames, |_, _| 3_000);
+        write_i16_wav(&system, sample_rate, 1, frames, |_, _| 0);
+
+        let reason = silent_system_stem_degraded_capture(&system);
+        let config = Config::default();
+        let mut attempted = false;
+        let recovered = degraded_voice_stem_ml_fallback_with_runner(
+            &audio,
+            &voice,
+            &config,
+            Some("test-engine"),
+            &reason,
+            DiarizationContext {
+                purpose: DiarizationPurpose::PrimaryMeeting,
+                transcript_windows: None,
+            },
+            |_path, _config, _engine| {
+                attempted = true;
+                Some(DiarizationResult::default())
+            },
+        );
+
+        assert!(recovered.is_none());
+        assert!(!attempted);
     }
 
     #[test]

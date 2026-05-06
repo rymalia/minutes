@@ -65,14 +65,39 @@ pub struct CaptureWarning {
 
 impl From<crate::diarize::DegradedCapture> for RecordingHealth {
     fn from(reason: crate::diarize::DegradedCapture) -> Self {
+        RecordingHealth::from_degraded_capture(reason, DiarizationPath::None)
+    }
+}
+
+impl RecordingHealth {
+    pub fn from_degraded_capture(
+        reason: crate::diarize::DegradedCapture,
+        diarization_path: DiarizationPath,
+    ) -> Self {
         let message = match &reason.failure_kind {
             crate::diarize::FailureKind::Silent => {
-                "System audio was silent during capture; transcript was left unlabeled.".to_string()
+                if diarization_path == DiarizationPath::MlBleedDegraded {
+                    "System audio was silent during capture; speaker labels were recovered from degraded mic bleed with low confidence.".to_string()
+                } else {
+                    "System audio was silent during capture; transcript was left unlabeled."
+                        .to_string()
+                }
             }
             crate::diarize::FailureKind::Sparse => {
-                "System audio did not contain sustained transcript-aligned remote speech; transcript was left unlabeled.".to_string()
+                if diarization_path == DiarizationPath::MlBleedDegraded {
+                    "System audio did not contain sustained transcript-aligned remote speech; speaker labels were recovered from degraded mic bleed with low confidence.".to_string()
+                } else {
+                    "System audio did not contain sustained transcript-aligned remote speech; transcript was left unlabeled.".to_string()
+                }
             }
-            _ => "Capture health degraded diarization; transcript was left unlabeled.".to_string(),
+            _ => {
+                if diarization_path == DiarizationPath::MlBleedDegraded {
+                    "Capture health degraded diarization; speaker labels were recovered from degraded mic bleed with low confidence.".to_string()
+                } else {
+                    "Capture health degraded diarization; transcript was left unlabeled."
+                        .to_string()
+                }
+            }
         };
 
         RecordingHealth {
@@ -85,7 +110,7 @@ impl From<crate::diarize::DegradedCapture> for RecordingHealth {
                 message,
                 diagnostic_confidence: reason.diagnostic_confidence,
             }],
-            diarization_path: Some(DiarizationPath::None),
+            diarization_path: Some(diarization_path),
         }
     }
 }

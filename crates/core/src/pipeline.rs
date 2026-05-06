@@ -263,6 +263,62 @@ fn debug_speaker_map(speaker_map: &[diarize::SpeakerAttribution]) -> Vec<Speaker
         .collect()
 }
 
+fn is_degraded_ml_fallback_result(result: &diarize::DiarizationResult) -> bool {
+    result.degraded_capture.is_some() && !result.from_stems && !result.source_aware
+}
+
+fn degraded_ml_recording_health(reason: diarize::DegradedCapture) -> markdown::RecordingHealth {
+    markdown::RecordingHealth::from_degraded_capture(
+        reason,
+        markdown::DiarizationPath::MlBleedDegraded,
+    )
+}
+
+fn mark_degraded_ml_attributions(speaker_map: &mut [diarize::SpeakerAttribution]) {
+    for attribution in speaker_map {
+        attribution.confidence = diarize::Confidence::Low;
+        attribution.source = diarize::AttributionSource::MlBleedDegraded;
+    }
+}
+
+fn log_rendered_label_collapse_diagnostic(
+    audio_path: &Path,
+    result: &diarize::DiarizationResult,
+    transcript: &str,
+) {
+    if result.num_speakers <= 1 {
+        return;
+    }
+
+    let rendered_labels = extract_effective_transcript_speaker_labels(transcript);
+    let rendered_speaker_labels = rendered_labels
+        .iter()
+        .filter(|label| label.as_str() != "UNKNOWN")
+        .count();
+    if rendered_speaker_labels > 1 {
+        return;
+    }
+
+    tracing::warn!(
+        diarization_speakers = result.num_speakers,
+        rendered_speaker_labels,
+        degraded_capture = result.degraded_capture.is_some(),
+        audio = %audio_path.display(),
+        "diarization found multiple speakers but transcript rendered one or fewer speaker labels"
+    );
+    logging::log_step(
+        "diarize_rendered_label_collapse",
+        &audio_path.display().to_string(),
+        0,
+        serde_json::json!({
+            "diagnostic": true,
+            "diarization_speakers": result.num_speakers,
+            "rendered_speaker_labels": rendered_speaker_labels,
+            "degraded_capture": result.degraded_capture.is_some(),
+        }),
+    );
+}
+
 fn expected_voice_stem_path(audio_path: &Path) -> Option<std::path::PathBuf> {
     let stem = audio_path.file_stem()?.to_str()?;
     let dir = audio_path.parent()?;
@@ -518,6 +574,7 @@ fn attribute_meeting_speakers(
     llm_attendees: &[String],
     diarization_num_speakers: usize,
     diarization_from_stems: bool,
+    degraded_ml_fallback: bool,
     diarization_embeddings: &std::collections::HashMap<String, Vec<f32>>,
     transcript: String,
 ) -> AttributionProcessingResult {
@@ -627,6 +684,10 @@ fn attribute_meeting_speakers(
 
         let effective_transcript_speaker_labels =
             extract_effective_transcript_speaker_labels(&transcript);
+
+        if degraded_ml_fallback {
+            mark_degraded_ml_attributions(&mut speaker_map);
+        }
 
         if speaker_map
             .iter()
@@ -1060,6 +1121,7 @@ where
     let mut transcript = artifact.transcript.clone();
     let mut diarization_num_speakers = 0usize;
     let mut diarization_from_stems = false;
+    let mut degraded_ml_fallback = false;
     let mut diarization_embeddings: std::collections::HashMap<String, Vec<f32>> =
         std::collections::HashMap::new();
     let mut recording_health: Option<markdown::RecordingHealth> = None;
@@ -1079,6 +1141,12 @@ where
                 let diarize_ms = diarize_start.elapsed().as_millis() as u64;
                 diarization_num_speakers = result.num_speakers;
                 diarization_from_stems = result.source_aware;
+                degraded_ml_fallback = is_degraded_ml_fallback_result(&result);
+                if degraded_ml_fallback {
+                    if let Some(reason) = result.degraded_capture.clone() {
+                        recording_health = Some(degraded_ml_recording_health(reason));
+                    }
+                }
                 diarization_embeddings = result.speaker_embeddings.clone();
                 logging::log_step(
                     "diarize",
@@ -1092,6 +1160,7 @@ where
                     }),
                 );
                 transcript = diarize::apply_speakers(&transcript, &result);
+                log_rendered_label_collapse_diagnostic(audio_path, &result, &transcript);
             }
             diarize::DiarizationOutcome::Skipped { reason } => {
                 let diarize_ms = diarize_start.elapsed().as_millis() as u64;
@@ -1248,6 +1317,7 @@ where
         &attendees,
         diarization_num_speakers,
         diarization_from_stems,
+        degraded_ml_fallback,
         &diarization_embeddings,
         transcript,
     );
@@ -1549,6 +1619,7 @@ where
     // Step 2: Diarize (optional — depends on config.diarization.engine)
     let mut diarization_num_speakers: usize = 0;
     let mut diarization_from_stems = false;
+    let mut degraded_ml_fallback = false;
     let mut diarization_embeddings: std::collections::HashMap<String, Vec<f32>> =
         std::collections::HashMap::new();
     let mut recording_health: Option<markdown::RecordingHealth> = None;
@@ -1568,8 +1639,16 @@ where
             diarize::DiarizationOutcome::Result(result) => {
                 diarization_num_speakers = result.num_speakers;
                 diarization_from_stems = result.source_aware;
+                degraded_ml_fallback = is_degraded_ml_fallback_result(&result);
+                if degraded_ml_fallback {
+                    if let Some(reason) = result.degraded_capture.clone() {
+                        recording_health = Some(degraded_ml_recording_health(reason));
+                    }
+                }
                 diarization_embeddings = result.speaker_embeddings.clone();
-                diarize::apply_speakers(&transcript, &result)
+                let transcript = diarize::apply_speakers(&transcript, &result);
+                log_rendered_label_collapse_diagnostic(audio_path, &result, &transcript);
+                transcript
             }
             diarize::DiarizationOutcome::Skipped { reason } => {
                 recording_health = Some(reason.into());
@@ -1744,6 +1823,7 @@ where
         &attendees,
         diarization_num_speakers,
         diarization_from_stems,
+        degraded_ml_fallback,
         &diarization_embeddings,
         transcript,
     );
@@ -4349,6 +4429,7 @@ mod tests {
             &["Mat".into(), "Alex".into()],
             2,
             true,
+            false,
             &std::collections::HashMap::new(),
             "[SPEAKER_0 0:00] hello\n[SPEAKER_1 0:01] hi\n".into(),
         );
@@ -4358,6 +4439,62 @@ mod tests {
             .speaker_map
             .iter()
             .all(|entry| entry.confidence == diarize::Confidence::Medium));
+    }
+
+    #[test]
+    fn degraded_ml_fallback_attribution_is_low_confidence_and_marked() {
+        let mut config = Config::default();
+        config.identity.name = Some("Mat".into());
+
+        let result = attribute_meeting_speakers(
+            Path::new("/fake.wav"),
+            ContentType::Meeting,
+            None,
+            &config,
+            &["Mat".into(), "Alex".into()],
+            &["Mat".into(), "Alex".into()],
+            2,
+            false,
+            true,
+            &std::collections::HashMap::new(),
+            "[SPEAKER_0 0:00] hello\n[SPEAKER_1 0:01] hi\n".into(),
+        );
+
+        assert_eq!(result.speaker_map.len(), 2);
+        assert!(result.speaker_map.iter().all(|entry| {
+            entry.confidence == diarize::Confidence::Low
+                && entry.source == diarize::AttributionSource::MlBleedDegraded
+        }));
+    }
+
+    #[test]
+    fn degraded_ml_recording_health_sets_recovery_path() {
+        let health = degraded_ml_recording_health(diarize::DegradedCapture {
+            failure_kind: diarize::FailureKind::Silent,
+            capture_backend: "cpal".into(),
+            capture_source: diarize::CaptureSource::System,
+            voice_active_ratio: Some(0.9),
+            system_active_ratio: Some(0.0),
+            observed_signal: diarize::ObservedSignal {
+                frames_captured: 120,
+                max_rms: 0.0,
+                avg_rms: 0.0,
+            },
+            diagnostic_confidence: diarize::DiagnosticConfidence::Inferred,
+        });
+
+        assert_eq!(
+            health.diarization_path,
+            Some(markdown::DiarizationPath::MlBleedDegraded)
+        );
+        assert_eq!(health.capture_warnings.len(), 1);
+        assert_eq!(
+            health.capture_warnings[0].source,
+            diarize::CaptureSource::System
+        );
+        assert!(health.capture_warnings[0]
+            .message
+            .contains("low confidence"));
     }
 
     #[test]
@@ -4455,6 +4592,7 @@ mod tests {
             &[],
             2,
             true,
+            false,
             &std::collections::HashMap::new(),
             "[SPEAKER_1 0:00] hi\n[SPEAKER_0 0:01] hello\n".into(),
         );
