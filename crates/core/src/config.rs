@@ -449,6 +449,9 @@ pub struct RecordingConfig {
     /// Allow Minutes to start a call capture even when the selected input
     /// looks like a plain microphone rather than a system-audio route.
     pub allow_degraded_call_capture: bool,
+    /// System-audio capture backend. "cpal" keeps the current loopback-device
+    /// path. "core-audio-tap" opts into Apple's macOS Process Tap backend.
+    pub capture_backend: String,
     /// Multi-source capture: explicit voice + call device names.
     /// When set, `device` is ignored. CLI `--source` flags override this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -476,6 +479,7 @@ impl Default for RecordingConfig {
             device: None,
             auto_call_intent: false,
             allow_degraded_call_capture: false,
+            capture_backend: "cpal".into(),
             sources: None,
         }
     }
@@ -1227,6 +1231,7 @@ mod tests {
         assert!(!config.watch.extensions.is_empty());
         assert!(!config.recording.auto_call_intent);
         assert!(!config.recording.allow_degraded_call_capture);
+        assert_eq!(config.recording.capture_backend, "cpal");
     }
 
     #[test]

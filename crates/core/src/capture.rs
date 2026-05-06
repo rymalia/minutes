@@ -497,6 +497,8 @@ fn resolve_capture_plan(config: &Config) -> Result<CapturePlan, CaptureError> {
 }
 
 pub fn resolve_system_audio_probe_device(config: &Config) -> Result<Option<String>, String> {
+    let use_core_audio_tap = crate::system_audio_backend::configured_capture_backend(config)?
+        == crate::system_audio_backend::CaptureBackendKind::CoreAudioTap;
     let Some(call_override) = config
         .recording
         .sources
@@ -507,6 +509,19 @@ pub fn resolve_system_audio_probe_device(config: &Config) -> Result<Option<Strin
     else {
         return Ok(None);
     };
+
+    if use_core_audio_tap {
+        if crate::system_audio_backend::core_audio_tap_source_is_supported(call_override) {
+            return Ok(Some(
+                crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND.to_string(),
+            ));
+        }
+        return Err(format!(
+            "recording.capture_backend = '{}' captures the default system output; set [recording.sources] call = \"auto\" instead of '{}'",
+            crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND,
+            call_override
+        ));
+    }
 
     if call_override.eq_ignore_ascii_case("auto") {
         detect_loopback_device()
@@ -546,6 +561,24 @@ fn resolve_capture_plan_with_host(
     #[cfg(feature = "streaming")]
     if let Some(call_override) = call_override {
         let (_, voice_name) = select_device_with_override(host, voice_override.as_deref())?;
+        let use_core_audio_tap = crate::system_audio_backend::configured_capture_backend(config)
+            .map_err(|error| CaptureError::Io(std::io::Error::other(error)))?
+            == crate::system_audio_backend::CaptureBackendKind::CoreAudioTap;
+        if use_core_audio_tap {
+            if !crate::system_audio_backend::core_audio_tap_source_is_supported(call_override) {
+                return Err(CaptureError::Io(std::io::Error::other(format!(
+                    "recording.capture_backend = '{}' captures the default system output; set [recording.sources] call = \"auto\" instead of '{}'",
+                    crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND,
+                    call_override
+                ))));
+            }
+            return Ok(CapturePlan::Dual(DualCapturePlan {
+                voice_override,
+                voice_device_name: voice_name,
+                call_override: crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND.into(),
+                call_device_name: crate::system_audio_backend::CORE_AUDIO_TAP_ROUTE_NAME.into(),
+            }));
+        }
         let resolved_call = if call_override.eq_ignore_ascii_case("auto") {
             detect_loopback_device().ok_or_else(|| {
                 CaptureError::Io(std::io::Error::other(MISSING_DUAL_SOURCE_LOOPBACK_MESSAGE))
@@ -968,8 +1001,6 @@ fn record_to_wav_dual_source(
     plan: DualCapturePlan,
     started_context: Option<RecordingStartedContext>,
 ) -> Result<(), CaptureError> {
-    use crate::system_audio_backend::SystemAudioBackend;
-
     crate::pid::check_and_clear_sentinel();
     // Refresh the in-process mic-mute flag from the sentinel. The CLI
     // `--mute-mic` flag writes the sentinel before getting here, and the
@@ -984,8 +1015,10 @@ fn record_to_wav_dual_source(
 
     let mut voice_stream = Some(AudioStream::start(plan.voice_override.as_deref())?);
     let (system_tx, system_backend_rx) = crossbeam_channel::bounded(64);
-    let mut system_backend =
-        crate::system_audio_backend::CpalSystemAudioBackend::new(plan.call_override.clone());
+    let mut system_backend = crate::system_audio_backend::system_audio_backend_for_config(
+        config,
+        plan.call_override.clone(),
+    )?;
     let mut system_stream = Some(system_backend.start(system_tx.clone())?);
     let system_device_name = system_stream
         .as_ref()
@@ -2035,6 +2068,7 @@ pub fn is_system_audio_device_name(name: &str) -> bool {
         "stereo mix",
         "multi-output",
         "aggregate",
+        "core audio process tap",
         // macOS app-installed virtual drivers (verified 2026-04-06)
         "mmaudio",
         "loomaudio",
@@ -2728,6 +2762,46 @@ mod tests {
             false, // not pipewire
         );
         assert_eq!(category, DeviceCategory::SystemAudio);
+    }
+
+    #[test]
+    fn core_audio_process_tap_route_counts_as_system_audio() {
+        assert!(is_system_audio_device_name(
+            crate::system_audio_backend::CORE_AUDIO_TAP_ROUTE_NAME
+        ));
+    }
+
+    #[test]
+    fn core_audio_tap_probe_route_does_not_require_loopback_device() {
+        let mut config = Config::default();
+        config.recording.capture_backend =
+            crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND.into();
+        config.recording.sources = Some(crate::config::SourcesConfig {
+            voice: Some("default".into()),
+            call: Some("auto".into()),
+        });
+
+        let route = resolve_system_audio_probe_device(&config).unwrap();
+
+        assert_eq!(
+            route.as_deref(),
+            Some(crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND)
+        );
+    }
+
+    #[test]
+    fn core_audio_tap_rejects_named_loopback_call_source() {
+        let mut config = Config::default();
+        config.recording.capture_backend =
+            crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND.into();
+        config.recording.sources = Some(crate::config::SourcesConfig {
+            voice: Some("default".into()),
+            call: Some("BlackHole 2ch".into()),
+        });
+
+        let error = resolve_system_audio_probe_device(&config).unwrap_err();
+
+        assert!(error.contains("call = \"auto\""));
     }
 
     #[test]

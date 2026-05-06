@@ -16,9 +16,7 @@
 use crate::config::Config;
 use crate::diarize::{CaptureSource, DiagnosticConfidence, FailureKind};
 use crate::markdown::{CaptureWarning, DiarizationPath, RecordingHealth};
-use crate::system_audio_backend::{
-    CpalSystemAudioBackend, ProbeResult, RouteDescription, SystemAudioBackend,
-};
+use crate::system_audio_backend::{system_audio_backend_for_config, ProbeResult, RouteDescription};
 use serde::{Deserialize, Serialize};
 
 const SYSTEM_AUDIO_PROBE_SECS: u32 = 5;
@@ -60,7 +58,8 @@ pub fn probe_system_audio_capture(
         return Ok(None);
     };
 
-    let backend = CpalSystemAudioBackend::new(device_override);
+    let backend = system_audio_backend_for_config(config, device_override)
+        .map_err(|error| error.to_string())?;
     let route = backend.current_route();
     backend
         .probe(SYSTEM_AUDIO_PROBE_SECS)

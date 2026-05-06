@@ -677,6 +677,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cidre"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c903ff1729987d29e07295d2c5841993db25ff86cca43bee04505878d3ec1a7"
+dependencies = [
+ "cc",
+ "cidre-macros",
+]
+
+[[package]]
+name = "cidre-macros"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6facfeffa8b9792dc014bb4e65e364d13518b74e06783d56249810a3e48cfad7"
+
+[[package]]
 name = "clang-sys"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3201,6 +3217,7 @@ version = "0.16.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "cidre",
  "cpal",
  "crossbeam-channel",
  "dirs 6.0.0",

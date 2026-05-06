@@ -106,6 +106,7 @@ server compatibility.
 | `min_disk_space_mb` | `500` | Auto-stop when free disk space drops below this; 0 = off |
 | `auto_call_intent` | `false` | Infer call intent from process detection (high false-positive rate) |
 | `allow_degraded_call_capture` | `false` | Allow call capture when selected input isn't a system-audio route |
+| `capture_backend` | `"cpal"` | System-audio backend: `"cpal"` for loopback devices, or opt-in `"core-audio-tap"` on macOS 14.4+ |
 
 ### `[recording.sources]` — multi-source capture
 
@@ -113,6 +114,10 @@ server compatibility.
 |---|---|---|
 | `voice` | unset | Voice (mic) device name, or `"default"` |
 | `call` | unset | Call (system audio) device name, or `"auto"` to detect loopback |
+
+When `capture_backend = "core-audio-tap"`, set `call = "auto"`. The backend
+captures the default macOS system output via Core Audio Process Tap instead of
+opening a named loopback input device.
 
 ### `[identity]` — who you are (for attribution)
 
