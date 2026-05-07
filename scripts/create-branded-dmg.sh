@@ -167,7 +167,11 @@ sync
 sleep 2
 
 echo "Detaching DMG..."
-hdiutil detach "$MOUNT_DIR" -quiet
+if ! hdiutil detach "$MOUNT_DIR" -quiet; then
+  echo "Initial DMG detach failed; retrying with force after Finder settles..." >&2
+  sleep 2
+  hdiutil detach "$MOUNT_DIR" -force -quiet
+fi
 
 echo "Compressing final DMG..."
 hdiutil convert "$RW_DMG" \
