@@ -9060,6 +9060,7 @@ mod tests {
             template_slug: None,
             word_count: Some(0),
             owner_pid: None,
+            recording_health: None,
         };
 
         let notice = output_notice_from_job(&job).expect("needs-review notice");
@@ -9092,6 +9093,7 @@ mod tests {
             template_slug: None,
             word_count: Some(0),
             owner_pid: None,
+            recording_health: None,
         };
 
         let live_notice = output_notice_from_job(&job).expect("live failed notice");
