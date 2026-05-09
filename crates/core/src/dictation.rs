@@ -347,7 +347,10 @@ where
         };
 
         let mut vad = Vad::new();
-        let mut streaming = StreamingWhisper::new(config.transcription.language.clone());
+        let mut streaming = StreamingWhisper::with_partial_max_secs(
+            config.transcription.language.clone(),
+            config.transcription.partial_max_secs,
+        );
         let final_backend = dictation_final_backend(config);
         let mut final_utterance_samples: Vec<f32> = Vec::new();
         let mut accumulated_results: Vec<DictationResult> = Vec::new();

@@ -663,7 +663,10 @@ fn run_inner(
     ));
 
     let mut vad = Vad::new();
-    let mut streaming = StreamingWhisper::new(config.transcription.language.clone());
+    let mut streaming = StreamingWhisper::with_partial_max_secs(
+        config.transcription.language.clone(),
+        config.transcription.partial_max_secs,
+    );
     let standalone_backend = config.effective_live_transcript_backend();
     #[cfg(target_os = "macos")]
     let mut apple_utterance_samples: Vec<f32> = Vec::new();
@@ -1317,7 +1320,15 @@ fn transcribe_with_whisper_for_live_sidecar(
         return None;
     }
 
-    let mut streaming = StreamingWhisper::new(language);
+    // This helper is a batch path: it accumulates `samples` via `feed()` and
+    // discards every partial result, returning only `finalize()`. Running
+    // partials here is wasted work — they cost O(buffer_len) per call but
+    // the caller only ever uses the final. Pass a 1-second cap so partials
+    // are suppressed as soon as the buffer crosses MIN_TRANSCRIBE_SAMPLES,
+    // i.e. effectively never. This is independent of the user's live-mode
+    // `transcription.partial_max_secs` setting; that knob is for live
+    // responsiveness, not for batch fan-in.
+    let mut streaming = StreamingWhisper::with_partial_max_secs(language, 1);
     for chunk in samples.chunks(1600) {
         let _ = streaming.feed(chunk, whisper_ctx);
     }
@@ -1852,7 +1863,10 @@ fn run_sidecar_inner_mpsc(
     writer.mark_healthy();
 
     let mut vad = RecordingSidecarVad::new(config);
-    let mut streaming = StreamingWhisper::new(config.transcription.language.clone());
+    let mut streaming = StreamingWhisper::with_partial_max_secs(
+        config.transcription.language.clone(),
+        config.transcription.partial_max_secs,
+    );
     #[cfg(feature = "parakeet")]
     let mut parakeet_utterance_samples: Vec<f32> = Vec::new();
     #[cfg(feature = "parakeet")]

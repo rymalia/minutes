@@ -144,6 +144,21 @@ pub struct TranscriptionConfig {
     /// If left at the default generic name, Minutes still prefers model-specific
     /// tokenizer files such as `tdt-ctc-110m.tokenizer.vocab` when they exist.
     pub parakeet_vocab: String,
+    /// Cap (in seconds) on streaming-whisper partial transcriptions.
+    ///
+    /// Streaming whisper re-transcribes the entire accumulated utterance every
+    /// 2s for full-context partials. Cost is O(buffer_len) per partial, so a
+    /// long uninterrupted monologue will eventually take longer to transcribe
+    /// than the partial interval and saturate the CPU. When the accumulated
+    /// buffer exceeds this many seconds, partial passes are skipped — the
+    /// utterance still finalizes correctly via VAD/silence detection or the
+    /// caller's own utterance cap (`dictation.max_utterance_secs` or
+    /// `live_transcript.max_utterance_secs`); the live transcript just stops
+    /// refreshing during the long stretch.
+    ///
+    /// Default 30s matches the design note in `streaming_whisper.rs`. Raise
+    /// for long-form dictation; lower if you still see CPU pressure.
+    pub partial_max_secs: u32,
 }
 
 pub const VALID_PARAKEET_MODELS: &[&str] = &["tdt-ctc-110m", "tdt-600m"];
@@ -699,6 +714,7 @@ impl Default for TranscriptionConfig {
             parakeet_sidecar_enabled: false,
             parakeet_fp16_blacklist_reset: false,
             parakeet_vocab: "tdt-600m.tokenizer.vocab".into(),
+            partial_max_secs: 30,
         }
     }
 }

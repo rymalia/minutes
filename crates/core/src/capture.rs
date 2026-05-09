@@ -716,15 +716,28 @@ fn build_capture_stream(
                 }
             }
 
-            // Write resampled samples to WAV as i16
+            // Write resampled samples to WAV as i16. Batch the sample-count
+            // atomic so we do one fetch_add per callback (~100/sec) instead
+            // of one per sample (~16,000/sec). Only count samples that were
+            // actually written — on a write error we abort the batch and
+            // commit the count of successful writes so far.
             let mut guard = writer_clone.lock().unwrap();
             if let Some(ref mut w) = *guard {
+                let mut written: u64 = 0;
+                let mut write_err = false;
                 for &sample in resampled {
                     let s16 = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
                     if w.write_sample(s16).is_err() {
-                        return;
+                        write_err = true;
+                        break;
                     }
-                    sample_count_clone.fetch_add(1, Ordering::Relaxed);
+                    written += 1;
+                }
+                if written > 0 {
+                    sample_count_clone.fetch_add(written, Ordering::Relaxed);
+                }
+                if write_err {
+                    return;
                 }
             }
 
