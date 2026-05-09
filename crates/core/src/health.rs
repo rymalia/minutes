@@ -626,6 +626,11 @@ mod tests {
         } else {
             "sh".into()
         };
+        // The default `parakeet_model` is "tdt-600m"; the test was written
+        // when the default was "tdt-ctc-110m" and silently broke when the
+        // default moved. Pin the model explicitly so the install-dir lookup
+        // and the file fixtures agree regardless of future default changes.
+        config.transcription.parakeet_model = "tdt-ctc-110m".into();
 
         let install_dir = crate::parakeet::install_dir(&config, "tdt-ctc-110m");
         std::fs::create_dir_all(&install_dir).unwrap();

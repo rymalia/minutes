@@ -522,9 +522,47 @@ fn list_jobs_raw() -> Vec<ProcessingJob> {
     jobs
 }
 
+/// Return the archived job with the most recent `finished_at` timestamp,
+/// falling back to `created_at` for jobs that predate finished_at being
+/// populated. Designed for the "show notification about what just
+/// completed" path (`spawn_processing_worker`'s post-exit handler in the
+/// Tauri commands layer).
+///
+/// Reads only `archive_dir()`, never the active dir. The status-poll hot
+/// path lives in `list_jobs_raw` (active only); this helper lives in the
+/// rare-event post-worker path where scanning the archive is acceptable.
+/// Using `finished_at` rather than `created_at` matters for reprocessed
+/// jobs: a long-running re-process can finish a job whose `created_at` is
+/// hours older than a freshly-queued recording, and the user wants the
+/// notification to reflect what actually just transitioned, not whichever
+/// terminal record was queued most recently.
+pub fn latest_terminal_job() -> Option<ProcessingJob> {
+    let mut latest: Option<ProcessingJob> = None;
+    for job in list_archive_jobs() {
+        // Defensive: archive should only ever hold terminal-state jobs,
+        // but a future bug or an external tool could plant a non-terminal
+        // record here. Filter explicitly so the caller never observes
+        // wrong-state output.
+        if !job.state.is_terminal() {
+            continue;
+        }
+        let candidate_key = job.finished_at.unwrap_or(job.created_at);
+        match latest.as_ref() {
+            None => latest = Some(job),
+            Some(current) => {
+                let current_key = current.finished_at.unwrap_or(current.created_at);
+                if candidate_key > current_key {
+                    latest = Some(job);
+                }
+            }
+        }
+    }
+    latest
+}
+
 /// List archived (terminal-state) jobs from `archive_dir`. Used by
-/// `display_jobs(_, include_terminal=true)` for full UI listings; never
-/// called from the 1Hz status poll path.
+/// `display_jobs(_, include_terminal=true)` for full UI listings and by
+/// `latest_terminal_job`; never called from the 1Hz status poll path.
 fn list_archive_jobs() -> Vec<ProcessingJob> {
     // Defensive — `display_jobs` already triggers migration via list_jobs(),
     // but a future caller hitting this directly would otherwise miss the
@@ -1946,6 +1984,70 @@ mod tests {
             let all_ids: Vec<&str> = all.iter().map(|j| j.id.as_str()).collect();
             assert!(all_ids.contains(&"job-active-display"));
             assert!(all_ids.contains(&"job-archived-display"));
+        });
+    }
+
+    #[test]
+    fn latest_terminal_job_picks_finished_at_over_created_at() {
+        // The motivating regression: post-worker-exit notifications used
+        // `display_jobs(Some(1), true)` sorted by `created_at` desc, which
+        // surfaces the "newest queued" terminal job rather than the
+        // "newest finished" one. A long-running reprocess that finishes
+        // an old recording must win over a fresher recording that
+        // happened to be terminated earlier.
+        with_temp_home(|_| {
+            fs::create_dir_all(archive_dir()).unwrap();
+
+            let now = Local::now();
+            let mut older_created = make_test_job("job-old-created", JobState::Complete);
+            older_created.created_at = now - chrono::Duration::hours(3);
+            older_created.finished_at = Some(now - chrono::Duration::seconds(10));
+
+            let mut newer_created = make_test_job("job-new-created", JobState::Complete);
+            newer_created.created_at = now - chrono::Duration::minutes(5);
+            newer_created.finished_at = Some(now - chrono::Duration::minutes(4));
+
+            write_job_to(&older_created, &job_archive_path(&older_created.id)).unwrap();
+            write_job_to(&newer_created, &job_archive_path(&newer_created.id)).unwrap();
+
+            let latest = latest_terminal_job().expect("at least one terminal job");
+            assert_eq!(
+                latest.id, "job-old-created",
+                "finished_at must dominate created_at in the latest-terminal selection"
+            );
+        });
+    }
+
+    #[test]
+    fn latest_terminal_job_falls_back_to_created_at_when_finished_at_missing() {
+        // Older records (pre-finished_at field population) should still
+        // surface — falling back to created_at preserves backwards compat.
+        with_temp_home(|_| {
+            fs::create_dir_all(archive_dir()).unwrap();
+
+            let now = Local::now();
+            let mut earlier = make_test_job("job-earlier", JobState::Complete);
+            earlier.created_at = now - chrono::Duration::hours(2);
+            earlier.finished_at = None;
+
+            let mut later = make_test_job("job-later", JobState::Failed);
+            later.created_at = now - chrono::Duration::minutes(1);
+            later.finished_at = None;
+
+            write_job_to(&earlier, &job_archive_path(&earlier.id)).unwrap();
+            write_job_to(&later, &job_archive_path(&later.id)).unwrap();
+
+            let latest = latest_terminal_job().expect("at least one terminal job");
+            assert_eq!(latest.id, "job-later");
+        });
+    }
+
+    #[test]
+    fn latest_terminal_job_returns_none_when_archive_empty() {
+        with_temp_home(|_| {
+            // Don't create archive_dir at all — exercises the early-return
+            // path for the common pre-migration case.
+            assert!(latest_terminal_job().is_none());
         });
     }
 }

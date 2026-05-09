@@ -3116,10 +3116,17 @@ pub fn spawn_processing_worker(
         }
 
         sync_processing_indicator(&processing, &processing_stage);
-        if let Some(job) = minutes_core::jobs::display_jobs(Some(1), true)
-            .into_iter()
-            .find(|job| job.state.is_terminal())
-        {
+        // The previous `display_jobs(Some(1), true).find(is_terminal)` had
+        // two bugs: (a) the truncation hid the just-completed notification
+        // whenever an active job existed, because the sort puts active <
+        // terminal and `.find()` never reached the terminal record, and
+        // (b) within the terminal bucket the sort was by `created_at` desc
+        // rather than `finished_at`, so a long-running reprocess finishing
+        // an old job would show the wrong notification. `latest_terminal_job`
+        // scans only the archive dir (no active-dir disk work) and sorts by
+        // `finished_at` with `created_at` as the fallback for older
+        // records. Runs once per worker exit, not on the hot status poll.
+        if let Some(job) = minutes_core::jobs::latest_terminal_job() {
             if let Some(notice) = output_notice_from_job(&job) {
                 set_latest_output(&latest_output, Some(notice.clone()));
                 if notice.kind == "saved" {
