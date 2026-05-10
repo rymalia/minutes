@@ -197,8 +197,7 @@ impl Smoothing {
         // codex review #1: a 30 ms spike never accumulates enough
         // continuous high-prob to validate, so `speaking` never emits.
         if self.triggered && prob >= self.params.threshold {
-            self.high_prob_run_samples =
-                self.high_prob_run_samples.saturating_add(window_samples);
+            self.high_prob_run_samples = self.high_prob_run_samples.saturating_add(window_samples);
             if self.high_prob_run_samples >= min_speech_samples {
                 self.validated = true;
             }

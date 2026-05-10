@@ -229,12 +229,7 @@ impl OrtSileroVad {
     ///    #7a flagged the original name-only validation as
     ///    insufficient.
     fn validate_schema(&mut self) -> Result<(), OrtSileroError> {
-        let inputs: Vec<_> = self
-            .session
-            .inputs
-            .iter()
-            .map(|i| i.name.clone())
-            .collect();
+        let inputs: Vec<_> = self.session.inputs.iter().map(|i| i.name.clone()).collect();
         let outputs: Vec<_> = self
             .session
             .outputs
@@ -445,7 +440,10 @@ mod tests {
         for _ in 0..20 {
             let samples = vec![0.0_f32; 1600];
             let result = engine.process(&samples, 0.0);
-            assert!(!result.speaking, "ort-silero must not detect speech in silence");
+            assert!(
+                !result.speaking,
+                "ort-silero must not detect speech in silence"
+            );
         }
     }
 
