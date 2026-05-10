@@ -109,20 +109,46 @@ pub struct TranscriptionConfig {
     pub model_path: PathBuf,
     pub min_words: usize,
     pub language: Option<String>,
-    /// Silero VAD model name (resolved under model_path, e.g. "silero-v6.2.0" → ggml-silero-v6.2.0.bin).
+    /// Silero VAD model name (resolved under model_path, e.g. "silero-v6.2.0" -> ggml-silero-v6.2.0.bin).
     /// Set to empty string to disable VAD (falls back to energy-based silence stripping).
     pub vad_model: String,
-    /// VAD engine for the recording sidecar. Accepted: `"ort-silero"`
-    /// (default; streaming Silero via ort, O(new_audio) per call,
-    /// requires the `vad-ort` build feature AND
-    /// `silero-vad-v6.2.0.onnx` in `model_path`), `"whisper-silero"`
-    /// (whisper-rs's bundled Silero, full-buffer rescan per 100ms
-    /// call). When `"ort-silero"` is requested but the `vad-ort`
-    /// feature is off OR the ONNX is missing, the dispatcher logs a
-    /// warning and falls through to `"whisper-silero"`. Unknown
-    /// values log and fall through to `"whisper-silero"` as well.
-    /// Energy is the dispatcher's emergency fallback; not a
-    /// user-selectable engine here.
+    /// VAD engine for the recording sidecar.
+    ///
+    /// **`"ort-silero"` (default, known-risk experimental, not
+    /// recommended as a general default)**. A 20-WAV stratified
+    /// screen of internal meeting audio truncated to 5 min each
+    /// found 6/20 samples had at least one substantive regression
+    /// vs whisper-silero. The Wilson 95% CI on the per-WAV rate is
+    /// [15%, 52%], with a 30% point estimate. Per-utterance the
+    /// rate is approximately 1.4% as secondary context. Regression
+    /// types observed: named-entity loss (`"Claude"` -> `"cloth"`,
+    /// real participant names redacted from this comment ->
+    /// nonsense words), nonword hallucination at chunk boundaries,
+    /// and content-word loss in the first ~30s of recordings.
+    ///
+    /// Mechanism: streaming Silero via ort, O(new_audio) per call.
+    /// Requires the `vad-ort` build feature AND
+    /// `silero-vad-v6.2.0.onnx` in `model_path`. About 2x faster
+    /// than whisper-silero on the recording sidecar's hot path
+    /// (median 2.16x on the same 20-WAV screen). Recommended only
+    /// for users who explicitly accept the regression tradeoff.
+    /// FSM tuning (candidates: max-chunk cap or chunk-boundary
+    /// smoothing) is needed before promotion to the general
+    /// default; see `PLAN-vad-refactor.md` and the harness at
+    /// `crates/core/examples/dogfood_vad_engines.rs`.
+    ///
+    /// **`"whisper-silero"`**: whisper-rs's bundled Silero,
+    /// full-buffer rescan per 100ms call. Slower; did not show the
+    /// longer-chunk regression class in the 20-WAV screen. Set this
+    /// in `~/.config/minutes/config.toml` to opt out of ort-silero
+    /// on a per-process basis.
+    ///
+    /// **Fallback chain**: when `"ort-silero"` is requested but the
+    /// `vad-ort` feature is off OR the ONNX is missing, the
+    /// dispatcher logs a warning and falls through to
+    /// `"whisper-silero"`. Unknown values log and fall through to
+    /// `"whisper-silero"` as well. Energy is the dispatcher's
+    /// emergency fallback; not a user-selectable engine here.
     pub vad_engine: String,
     /// Enable noise reduction via nnnoiseless (RNNoise) before transcription.
     /// Requires the `denoise` feature flag. Default: true.
