@@ -6833,7 +6833,16 @@
             openSettings.textContent = 'System Settings';
             openSettings.addEventListener('click', (event) => {
               event.stopPropagation();
-              window.__TAURI__.shell.open(item.settingsUrl);
+              // Route through the Rust `cmd_open_file` -> `open_target` ->
+              // `app.shell().open(...)` instead of `window.__TAURI__.shell.open()`
+              // because the JS shell plugin's `allow-open` permission validates
+              // URLs against a default regex that only matches http(s)/mailto/tel.
+              // The settingsUrl values from `macos_permissions.rs` use the
+              // `x-apple.systempreferences:` scheme, which the JS validator
+              // rejects silently. Issue #226.
+              invoke('cmd_open_file', { path: item.settingsUrl }).catch((err) => {
+                console.error('Open System Settings:', err);
+              });
             });
             actions.appendChild(openSettings);
           }
