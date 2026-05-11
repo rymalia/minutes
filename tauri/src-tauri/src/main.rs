@@ -324,7 +324,30 @@ pub fn show_terminal_window(app: &tauri::AppHandle, session_id: &str, title: &st
     }
 }
 
-/// Update tray to reflect recording state
+/// Cloned references to the tray's recording-related menu items, registered
+/// via `app.manage()` after menu construction so any recording-state change
+/// (regardless of source — tray click, main window, hotkey, CLI, call-detect,
+/// palette) can flip the menu items' enabled state through the central
+/// `update_tray_state_with_mode` function.
+///
+/// Without this, items built with `MenuItem::with_id(..., enabled, ...)` are
+/// frozen in their startup state because `enabled` is only consulted at
+/// construction time. Issue #223 surfaced this: stop was always grayed out
+/// when recordings started from outside the tray.
+///
+/// Tauri 2's `MenuItem<R>` is `Send + Sync` (it's `Arc<MenuItemInner<R>>`
+/// internally with explicit unsafe impls; all setter operations marshal back
+/// to the main thread), so no extra wrapping is needed.
+pub struct TrayMenuHandles {
+    pub record: tauri::menu::MenuItem<tauri::Wry>,
+    pub quick_thought: tauri::menu::MenuItem<tauri::Wry>,
+    pub stop: tauri::menu::MenuItem<tauri::Wry>,
+}
+
+/// Update tray to reflect recording state.
+///
+/// Updates the tray icon, tooltip, and (when `TrayMenuHandles` is registered)
+/// the enabled state of the record / quick-thought / stop menu items.
 pub fn update_tray_state(app: &tauri::AppHandle, is_recording: bool) {
     update_tray_state_with_mode(app, is_recording, false);
 }
@@ -350,6 +373,31 @@ pub fn update_tray_state_with_mode(app: &tauri::AppHandle, is_active: bool, is_l
             "Minutes"
         };
         tray.set_tooltip(Some(tooltip)).ok();
+    }
+
+    // Sync tray menu item enabled state with the recording lifecycle. Tray
+    // callback handlers used to do this on their own immediate paths, but
+    // any non-tray-initiated recording (main window, hotkey, CLI, call-detect,
+    // palette) bypassed those callbacks and left the menu stuck in its
+    // construction-time state. Centralizing here fixes issue #223 in one
+    // hook and removes a class of race between the tray callback's
+    // post-async-work cleanup and external state updates.
+    //
+    // No-op + warn if the handles aren't registered (programmer error caught
+    // at the first recording state transition — quieter than panic, louder
+    // than silent regression).
+    match app.try_state::<TrayMenuHandles>() {
+        Some(handles) => {
+            handles.record.set_enabled(!is_active).ok();
+            handles.quick_thought.set_enabled(!is_active).ok();
+            handles.stop.set_enabled(is_active).ok();
+        }
+        None => {
+            tracing::warn!(
+                "TrayMenuHandles not registered; tray record/stop menu items will not \
+                 reflect recording state changes from non-tray sources"
+            );
+        }
     }
 
     // Notify the palette overlay that recording / live state changed
@@ -1587,17 +1635,26 @@ fn main() {
                             show_main_window(app);
                         }
                         "record" => {
-                            if commands::recording_active(&recording) {
+                            let app_state = app.state::<commands::AppState>();
+                            // Guard double-click: a fast second click before
+                            // recording_active flips spawns a redundant
+                            // wrapper that resets transitional text. The
+                            // `state.starting` flag covers the window
+                            // between launch_recording acquiring the slot
+                            // (commands.rs:4576-4583) and the recording flag
+                            // actually flipping (codex diff-review attack G).
+                            if commands::recording_active(&recording)
+                                || app_state.starting.load(Ordering::Relaxed)
+                            {
                                 return;
                             }
+                            // Transitional text only — enabled-state flips
+                            // flow through update_tray_state so they cannot
+                            // race against external (non-tray) state changes
+                            // (issue #223 / codex race-condition catch).
                             rec_item.set_text("Starting...").ok();
-                            rec_item.set_enabled(false).ok();
-                            quick_item.set_enabled(false).ok();
-                            stp_item.set_enabled(true).ok();
                             let app_handle = app.clone();
-                            let app_done = app.clone();
                             let ri = rec_item.clone();
-                            let si = stp_item.clone();
                             std::thread::spawn(move || {
                                 let app_for_launch = app_handle.clone();
                                 let state = app_handle.state::<commands::AppState>();
@@ -1612,26 +1669,30 @@ fn main() {
                                     None,
                                     None,
                                 );
+                                // Reset transitional text only. Do NOT call
+                                // update_tray_state(false) here — `launch_recording`
+                                // is non-blocking; it spawns the actual recorder
+                                // thread which manages its own update_tray_state
+                                // calls through the recording lifecycle. Calling
+                                // update_tray_state(false) here would race against
+                                // the inner recorder's update_tray_state(true) and
+                                // could leave the menu showing record-enabled
+                                // mid-recording (codex diff-review attack #1).
                                 ri.set_text("Start Recording").ok();
-                                ri.set_enabled(true).ok();
-                                quick_item.set_enabled(true).ok();
-                                si.set_enabled(false).ok();
-                                update_tray_state(&app_done, false);
                             });
                         }
                         "quick-thought" => {
-                            if commands::recording_active(&recording) {
+                            let app_state = app.state::<commands::AppState>();
+                            if commands::recording_active(&recording)
+                                || app_state.starting.load(Ordering::Relaxed)
+                            {
                                 return;
                             }
-                            rec_item.set_enabled(false).ok();
+                            // Transitional text only; see "record" arm for full rationale.
                             quick_item.set_text("Starting Quick Thought…").ok();
-                            quick_item.set_enabled(false).ok();
-                            stp_item.set_enabled(true).ok();
                             let app_handle = app.clone();
-                            let app_done = app.clone();
                             let ri = rec_item.clone();
                             let qi = quick_item.clone();
-                            let si = stp_item.clone();
                             std::thread::spawn(move || {
                                 let app_for_launch = app_handle.clone();
                                 let state = app_handle.state::<commands::AppState>();
@@ -1647,33 +1708,68 @@ fn main() {
                                     None,
                                 );
                                 ri.set_text("Start Recording").ok();
-                                ri.set_enabled(true).ok();
                                 qi.set_text("Quick Thought").ok();
-                                qi.set_enabled(true).ok();
-                                si.set_enabled(false).ok();
-                                update_tray_state(&app_done, false);
                             });
                         }
-                        "stop" if commands::request_stop(&recording, &stop).is_ok() => {
+                        "stop" => {
+                            // The Stop menu item is enabled whenever ANY
+                            // recording-class state is active: recording proper
+                            // OR live transcript. Route to whichever is active.
+                            // Codex diff-review attack #5: live transcript has a
+                            // separate stop path (`cmd_stop_live_transcript`)
+                            // and `request_stop` only targets recording, so
+                            // calling request_stop while only live transcript
+                            // is active would no-op and leave the user with a
+                            // button that did nothing. (Dictation is a separate
+                            // bug class — tracked as follow-up.)
+                            let state = app.state::<commands::AppState>();
+                            let live_active = state.live_transcript_active.load(Ordering::Relaxed);
+                            let recording_was_active = commands::recording_active(&recording);
+
+                            // Try recording stop first; if no recording is
+                            // active, try live transcript stop.
+                            let stop_ok = if recording_was_active {
+                                commands::request_stop(&recording, &stop).is_ok()
+                            } else if live_active {
+                                commands::cmd_stop_live_transcript(state).is_ok()
+                            } else {
+                                false
+                            };
+                            if !stop_ok {
+                                // Nothing active to stop, or stop failed; bail.
+                                return;
+                            }
+
+                            // Transitional text only; see comment in "record"
+                            // arm. Disabling stop immediately to prevent
+                            // double-click is intentional and stays here
+                            // (transient UX affordance, separate from
+                            // steady-state sync).
                             rec_item.set_text("Stopping...").ok();
-                            rec_item.set_enabled(false).ok();
                             quick_item.set_text("Quick Thought").ok();
-                            quick_item.set_enabled(false).ok();
                             stp_item.set_enabled(false).ok();
                             let app_done = app.clone();
                             let ri = rec_item.clone();
                             let qi = quick_item.clone();
-                            let si = stp_item.clone();
                             std::thread::spawn(move || {
-                                if commands::wait_for_recording_shutdown(
-                                    std::time::Duration::from_secs(120),
-                                ) {
+                                if recording_was_active {
+                                    if commands::wait_for_recording_shutdown(
+                                        std::time::Duration::from_secs(120),
+                                    ) {
+                                        ri.set_text("Start Recording").ok();
+                                        qi.set_text("Quick Thought").ok();
+                                        update_tray_state(&app_done, false);
+                                    }
+                                } else {
+                                    // Live transcript path: cmd_stop_live_transcript
+                                    // sets the stop flag; the live session's own
+                                    // run_live_session calls update_tray_state(false)
+                                    // when it tears down. Just reset transitional
+                                    // text here; do NOT call update_tray_state
+                                    // ourselves (would race with the session
+                                    // shutdown — codex attack #1 generalized).
                                     ri.set_text("Start Recording").ok();
-                                    ri.set_enabled(true).ok();
                                     qi.set_text("Quick Thought").ok();
-                                    qi.set_enabled(true).ok();
-                                    si.set_enabled(false).ok();
-                                    update_tray_state(&app_done, false);
                                 }
                             });
                         }
@@ -1781,19 +1877,20 @@ fn main() {
                         "quit" => {
                             request_clean_exit(app, 0);
                         }
-                        // Calendar event items — start recording on click
+                        // Calendar event items — start recording on click.
+                        // Mirrors the "record" arm exactly; enabled-state flips
+                        // flow through update_tray_state, not local set_enabled
+                        // calls (issue #223 / codex diff-review attack #8).
                         "cal-0" | "cal-1" | "cal-2" => {
-                            if commands::recording_active(&recording) {
+                            let app_state = app.state::<commands::AppState>();
+                            if commands::recording_active(&recording)
+                                || app_state.starting.load(Ordering::Relaxed)
+                            {
                                 return;
                             }
                             rec_item.set_text("Starting...").ok();
-                            rec_item.set_enabled(false).ok();
-                            quick_item.set_enabled(false).ok();
-                            stp_item.set_enabled(true).ok();
                             let app_handle = app.clone();
-                            let app_done = app.clone();
                             let ri = rec_item.clone();
-                            let si = stp_item.clone();
                             std::thread::spawn(move || {
                                 let app_for_launch = app_handle.clone();
                                 let state = app_handle.state::<commands::AppState>();
@@ -1809,16 +1906,22 @@ fn main() {
                                     None,
                                 );
                                 ri.set_text("Start Recording").ok();
-                                ri.set_enabled(true).ok();
-                                quick_item.set_enabled(true).ok();
-                                si.set_enabled(false).ok();
-                                update_tray_state(&app_done, false);
                             });
                         }
                         _ => {}
                     }
                 })
                 .build(app)?;
+
+            // Register tray menu handles BEFORE the initial state sync below
+            // (and before any commands.rs entry-point can fire update_tray_state).
+            // Issue #223: without these handles wired up, the record / stop
+            // menu items are frozen in their construction-time enabled state.
+            app.manage(TrayMenuHandles {
+                record: record_item.clone(),
+                quick_thought: quick_thought_item.clone(),
+                stop: stop_item.clone(),
+            });
 
             update_tray_state(app.handle(), initial_recording);
 
