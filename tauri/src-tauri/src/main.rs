@@ -269,6 +269,19 @@ fn show_main_window(app: &tauri::AppHandle) {
             use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
             apply_vibrancy(&win, NSVisualEffectMaterial::Sidebar, None, None).ok();
         }
+        // Re-seed the tray appearance from the fresh window's theme. In
+        // normal flow CloseRequested hides instead of destroys (see
+        // on_window_event for "main"), so this branch is rare — but if
+        // the main window was ever destroyed and the system appearance
+        // flipped while it was absent, `ThemeChanged` never fired and the
+        // cached state is stale. Reseed + repaint here is idempotent
+        // when the cache is already correct (codex diff-review P2).
+        if let Some(state) = app.try_state::<TrayAppearanceState>() {
+            if let Ok(theme) = win.theme() {
+                state.set(TrayAppearance::from_theme(theme));
+                sync_tray_appearance(app);
+            }
+        }
     }
 }
 
@@ -369,16 +382,84 @@ pub enum TrayActivity {
     Dictation,
 }
 
+/// Inferred macOS menu-bar appearance. Honestly a proxy: we read the app's
+/// `NSApplication.effectiveAppearance` via Tauri's `Window::theme()` API,
+/// which is the system Aqua/DarkAqua choice — NOT the status item's actual
+/// rendering background (which can drift in translucent / wallpaper-tinted
+/// menu bar configurations). It's a good-enough heuristic for the common
+/// case (status items track system appearance on stock macOS), which beats
+/// the current state of a low-contrast icon on every dark menu bar.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TrayAppearance {
+    Light,
+    Dark,
+}
+
+impl TrayAppearance {
+    fn from_theme(theme: tauri::Theme) -> Self {
+        // Tauri's Theme has Light/Dark/_NonExhaustive. Default to Light for
+        // any future variant — matches current asset's design target.
+        match theme {
+            tauri::Theme::Dark => Self::Dark,
+            _ => Self::Light,
+        }
+    }
+}
+
+/// Last-known menu-bar appearance, seeded from `Window::theme()` and
+/// updated by the `WindowEvent::ThemeChanged` listener. Stored as a
+/// managed `AtomicU8` so tray syncs from any thread read a current value
+/// without locking. Light = 0, Dark = 1.
+pub struct TrayAppearanceState(pub Arc<AtomicU8>);
+
+impl TrayAppearanceState {
+    pub fn new(initial: TrayAppearance) -> Self {
+        Self(Arc::new(AtomicU8::new(match initial {
+            TrayAppearance::Light => 0,
+            TrayAppearance::Dark => 1,
+        })))
+    }
+
+    pub fn get(&self) -> TrayAppearance {
+        match self.0.load(Ordering::Relaxed) {
+            1 => TrayAppearance::Dark,
+            _ => TrayAppearance::Light,
+        }
+    }
+
+    pub fn set(&self, appearance: TrayAppearance) {
+        self.0.store(
+            match appearance {
+                TrayAppearance::Light => 0,
+                TrayAppearance::Dark => 1,
+            },
+            Ordering::Relaxed,
+        );
+    }
+}
+
+fn current_tray_appearance(app: &tauri::AppHandle) -> TrayAppearance {
+    app.try_state::<TrayAppearanceState>()
+        .map(|s| s.get())
+        .unwrap_or(TrayAppearance::Light)
+}
+
 impl TrayActivity {
     fn is_active(self) -> bool {
         !matches!(self, Self::Idle)
     }
 
-    fn icon_bytes(self) -> &'static [u8] {
-        match self {
-            Self::Idle => include_bytes!("../icons/icon-tray.png"),
-            Self::Recording | Self::Dictation => include_bytes!("../icons/icon-recording.png"),
-            Self::Live => include_bytes!("../icons/icon-live.png"),
+    fn icon_bytes(self, appearance: TrayAppearance) -> &'static [u8] {
+        match (self, appearance) {
+            (Self::Idle, _) => include_bytes!("../icons/icon-tray.png"),
+            (Self::Recording | Self::Dictation, TrayAppearance::Light) => {
+                include_bytes!("../icons/icon-recording.png")
+            }
+            (Self::Recording | Self::Dictation, TrayAppearance::Dark) => {
+                include_bytes!("../icons/icon-recording-dark.png")
+            }
+            (Self::Live, TrayAppearance::Light) => include_bytes!("../icons/icon-live.png"),
+            (Self::Live, TrayAppearance::Dark) => include_bytes!("../icons/icon-live-dark.png"),
         }
     }
 
@@ -455,9 +536,15 @@ fn snapshot_tray_state(app: &tauri::AppHandle) -> TrayStateSnapshot {
     }
 }
 
-fn apply_tray_activity(app: &tauri::AppHandle, activity: TrayActivity) {
+/// Apply the tray rendering for `activity` against the last-known menu-bar
+/// appearance. `emit_palette_refresh` separates lifecycle transitions
+/// (which must wake the palette so its visible command list re-fetches)
+/// from appearance-only repaints (which would otherwise spam the palette
+/// with no-op refreshes — codex plan-review #4).
+fn apply_tray_activity(app: &tauri::AppHandle, activity: TrayActivity, emit_palette_refresh: bool) {
+    let appearance = current_tray_appearance(app);
     if let Some(tray) = app.tray_by_id("minutes-tray") {
-        if let Ok(icon) = tauri::image::Image::from_bytes(activity.icon_bytes()) {
+        if let Ok(icon) = tauri::image::Image::from_bytes(activity.icon_bytes(appearance)) {
             tray.set_icon(Some(icon)).ok();
             // Active-state icons (recording/live/dictation) render with
             // template tinting OFF so their colored dot is visible; idle
@@ -496,16 +583,18 @@ fn apply_tray_activity(app: &tauri::AppHandle, activity: TrayActivity) {
         }
     }
 
-    // Notify the palette overlay that lifecycle state changed so it can
-    // re-fetch its visible command list. The source string lets the palette
-    // distinguish recording / live / dictation transitions.
-    let _ = app.emit(
-        "palette:refresh",
-        serde_json::json!({
-            "source": activity.palette_source(),
-            "active": activity.is_active(),
-        }),
-    );
+    if emit_palette_refresh {
+        // Notify the palette overlay that lifecycle state changed so it
+        // can re-fetch its visible command list. The source string lets
+        // the palette distinguish recording / live / dictation transitions.
+        let _ = app.emit(
+            "palette:refresh",
+            serde_json::json!({
+                "source": activity.palette_source(),
+                "active": activity.is_active(),
+            }),
+        );
+    }
 }
 
 /// Re-sync the tray (icon, tooltip, menu enabled/labels, palette refresh)
@@ -515,7 +604,17 @@ fn apply_tray_activity(app: &tauri::AppHandle, activity: TrayActivity) {
 pub fn sync_tray_state(app: &tauri::AppHandle) {
     let snapshot = snapshot_tray_state(app);
     let activity = derive_tray_activity(snapshot);
-    apply_tray_activity(app, activity);
+    apply_tray_activity(app, activity, true);
+}
+
+/// Re-paint the tray for an appearance change (system Light/Dark toggle)
+/// without re-emitting `palette:refresh`. The lifecycle activity is
+/// unchanged; only the icon variant differs. Called from the
+/// `WindowEvent::ThemeChanged` listener.
+pub fn sync_tray_appearance(app: &tauri::AppHandle) {
+    let snapshot = snapshot_tray_state(app);
+    let activity = derive_tray_activity(snapshot);
+    apply_tray_activity(app, activity, false);
 }
 
 // ── Auto-updater ────────────────────────────────────────────
@@ -2040,6 +2139,21 @@ fn main() {
                 stop: stop_item.clone(),
             });
 
+            // Seed the appearance state from the main window's theme. The
+            // main window is built earlier in setup() via `show_main_window`,
+            // so `.theme()` returns the current system Aqua/DarkAqua choice
+            // here. If the query errors, default to Light — the active-state
+            // icons were originally designed for light menu bars (commit
+            // 2c9d26d). After this seed the `WindowEvent::ThemeChanged`
+            // listener in the run loop keeps the state updated and triggers
+            // `sync_tray_appearance` so the icon variant tracks the system.
+            let initial_appearance = app
+                .get_webview_window("main")
+                .and_then(|w| w.theme().ok())
+                .map(TrayAppearance::from_theme)
+                .unwrap_or(TrayAppearance::Light);
+            app.manage(TrayAppearanceState::new(initial_appearance));
+
             // `sync_tray_state` reads the PID-aware `recording_active`
             // helper and the in-app live/dictation flags, so an external
             // CLI recording active at app launch keeps the tray rendering
@@ -2159,6 +2273,26 @@ fn main() {
                     if is_open {
                         commands::close_palette_window(&app_handle);
                     }
+                }
+                // Track macOS system appearance changes via the main
+                // window's ThemeChanged event. Tao registers an
+                // `AppleInterfaceThemeChangedNotification` observer on
+                // the window delegate and fires this whenever the cached
+                // theme flips. The event fires on hidden windows too
+                // (no visibility check in the upstream observer), so
+                // the menu-bar-only state still gets the update after
+                // the user closes the main window. Filter to "main" so
+                // we only sync once per system flip (the secondary
+                // windows would otherwise re-fire the same event).
+                tauri::WindowEvent::ThemeChanged(theme) if window.label() == "main" => {
+                    let app_handle = window.app_handle().clone();
+                    if let Some(state) = app_handle.try_state::<TrayAppearanceState>() {
+                        state.set(TrayAppearance::from_theme(*theme));
+                    }
+                    // Re-paint the tray icon for the new appearance; do
+                    // NOT emit `palette:refresh` (codex plan-review #4 —
+                    // appearance changes are not lifecycle transitions).
+                    sync_tray_appearance(&app_handle);
                 }
                 _ => {}
             }
@@ -2296,7 +2430,7 @@ fn main() {
 
 #[cfg(test)]
 mod tray_activity_tests {
-    use super::{derive_tray_activity, TrayActivity, TrayStateSnapshot};
+    use super::{derive_tray_activity, TrayActivity, TrayAppearance, TrayStateSnapshot};
 
     fn snap(recording: bool, live: bool, dictation: bool) -> TrayStateSnapshot {
         TrayStateSnapshot {
@@ -2382,5 +2516,62 @@ mod tray_activity_tests {
         assert_eq!(TrayActivity::Recording.palette_source(), "recording");
         assert_eq!(TrayActivity::Live.palette_source(), "live-transcript");
         assert_eq!(TrayActivity::Dictation.palette_source(), "dictation");
+    }
+
+    #[test]
+    fn icon_bytes_pick_appearance_variant() {
+        // Idle uses the templated tray icon regardless of appearance.
+        let idle_light = TrayActivity::Idle.icon_bytes(TrayAppearance::Light);
+        let idle_dark = TrayActivity::Idle.icon_bytes(TrayAppearance::Dark);
+        assert_eq!(idle_light, idle_dark);
+
+        // Active states must pick distinct bytes per appearance so the
+        // M is legible on both light and dark menu bars. Compare slice
+        // contents (not pointer identity) so the test fails if a future
+        // refactor inadvertently routes both arms to the same PNG.
+        let rec_light = TrayActivity::Recording.icon_bytes(TrayAppearance::Light);
+        let rec_dark = TrayActivity::Recording.icon_bytes(TrayAppearance::Dark);
+        assert_ne!(rec_light, rec_dark);
+
+        let live_light = TrayActivity::Live.icon_bytes(TrayAppearance::Light);
+        let live_dark = TrayActivity::Live.icon_bytes(TrayAppearance::Dark);
+        assert_ne!(live_light, live_dark);
+
+        // Dictation reuses the recording asset (no dedicated dictation
+        // icon — out of scope for this commit). Same bytes per appearance
+        // as recording, distinct across appearance variants.
+        let dict_light = TrayActivity::Dictation.icon_bytes(TrayAppearance::Light);
+        let dict_dark = TrayActivity::Dictation.icon_bytes(TrayAppearance::Dark);
+        assert_eq!(dict_light, rec_light);
+        assert_eq!(dict_dark, rec_dark);
+        assert_ne!(dict_light, dict_dark);
+
+        // All assets are valid PNGs (magic bytes 89 50 4E 47 0D 0A 1A 0A).
+        // If a future asset substitution swaps in the wrong format this
+        // catches it before runtime.
+        for bytes in [
+            idle_light, rec_light, rec_dark, live_light, live_dark, dict_light, dict_dark,
+        ] {
+            assert!(
+                bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+                "tray icon asset is not a valid PNG"
+            );
+        }
+    }
+
+    #[test]
+    fn appearance_from_theme_maps_dark_only_to_dark() {
+        // Tauri Theme is non-exhaustive (Light / Dark / future). Anything
+        // other than Dark resolves to Light — the active-state assets
+        // were originally designed for light menu bars (commit 2c9d26d),
+        // so a future variant defaults to the lower-risk choice.
+        assert_eq!(
+            TrayAppearance::from_theme(tauri::Theme::Light),
+            TrayAppearance::Light
+        );
+        assert_eq!(
+            TrayAppearance::from_theme(tauri::Theme::Dark),
+            TrayAppearance::Dark
+        );
     }
 }
