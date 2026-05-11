@@ -8043,6 +8043,29 @@
             fill.style.width = '100%';
             text.textContent = result;
 
+            // Persist the chosen model to ALL whisper-backed surfaces:
+            // transcription (batch + recording pipeline) AND dictation.
+            // live_transcript.model defaults to empty which falls back to
+            // dictation.model per the comment in config.rs, so updating
+            // dictation propagates transitively.
+            //
+            // Before this, cmd_download_model only put the file on disk;
+            // a user picking "tiny" in onboarding would still have
+            // transcription.model="small" (default) and dictation.model=
+            // "base" (default) and Minutes would try to use models that
+            // were not downloaded. allaire surfaced the dictation half
+            // of this in the v0.17.0 ship feedback.
+            try {
+              await invoke('cmd_set_setting', { section: 'transcription', key: 'model', value: model });
+            } catch (settingErr) {
+              console.warn('onboarding: failed to persist transcription.model:', settingErr);
+            }
+            try {
+              await invoke('cmd_set_setting', { section: 'dictation', key: 'model', value: model });
+            } catch (settingErr) {
+              console.warn('onboarding: failed to persist dictation.model:', settingErr);
+            }
+
             root.querySelector('#step-model').classList.add('done');
             root.querySelector('#step-model-status').textContent = 'Done';
             root.querySelector('#step-model-body').classList.add('ui-hidden');
