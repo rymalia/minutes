@@ -2498,6 +2498,66 @@ fn basename_is_free(dir: &Path, basename: &str, ext: &str) -> bool {
         && !dir.join(format!("{}.system.wav", basename)).exists()
 }
 
+/// Audio duration (seconds) below which a stem is treated as an abort-at-start
+/// fragment and skipped by rescue (#236). Read from the file's WAV header
+/// `byte_rate` field so the threshold scales to whatever sample rate the
+/// SCStream buffer produced rather than assuming 48 kHz.
+const MIN_VIABLE_STEM_DURATION_SECS: f64 = 0.5;
+
+/// Fallback `byte_rate` when the WAV header cannot be parsed (corrupt header,
+/// truncated to less than 32 bytes, non-RIFF). 48 kHz float32 mono is what
+/// SCStream produces in practice and what AVAudioFile defaults to in the
+/// Swift helper. Used so a malformed-but-real-sized stem still gets a chance
+/// to rescue against a reasonable threshold rather than always passing.
+const FALLBACK_WAV_BYTE_RATE: u32 = 192_000;
+
+/// Read the `byte_rate` field (bytes/sec of audio data) from a WAV header.
+/// Returns None for non-RIFF files, files whose first chunk is not `fmt `
+/// (e.g. BWF with leading JUNK/bext, RF64), headers shorter than 32 bytes,
+/// any I/O error, or a header that decodes byte_rate as 0 (malformed).
+///
+/// Byte rate is at offset 28 of a standard RIFF/WAVE/PCM header (little
+/// endian u32). For float WAVs this is `sample_rate * channels *
+/// (bits_per_sample / 8)`. Reading from the header rather than recomputing
+/// from sample_rate + format avoids assuming what the producer wrote.
+///
+/// We validate three layers before trusting offset 28:
+/// 1. `RIFF` at 0..4 and `WAVE` at 8..12 — file is a RIFF/WAVE container.
+/// 2. `fmt ` at 12..16 — the first chunk is the format chunk, not a
+///    pre-format JUNK/bext chunk that would shift fmt elsewhere. Files
+///    with non-standard chunk ordering fall back to the conservative
+///    48 kHz default rather than silently using garbage at offset 28.
+/// 3. `byte_rate > 0` — guards against malformed-but-RIFF-magic files
+///    where the field is zero. A zero rate would set the size threshold
+///    to zero and let every stem pass, defeating the abort-at-start
+///    filter.
+fn read_wav_byte_rate(path: &Path) -> Option<u32> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 32];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return None;
+    }
+    if &header[12..16] != b"fmt " {
+        return None;
+    }
+    let byte_rate = u32::from_le_bytes([header[28], header[29], header[30], header[31]]);
+    if byte_rate == 0 {
+        return None;
+    }
+    Some(byte_rate)
+}
+
+/// Compute the minimum viable file size (bytes) for a stem at the given path
+/// based on its WAV header's `byte_rate` field. Falls back to a 48 kHz
+/// float32 mono rate when the header is unreadable so a malformed-but-real
+/// stem still gets a fair threshold rather than always passing.
+fn min_viable_stem_bytes(path: &Path) -> u64 {
+    let byte_rate = read_wav_byte_rate(path).unwrap_or(FALLBACK_WAV_BYTE_RATE);
+    ((byte_rate as f64) * MIN_VIABLE_STEM_DURATION_SECS) as u64
+}
+
 /// Move any sibling `<stem>.voice.wav` / `<stem>.system.wav` files (the
 /// per-source PCM stems written by the native call capture helper) into
 /// `dest_dir` with `<new_basename>.voice.wav` / `<new_basename>.system.wav`
@@ -2519,8 +2579,10 @@ fn rescue_paired_stems(original: &std::path::Path, dest_dir: &Path, new_basename
         return;
     };
 
-    // Phase 1: enumerate stems that exist and carry data.
-    let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Phase 1: enumerate stems that exist and carry data. The suffix tag
+    // travels alongside each plan entry so the asymmetry check below can
+    // identify which side is missing without re-parsing path names.
+    let mut plan: Vec<(PathBuf, (PathBuf, &str))> = Vec::new();
     for suffix in ["voice", "system"] {
         let src = parent.join(format!("{}.{}.wav", stem, suffix));
         // Use symlink_metadata so a sibling that is a symlink (pointing at
@@ -2532,12 +2594,50 @@ fn rescue_paired_stems(original: &std::path::Path, dest_dir: &Path, new_basename
         if !meta.file_type().is_file() {
             continue;
         }
-        if meta.len() == 0 {
+        // Abort-at-start captures (issue #236) leave tiny orphan stems
+        // (sjunnesson reported 19 KB and 38 KB pairs, ~0.1-0.2 s of
+        // audio) next to 1.9 KB .mov stubs. The old `meta.len() == 0`
+        // gate let these through, producing `failed-captures/` entries
+        // the user can do nothing useful with. Skip stems below ~0.5 s
+        // of audio. Threshold is derived per-file from the WAV header's
+        // `byte_rate` field so it scales to whatever sample rate the
+        // SCStream buffer actually produced (codex review caught the
+        // earlier hard-coded 48 kHz assumption).
+        let min_bytes = min_viable_stem_bytes(&src);
+        if meta.len() < min_bytes {
+            tracing::warn!(
+                path = %src.display(),
+                size_bytes = meta.len(),
+                threshold_bytes = min_bytes,
+                "rescue_paired_stems: skipping sub-threshold stem (abort-at-start fragment)"
+            );
             continue;
         }
         let dest = dest_dir.join(format!("{}.{}.wav", new_basename, suffix));
-        plan.push((src, dest));
+        plan.push((src, (dest, suffix)));
     }
+
+    // Discovery requires either both stems or system-only; voice-only is
+    // explicitly rejected by `diarize::discover_stem_plan`. If voice made
+    // it into the plan but system did not (absent, non-file, symlink, or
+    // sub-threshold), drop voice too so we never produce a voice-only
+    // rescue artifact. Codex review #236 caught the asymmetric-skip gap
+    // introduced by the per-stem size filter — without this guard, a
+    // sub-threshold system stem + healthy voice stem would silently
+    // rescue voice alone and discover_stem_plan would reject it.
+    let has_voice = plan.iter().any(|(_, (_, suffix))| *suffix == "voice");
+    let has_system = plan.iter().any(|(_, (_, suffix))| *suffix == "system");
+    if has_voice && !has_system {
+        tracing::warn!(
+            new_basename = new_basename,
+            "rescue_paired_stems: dropping voice-only plan (system stem missing or sub-threshold); discover_stem_plan rejects voice-only"
+        );
+        return;
+    }
+
+    // Discard the suffix tag now that the asymmetry check has used it;
+    // downstream phases only need the (src, dest) path pair.
+    let plan: Vec<(PathBuf, PathBuf)> = plan.into_iter().map(|(s, (d, _))| (s, d)).collect();
 
     if plan.is_empty() {
         return;
@@ -8443,8 +8543,10 @@ mod tests {
         std::fs::write(&mov, vec![1_u8; 1024]).unwrap();
         let voice_stem = native_captures.join("2026-05-11-103342-call.voice.wav");
         let system_stem = native_captures.join("2026-05-11-103342-call.system.wav");
-        std::fs::write(&voice_stem, vec![2_u8; 2048]).unwrap();
-        std::fs::write(&system_stem, vec![3_u8; 2048]).unwrap();
+        // Stems must be above MIN_VIABLE_STEM_BYTES to be rescued (#236).
+        // Use 200 KB which represents ~1 s of audio, well above the cutoff.
+        std::fs::write(&voice_stem, vec![2_u8; 200_000]).unwrap();
+        std::fs::write(&system_stem, vec![3_u8; 200_000]).unwrap();
 
         let preserved = preserve_failed_capture_path(&mov, &config).expect("preserve");
 
@@ -8595,8 +8697,9 @@ mod tests {
         std::fs::write(&mov, vec![1_u8; 1024]).unwrap();
         let voice_stem = native_captures.join("call.voice.wav");
         let system_stem = native_captures.join("call.system.wav");
-        std::fs::write(&voice_stem, vec![2_u8; 2048]).unwrap();
-        std::fs::write(&system_stem, vec![3_u8; 2048]).unwrap();
+        // Use 200 KB stems to clear MIN_VIABLE_STEM_BYTES (#236).
+        std::fs::write(&voice_stem, vec![2_u8; 200_000]).unwrap();
+        std::fs::write(&system_stem, vec![3_u8; 200_000]).unwrap();
 
         // Force the second copy (system) to fail by pre-creating its
         // destination as a directory, which `fs::copy` cannot overwrite.
@@ -8649,9 +8752,10 @@ mod tests {
         let voice_link = native_captures.join("call.voice.wav");
         std::os::unix::fs::symlink(&outside_secret, &voice_link).unwrap();
 
-        // Real system stem with data, so the function has something to attempt.
+        // Real system stem above MIN_VIABLE_STEM_BYTES so the function has
+        // something to attempt (#236).
         let system_stem = native_captures.join("call.system.wav");
-        std::fs::write(&system_stem, vec![3_u8; 2048]).unwrap();
+        std::fs::write(&system_stem, vec![3_u8; 200_000]).unwrap();
 
         rescue_paired_stems(&mov, &failed_dir, "rescued");
 
@@ -8711,6 +8815,266 @@ mod tests {
         assert!(system_stem.exists());
         assert!(!dest_dir.join(format!("{}.voice.wav", dest_stem)).exists());
         assert!(!dest_dir.join(format!("{}.system.wav", dest_stem)).exists());
+    }
+
+    /// Abort-at-start native captures (#236) leave tiny orphan stems
+    /// (sjunnesson observed 19 KB and 38 KB pairs) next to ~1.9 KB .mov
+    /// stubs. Rescue must skip stems below MIN_VIABLE_STEM_BYTES so the
+    /// user does not get useless `failed-captures/` entries with 0.1-0.2 s
+    /// of garbage audio. The .mov itself still preserves.
+    #[test]
+    fn preserve_failed_capture_path_skips_subthreshold_paired_stems() {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            output_dir: dir.path().join("meetings"),
+            ..Config::default()
+        };
+        let native_captures = dir.path().join("native-captures");
+        std::fs::create_dir_all(&native_captures).unwrap();
+
+        let mov = native_captures.join("2026-04-07-130235-capture.mov");
+        std::fs::write(&mov, vec![1_u8; 1908]).unwrap();
+        let voice_stem = native_captures.join("2026-04-07-130235-capture.voice.wav");
+        let system_stem = native_captures.join("2026-04-07-130235-capture.system.wav");
+        // Realistic abort-at-start sizes from sjunnesson's report on #236.
+        std::fs::write(&voice_stem, vec![2_u8; 38_656]).unwrap();
+        std::fs::write(&system_stem, vec![3_u8; 19_456]).unwrap();
+
+        let preserved = preserve_failed_capture_path(&mov, &config).expect("preserve");
+        let dest_stem = preserved.file_stem().and_then(|s| s.to_str()).unwrap();
+        let dest_dir = preserved.parent().unwrap();
+
+        // The .mov itself still preserves (it's the only failure signal).
+        assert!(preserved.exists(), "the .mov stub must still be preserved");
+
+        // Sub-threshold stems must stay in native-captures untouched, and
+        // must NOT appear in failed-captures.
+        assert!(
+            voice_stem.exists(),
+            "sub-threshold voice stem original must stay in place"
+        );
+        assert!(
+            system_stem.exists(),
+            "sub-threshold system stem original must stay in place"
+        );
+        assert!(
+            !dest_dir.join(format!("{}.voice.wav", dest_stem)).exists(),
+            "sub-threshold voice stem must NOT be moved to failed-captures"
+        );
+        assert!(
+            !dest_dir.join(format!("{}.system.wav", dest_stem)).exists(),
+            "sub-threshold system stem must NOT be moved to failed-captures"
+        );
+    }
+
+    /// Helper: write a minimal RIFF/WAVE/fmt header carrying the given
+    /// sample rate (float32 mono), then pad with zeros to the requested
+    /// total file size. The rescue code only reads RIFF/WAVE/`fmt `
+    /// markers plus `byte_rate` at offset 28, so the rest of the file
+    /// does not need to be a valid PCM payload.
+    ///
+    /// Note: AVAudioFile on macOS may write WAVE_FORMAT_EXTENSIBLE
+    /// (`0xFFFE`) for float32 mono in some cases, but byte_rate sits at
+    /// the same absolute offset 28 either way. The chunk layout is
+    /// chunk_id 4 plus chunk_size 4 plus format 2 plus channels 2 plus
+    /// sample_rate 4, totaling 16 bytes after the RIFF header. This
+    /// fixture uses tag `3` (IEEE float) for readability; the threshold
+    /// logic is identical for both tags.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+    fn write_test_wav(path: &Path, sample_rate: u32, total_bytes: usize) {
+        use std::io::Write;
+        let channels: u16 = 1;
+        let bits_per_sample: u16 = 32;
+        let byte_rate: u32 = sample_rate * (channels as u32) * ((bits_per_sample / 8) as u32);
+        let block_align: u16 = channels * (bits_per_sample / 8);
+
+        let mut header = Vec::with_capacity(44);
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&[0; 4]); // file size minus 8 (placeholder)
+        header.extend_from_slice(b"WAVE");
+        header.extend_from_slice(b"fmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&3u16.to_le_bytes()); // float
+        header.extend_from_slice(&channels.to_le_bytes());
+        header.extend_from_slice(&sample_rate.to_le_bytes());
+        header.extend_from_slice(&byte_rate.to_le_bytes());
+        header.extend_from_slice(&block_align.to_le_bytes());
+        header.extend_from_slice(&bits_per_sample.to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&[0; 4]); // data chunk size (placeholder)
+
+        let mut file = std::fs::File::create(path).expect("create wav");
+        file.write_all(&header).expect("write header");
+        let pad = total_bytes.saturating_sub(header.len());
+        if pad > 0 {
+            file.write_all(&vec![0u8; pad]).expect("pad");
+        }
+    }
+
+    /// Malformed WAV files (non-`fmt `-first chunk, zero byte_rate, or
+    /// outright unreadable header) must fall back to the 48 kHz default
+    /// threshold rather than letting every stem pass with a 0-byte cutoff
+    /// or silently using garbage from offset 28. Codex round 2 review
+    /// flagged both gaps; this test locks the fallback behavior in.
+    #[test]
+    fn read_wav_byte_rate_rejects_malformed_headers() {
+        let dir = TempDir::new().unwrap();
+
+        // Not a RIFF file at all.
+        let plain = dir.path().join("not-a-wav.wav");
+        std::fs::write(&plain, b"this is not wav content").unwrap();
+        assert!(read_wav_byte_rate(&plain).is_none());
+
+        // RIFF/WAVE but first chunk is JUNK, not `fmt ` (BWF-style).
+        let bwf = dir.path().join("bwf.wav");
+        let mut buf = Vec::with_capacity(32);
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&[0; 4]);
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"JUNK");
+        buf.extend_from_slice(&[0; 16]);
+        std::fs::write(&bwf, &buf).unwrap();
+        assert!(read_wav_byte_rate(&bwf).is_none());
+
+        // RIFF/WAVE/fmt with explicit byte_rate = 0.
+        let zero_rate = dir.path().join("zero-rate.wav");
+        let mut buf = Vec::with_capacity(32);
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&[0; 4]);
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&3u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&48_000u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&zero_rate, &buf).unwrap();
+        assert!(read_wav_byte_rate(&zero_rate).is_none());
+
+        // Well-formed header — should return the byte_rate we wrote.
+        let good = dir.path().join("good.wav");
+        write_test_wav(&good, 48_000, 200_000);
+        assert_eq!(read_wav_byte_rate(&good), Some(192_000));
+    }
+
+    /// At 16 kHz float32 mono, byte_rate is 64_000. A 0.5 s threshold is
+    /// 32_000 bytes. A 40_000-byte stem at 16 kHz must rescue (above
+    /// threshold for that rate), even though it falls below the 96 KB
+    /// number that would apply at 48 kHz. Verifies the threshold scales
+    /// per-file from the WAV header rather than assuming 48 kHz.
+    #[test]
+    fn rescue_paired_stems_threshold_scales_with_wav_byte_rate() {
+        let dir = TempDir::new().unwrap();
+        let failed_dir = dir.path().join("failed-captures");
+        std::fs::create_dir_all(&failed_dir).unwrap();
+        let native_captures = dir.path().join("native-captures");
+        std::fs::create_dir_all(&native_captures).unwrap();
+
+        let mov = native_captures.join("call.mov");
+        std::fs::write(&mov, vec![1_u8; 1024]).unwrap();
+        // 40_000 bytes at 16 kHz float32 mono = ~0.625 s of audio.
+        // Above the 0.5 s threshold for that sample rate (32_000 byte_rate
+        // * 0.5 = 32_000 byte minimum), below the 96_000 bytes that would
+        // apply if we hardcoded 48 kHz.
+        write_test_wav(&native_captures.join("call.voice.wav"), 16_000, 40_000);
+        write_test_wav(&native_captures.join("call.system.wav"), 16_000, 40_000);
+
+        rescue_paired_stems(&mov, &failed_dir, "rescued");
+
+        assert!(
+            failed_dir.join("rescued.voice.wav").exists(),
+            "16 kHz stem above 0.5 s should rescue"
+        );
+        assert!(
+            failed_dir.join("rescued.system.wav").exists(),
+            "16 kHz stem above 0.5 s should rescue"
+        );
+    }
+
+    /// Discovery rejects voice-only stem plans (`SystemStemOnly` is valid,
+    /// `VoiceStemOnly` is not). If voice clears the threshold but system
+    /// is sub-threshold, the rescue must drop voice too rather than
+    /// produce a voice-only artifact that diarize cannot consume. Codex
+    /// review on #236 caught this asymmetric-skip gap.
+    #[test]
+    fn rescue_paired_stems_drops_voice_when_system_subthreshold() {
+        let dir = TempDir::new().unwrap();
+        let failed_dir = dir.path().join("failed-captures");
+        std::fs::create_dir_all(&failed_dir).unwrap();
+        let native_captures = dir.path().join("native-captures");
+        std::fs::create_dir_all(&native_captures).unwrap();
+
+        let mov = native_captures.join("call.mov");
+        std::fs::write(&mov, vec![1_u8; 1024]).unwrap();
+
+        // Voice is healthy 1 s at 48 kHz, system is sub-threshold 0.1 s.
+        let voice_stem = native_captures.join("call.voice.wav");
+        let system_stem = native_captures.join("call.system.wav");
+        write_test_wav(&voice_stem, 48_000, 200_000);
+        write_test_wav(&system_stem, 48_000, 20_000);
+
+        rescue_paired_stems(&mov, &failed_dir, "rescued");
+
+        // Voice must NOT have moved alone (would be a VoiceStemOnly plan,
+        // which discover_stem_plan rejects).
+        assert!(
+            voice_stem.exists(),
+            "voice original must stay in place when system is sub-threshold"
+        );
+        assert!(
+            !failed_dir.join("rescued.voice.wav").exists(),
+            "voice must NOT rescue alone (would be invalid voice-only plan)"
+        );
+        // System sub-threshold stays in place too (skipped earlier).
+        assert!(
+            system_stem.exists(),
+            "system sub-threshold stem must stay in place"
+        );
+        assert!(
+            !failed_dir.join("rescued.system.wav").exists(),
+            "system sub-threshold must not rescue"
+        );
+    }
+
+    /// Inverse of the above: when voice is sub-threshold and system is
+    /// healthy, system alone IS a valid plan (`SystemStemOnly`) and must
+    /// still rescue. Verifies the asymmetric guard is one-directional.
+    #[test]
+    fn rescue_paired_stems_keeps_system_when_voice_subthreshold() {
+        let dir = TempDir::new().unwrap();
+        let failed_dir = dir.path().join("failed-captures");
+        std::fs::create_dir_all(&failed_dir).unwrap();
+        let native_captures = dir.path().join("native-captures");
+        std::fs::create_dir_all(&native_captures).unwrap();
+
+        let mov = native_captures.join("call.mov");
+        std::fs::write(&mov, vec![1_u8; 1024]).unwrap();
+
+        let voice_stem = native_captures.join("call.voice.wav");
+        let system_stem = native_captures.join("call.system.wav");
+        write_test_wav(&voice_stem, 48_000, 20_000);
+        write_test_wav(&system_stem, 48_000, 200_000);
+
+        rescue_paired_stems(&mov, &failed_dir, "rescued");
+
+        // System rescues alone (valid SystemStemOnly).
+        assert!(
+            !system_stem.exists(),
+            "healthy system stem must be moved on successful rescue"
+        );
+        assert!(
+            failed_dir.join("rescued.system.wav").exists(),
+            "healthy system stem must rescue when voice is sub-threshold"
+        );
+        // Voice sub-threshold stays in place.
+        assert!(
+            voice_stem.exists(),
+            "voice sub-threshold stem must stay in place"
+        );
+        assert!(
+            !failed_dir.join("rescued.voice.wav").exists(),
+            "voice sub-threshold must not rescue"
+        );
     }
 
     #[test]
