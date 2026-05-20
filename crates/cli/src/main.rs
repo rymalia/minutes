@@ -8190,6 +8190,7 @@ fn cmd_demo(config: &Config) -> Result<()> {
     }
 }
 
+#[cfg(feature = "whisper")]
 fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -8307,6 +8308,13 @@ fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(not(feature = "whisper"))]
+fn cmd_dictate(_stdout: bool, _note_only: bool, _config: &Config) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "`minutes dictate` requires the `whisper` feature. Reinstall without `--no-default-features` to use local dictation."
+    ))
 }
 
 fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()> {
@@ -8754,6 +8762,7 @@ fn cmd_confirm(
     Ok(())
 }
 
+#[cfg(feature = "whisper")]
 fn cmd_live(config: &Config) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -8821,6 +8830,14 @@ fn cmd_live(config: &Config) -> Result<()> {
     }
 }
 
+#[cfg(not(feature = "whisper"))]
+fn cmd_live(_config: &Config) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "`minutes live` requires the `whisper` feature. Reinstall without `--no-default-features` to use live transcription."
+    ))
+}
+
+#[cfg(feature = "whisper")]
 fn cmd_transcript(since: Option<&str>, status: bool, format: &str) -> Result<()> {
     if status {
         let s = minutes_core::live_transcript::session_status();
@@ -8901,4 +8918,11 @@ fn cmd_transcript(since: Option<&str>, status: bool, format: &str) -> Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(not(feature = "whisper"))]
+fn cmd_transcript(_since: Option<&str>, _status: bool, _format: &str) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "`minutes transcript` requires the `whisper` feature. Reinstall without `--no-default-features` to read live transcripts."
+    ))
 }
