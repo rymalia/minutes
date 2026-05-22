@@ -146,25 +146,21 @@ minutes setup --parakeet
 ```
 
 4. Download and convert the multilingual `tdt-600m` model. This is the
-   manual step the CLI prints instructions for. The `.nemo` file is publicly
-   curl-able from HuggingFace — no `huggingface_hub` dependency needed — and
-   conversion needs a small Python venv with `torch`, `safetensors`,
-   `packaging`, and `numpy`. (`packaging` is a transitive dep `safetensors`
-   doesn't pull on its own; without it `convert_nemo.py` crashes at import
-   time.)
+   manual step the CLI prints instructions for. Conversion needs a small
+   Python venv; the only non-obvious dep is `packaging`, which `safetensors`
+   requires but does not auto-pull — without it, `convert_nemo.py` crashes
+   at import time.
 
 ```bash
-# 4a. Python venv for the conversion script (uv is fastest; python -m venv
-#     works too)
-uv venv ~/.local/venvs/parakeet-convert --python 3.13
-uv pip install --python ~/.local/venvs/parakeet-convert/bin/python \
-  torch safetensors packaging numpy
+# 4a. Python venv for the conversion script. The `packaging` package is the
+#     transitive that safetensors does not auto-install.
+python3 -m venv ~/.local/venvs/parakeet-convert
 source ~/.local/venvs/parakeet-convert/bin/activate
+pip install torch torchaudio safetensors huggingface_hub packaging
 
-# 4b. Download the .nemo (2.4 GB). HF transparently redirects to the xet-hub
-#     CDN; no auth required.
+# 4b. Download the .nemo (2.4 GB) into a scratch dir
 mkdir -p /tmp/parakeet-dl && cd /tmp/parakeet-dl
-curl -L -O https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/parakeet-tdt-0.6b-v3.nemo
+hf download nvidia/parakeet-tdt-0.6b-v3 parakeet-tdt-0.6b-v3.nemo --local-dir .
 
 # 4c. Convert to safetensors (2.3 GB output, 627M params)
 mkdir -p ~/.minutes/models/parakeet/tdt-600m
@@ -425,29 +421,22 @@ warning, but the VAD weights and binary check still complete.
 ### Step 2 — Python environment for the conversion script
 
 `convert_nemo.py` needs PyTorch and `safetensors`. `safetensors` has a
-transitive `packaging` dependency it does not auto-pull, and torch emits a
-warning on first tensor op without `numpy` — install both explicitly.
-`torchaudio` and `huggingface_hub` are **not** required and add hundreds of
-MB.
+transitive `packaging` dependency it does not auto-pull — without it the
+script crashes at import time. Add it to the install list:
 
 ```bash
-# uv is fastest; `python -m venv` + `pip install` works equivalently
-uv venv ~/.local/venvs/parakeet-convert --python 3.13
-uv pip install --python ~/.local/venvs/parakeet-convert/bin/python \
-  torch safetensors packaging numpy
+python3 -m venv ~/.local/venvs/parakeet-convert
 source ~/.local/venvs/parakeet-convert/bin/activate
+pip install torch torchaudio safetensors huggingface_hub packaging
 ```
 
 ### Step 3 — Download the .nemo
 
-HuggingFace transparently redirects this public URL to its xet-hub CDN; no
-auth and no `huggingface_hub` Python package required.
-
 ```bash
 mkdir -p /tmp/parakeet-dl && cd /tmp/parakeet-dl
-curl -L -O https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/parakeet-tdt-0.6b-v3.nemo
+hf download nvidia/parakeet-tdt-0.6b-v3 parakeet-tdt-0.6b-v3.nemo --local-dir .
 # For the English-only compact model, swap the repo:
-#   https://huggingface.co/nvidia/parakeet-tdt_ctc-110m/resolve/main/parakeet-tdt_ctc-110m.nemo
+#   hf download nvidia/parakeet-tdt_ctc-110m parakeet-tdt_ctc-110m.nemo --local-dir .
 ```
 
 ### Step 4 — Convert to safetensors
