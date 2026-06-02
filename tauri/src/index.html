@@ -5715,6 +5715,7 @@
     let processingStartTime = null;
     let processingTimerInterval = null;
     let updaterDebugEnabled = false;
+    let lastUpdateNotesBody = null;
     let updateState = {
       available: false,
       version: null,
@@ -5857,12 +5858,12 @@
       const watchStatus = root.querySelector('#step-watch-artifact-status');
 
       if (!activation.hasModel && activation.nextAction === 'setup-parakeet') {
-        if (modelStatus) modelStatus.textContent = 'Needs setup';
+        setText(modelStatus, 'Needs setup');
       }
 
       if (activation.hasModel || milestones.modelReadyAt) {
         modelStep?.classList.add('done');
-        if (modelStatus) modelStatus.textContent = 'Done';
+        setText(modelStatus, 'Done');
         modelBody?.classList.add('ui-hidden');
         artifactStep?.classList.remove('disabled');
       }
@@ -5875,12 +5876,10 @@
         artifactStep?.classList.add('done');
         watchStep?.classList.remove('disabled');
         watchStep?.classList.add('done');
-        if (watchStatus) watchStatus.textContent = 'Saved';
+        setText(watchStatus, 'Saved');
       } else if (activation.phase === 'processing-first-artifact' || activation.phase === 'recording-first-artifact') {
         watchStep?.classList.remove('disabled');
-        if (watchStatus) {
-          watchStatus.textContent = activation.phase === 'processing-first-artifact' ? 'Processing...' : 'Recording...';
-        }
+        setText(watchStatus, activation.phase === 'processing-first-artifact' ? 'Processing...' : 'Recording...');
       }
     }
 
@@ -6111,10 +6110,10 @@
 
     function renderProcessingJobs(jobs) {
       processingJobs = Array.isArray(jobs) ? jobs : [];
-      processingJobsEl.replaceChildren();
+      clearChildren(processingJobsEl);
 
       if (!processingJobs.length) {
-        processingSummary.textContent = '';
+        setText(processingSummary, '');
         processingBar.classList.remove('has-jobs');
         return;
       }
@@ -6181,7 +6180,7 @@
     }
 
     function updateJobsChip(activeCount) {
-      jobsCount.textContent = String(activeCount || 0);
+      setText(jobsCount, String(activeCount || 0));
       jobsButton.classList.toggle('active', (activeCount || 0) > 0);
     }
 
@@ -6512,16 +6511,16 @@
 
           if (!isLiveTranscript) {
             stopRequested = false;
-            document.getElementById('btn-stop').disabled = false;
-            statusPill.className = 'status-pill';
-            statusPill.textContent = 'idle';
-            recordingLabel.textContent = 'Recording';
+            setDisabled(document.getElementById('btn-stop'), false);
+            setClassName(statusPill, 'status-pill');
+            setText(statusPill, 'idle');
+            setText(recordingLabel, 'Recording');
             recordingSourceHealth.classList.remove('active');
-            processingTitle.textContent = 'Processing recording';
+            setText(processingTitle, 'Processing recording');
             recordingBar.classList.remove('active');
             processingBar.classList.remove('active');
-            processingSummary.textContent = '';
-            processingJobsEl.replaceChildren();
+            setText(processingSummary, '');
+            clearChildren(processingJobsEl);
             quickNote.classList.remove('active');
             setFooterCaptureMode(false);
 
@@ -6532,7 +6531,7 @@
             // Clear processing elapsed timer
             if (processingTimerInterval) { clearInterval(processingTimerInterval); processingTimerInterval = null; }
             processingStartTime = null;
-            processingElapsed.textContent = '';
+            setText(processingElapsed, '');
 
             // Slow down polling when recording/processing/live stops (T5)
             if (wasRecording || wasStarting || wasProcessing || wasLive) {
@@ -6586,11 +6585,11 @@
         lastOutputKey = null;
         const retryBtn = document.getElementById('btn-retry-output');
         if (retryBtn) {
-          retryBtn.hidden = true;
-          retryBtn.dataset.jobId = '';
+          setHidden(retryBtn, true);
+          setDataset(retryBtn, 'jobId', '');
         }
         const openBtn = document.getElementById('btn-open-output');
-        if (openBtn) openBtn.hidden = false;
+        setHidden(openBtn, false);
         return;
       }
 
@@ -6603,25 +6602,25 @@
         playCue(isSaved ? 'complete' : 'error');
         lastOutputKey = nextKey;
       }
-      outputNotice.classList.toggle('capture', isCapture);
-      outputNotice.classList.add('active');
-      outputNoticeIcon.textContent = isSaved ? '✓' : '!';
-      outputNoticeTitle.textContent = notice.title || (isCapture ? 'Capture preserved' : isSaved ? 'Saved meeting' : 'Needs attention');
-      outputNoticeDetail.textContent = notice.detail || '';
-      outputNoticePath.textContent = notice.path || '';
+      setClassActive(outputNotice, 'capture', isCapture);
+      setClassActive(outputNotice, 'active', true);
+      setText(outputNoticeIcon, isSaved ? '✓' : '!');
+      setText(outputNoticeTitle, notice.title || (isCapture ? 'Capture preserved' : isSaved ? 'Saved meeting' : 'Needs attention'));
+      setText(outputNoticeDetail, notice.detail || '');
+      setText(outputNoticePath, notice.path || '');
       const openOutputBtn = document.getElementById('btn-open-output');
-      openOutputBtn.textContent = isCapture ? 'Open Capture' : isSaved ? 'Open Meeting' : 'Open';
-      openOutputBtn.hidden = !notice.path;
+      setText(openOutputBtn, isCapture ? 'Open Capture' : isSaved ? 'Open Meeting' : 'Open');
+      setHidden(openOutputBtn, !notice.path);
       // Only saved notices auto-dismiss + can rely on click-to-dismiss; everything else
       // (preserved-capture, error, stale-recording, watch-failed, working-copy) needs the
       // user to acknowledge it explicitly, so show a Dismiss button for those cases.
       const dismissBtn = document.getElementById('btn-dismiss-output');
-      if (dismissBtn) dismissBtn.hidden = isSaved;
+      setHidden(dismissBtn, isSaved);
       const retryBtn = document.getElementById('btn-retry-output');
       if (retryBtn) {
         const showRetry = !!notice.jobId && notice.kind === 'preserved-capture';
-        retryBtn.hidden = !showRetry;
-        retryBtn.dataset.jobId = notice.jobId || '';
+        setHidden(retryBtn, !showRetry);
+        setDataset(retryBtn, 'jobId', notice.jobId || '');
       }
       if (isSaved) {
         markActivationNudgeShown('saved-artifact-draft');
@@ -6665,11 +6664,11 @@
       if (active) {
         footer.classList.remove('footer-hidden');
       }
-      footer.classList.toggle('capture-mode', active);
+      setClassActive(footer, 'capture-mode', active);
 
-      recordButton.disabled = active;
-      liveButton.disabled = active;
-      quickThoughtButton.disabled = active;
+      setDisabled(recordButton, active);
+      setDisabled(liveButton, active);
+      setDisabled(quickThoughtButton, active);
 
       if (active) {
         const tooltip = reason === 'live'
@@ -6677,13 +6676,13 @@
           : reason === 'starting'
             ? 'Recording is starting. Wait for the recorder to finish connecting.'
             : 'Finish the current recording before starting another capture.';
-        recordButton.title = tooltip;
-        liveButton.title = tooltip;
-        quickThoughtButton.title = tooltip;
+        setTitle(recordButton, tooltip);
+        setTitle(liveButton, tooltip);
+        setTitle(quickThoughtButton, tooltip);
       } else {
-        recordButton.title = '';
-        liveButton.title = 'Start live transcription — ask your agent in Recall for coaching';
-        quickThoughtButton.title = '';
+        setTitle(recordButton, '');
+        setTitle(liveButton, 'Start live transcription — ask your agent in Recall for coaching');
+        setTitle(quickThoughtButton, '');
       }
     }
 
@@ -10548,19 +10547,19 @@
 
     function setButtonVisibility(button, visible, disabled = false) {
       if (!button) return;
-      button.hidden = !visible;
-      button.disabled = disabled;
+      setHidden(button, !visible);
+      setDisabled(button, disabled);
     }
 
     function renderUpdateBanner() {
       if (!updateBanner) return;
       const showBanner = updateState.available || ['checking', 'downloading', 'verifying', 'installing', 'ready', 'error'].includes(updateState.phase);
-      updateBanner.classList.toggle('active', showBanner);
+      setClassActive(updateBanner, 'active', showBanner);
       if (!showBanner) return;
 
-      updateBanner.classList.toggle('error-state', updateState.phase === 'error');
+      setClassActive(updateBanner, 'error-state', updateState.phase === 'error');
       const activeSpinner = ['checking', 'downloading', 'verifying', 'installing'].includes(updateState.phase);
-      updateBannerSpinner?.classList.toggle('active', activeSpinner);
+      setClassActive(updateBannerSpinner, 'active', activeSpinner);
 
       let title = 'Update available';
       let sub = updatePreambleText();
@@ -10617,39 +10616,43 @@
           break;
       }
 
-      if (updateBannerTitle) updateBannerTitle.textContent = title;
-      if (updateBannerSub) updateBannerSub.textContent = sub;
+      setText(updateBannerTitle, title);
+      setText(updateBannerSub, sub);
       if (updateBannerMeta) {
-        updateBannerMeta.textContent = meta;
-        updateBannerMeta.classList.toggle('active', showMeta);
+        setText(updateBannerMeta, meta);
+        setClassActive(updateBannerMeta, 'active', showMeta);
       }
-      if (updateBannerProgress) updateBannerProgress.classList.toggle('active', showProgress);
+      setClassActive(updateBannerProgress, 'active', showProgress);
       if (updateBannerProgressFill) {
-        updateBannerProgressFill.style.width = `${Math.max(0, Math.min(100, progressRatio * 100))}%`;
+        setStyleWidth(updateBannerProgressFill, `${Math.max(0, Math.min(100, progressRatio * 100))}%`);
       }
       if (updateBannerError) {
-        updateBannerError.textContent = updateState.phase === 'error' ? updateState.errorMessage || 'Update failed.' : '';
-        updateBannerError.classList.toggle('active', updateState.phase === 'error');
+        setText(updateBannerError, updateState.phase === 'error' ? updateState.errorMessage || 'Update failed.' : '');
+        setClassActive(updateBannerError, 'active', updateState.phase === 'error');
       }
       const showNotes = updateState.phase === 'available' && Boolean(updateState.body);
-      if (updateBannerNotes) updateBannerNotes.classList.toggle('active', showNotes);
+      setClassActive(updateBannerNotes, 'active', showNotes);
       if (showNotes && updateBannerNotesBody) {
-        renderMarkdownToElement(updateBannerNotesBody, updateState.body);
-        updateBannerNotesBody.querySelectorAll('a').forEach((a) => {
-          a.addEventListener('click', (e) => {
-            e.preventDefault();
-            window.__TAURI__.shell.open(a.href);
+        if (lastUpdateNotesBody !== updateState.body) {
+          renderMarkdownToElement(updateBannerNotesBody, updateState.body);
+          updateBannerNotesBody.querySelectorAll('a').forEach((a) => {
+            a.addEventListener('click', (e) => {
+              e.preventDefault();
+              window.__TAURI__.shell.open(a.href);
+            });
           });
-        });
+          lastUpdateNotesBody = updateState.body;
+        }
       } else if (updateBannerNotesBody) {
-        updateBannerNotesBody.textContent = '';
+        setText(updateBannerNotesBody, '');
+        lastUpdateNotesBody = null;
       }
 
       setButtonVisibility(startUpdateButton, updateState.phase === 'available');
       setButtonVisibility(retryUpdateButton, updateState.phase === 'error' && updateState.recoverable);
       setButtonVisibility(cancelUpdateButton, ['checking', 'downloading', 'verifying', 'installing'].includes(updateState.phase), !updateState.canCancel);
       setButtonVisibility(dismissUpdateButton, updateState.phase === 'available' || updateState.phase === 'error');
-      if (dismissUpdateButton) dismissUpdateButton.textContent = updateState.phase === 'error' ? 'Cancel' : 'Later';
+      setText(dismissUpdateButton, updateState.phase === 'error' ? 'Cancel' : 'Later');
     }
 
     function resetUpdateState() {
@@ -10979,6 +10982,38 @@
 
     function clearChildren(node) {
       while (node.firstChild) node.removeChild(node.firstChild);
+    }
+
+    // Idempotent DOM writes — skip when the value is unchanged. The status poll
+    // (checkStatus) reasserts identical idle text every 2s forever; on the main
+    // window (transparent + NSVisualEffectMaterial::Sidebar vibrancy) every text
+    // mutation forces WindowServer to re-blend the whole window, so unguarded
+    // no-op writes peg WindowServer while the app sits idle. These let an
+    // unchanged idle tick produce zero DOM churn. clearChildren() above is
+    // already idempotent (no-ops when the node is empty).
+    function setText(el, value) {
+      if (el && el.textContent !== value) el.textContent = value;
+    }
+    function setClassName(el, value) {
+      if (el && el.className !== value) el.className = value;
+    }
+    function setClassActive(el, name, active) {
+      if (el && el.classList.contains(name) !== active) el.classList.toggle(name, active);
+    }
+    function setDisabled(el, value) {
+      if (el && el.disabled !== value) el.disabled = value;
+    }
+    function setHidden(el, value) {
+      if (el && el.hidden !== value) el.hidden = value;
+    }
+    function setTitle(el, value) {
+      if (el && el.title !== value) el.title = value;
+    }
+    function setDataset(el, name, value) {
+      if (el && el.dataset[name] !== value) el.dataset[name] = value;
+    }
+    function setStyleWidth(el, value) {
+      if (el && el.style.width !== value) el.style.width = value;
     }
 
     function setBody(node, ...elements) {
