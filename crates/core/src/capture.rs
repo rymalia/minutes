@@ -458,16 +458,32 @@ pub fn stem_paths_for(audio_path: &Path) -> Option<crate::diarize::StemPaths> {
 }
 
 pub fn meeting_audio_artifact_paths(markdown_path: &Path) -> Vec<PathBuf> {
-    let audio_path = markdown_path.with_extension("wav");
-    let mut paths = vec![audio_path.clone()];
+    let mut paths = Vec::new();
 
-    if let Some(stems) = stem_paths_for(&audio_path) {
-        paths.push(stems.voice);
-        paths.push(stems.system);
+    // Most library recordings preserve a mixed WAV beside the markdown, while
+    // native call captures preserve the MOV anchor/container so future
+    // reprocessing can rediscover sibling voice/system stems.
+    for ext in ["wav", "mov"] {
+        let audio_path = markdown_path.with_extension(ext);
+        push_unique_path(&mut paths, audio_path.clone());
+
+        if let Some(stems) = stem_paths_for(&audio_path) {
+            push_unique_path(&mut paths, stems.voice);
+            push_unique_path(&mut paths, stems.system);
+        }
     }
 
-    paths.push(crate::voice::meeting_embeddings_sidecar_path(markdown_path));
+    push_unique_path(
+        &mut paths,
+        crate::voice::meeting_embeddings_sidecar_path(markdown_path),
+    );
     paths
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
 }
 
 fn normalize_source_name(value: Option<&str>) -> Option<String> {
@@ -2640,17 +2656,29 @@ mod tests {
     fn meeting_audio_artifact_paths_include_stems_and_embeddings_sidecar() {
         let markdown = Path::new("/tmp/meetings/2026-04-01-standup.md");
         let artifacts = meeting_audio_artifact_paths(markdown);
-        let audio_path = markdown.with_extension("wav");
-        let stems = stem_paths_for(&audio_path).expect("expected stem paths for meeting audio");
+        let wav_path = markdown.with_extension("wav");
+        let wav_stems = stem_paths_for(&wav_path).expect("expected stem paths for meeting audio");
+        let mov_path = markdown.with_extension("mov");
+        let mov_stems =
+            stem_paths_for(&mov_path).expect("expected stem paths for native meeting audio");
 
         assert_eq!(
             artifacts,
             vec![
-                audio_path,
-                stems.voice,
-                stems.system,
+                wav_path,
+                wav_stems.voice,
+                wav_stems.system,
+                mov_path,
                 crate::voice::meeting_embeddings_sidecar_path(markdown),
             ]
+        );
+        assert_eq!(
+            mov_stems.voice,
+            Path::new("/tmp/meetings/2026-04-01-standup.voice.wav")
+        );
+        assert_eq!(
+            mov_stems.system,
+            Path::new("/tmp/meetings/2026-04-01-standup.system.wav")
         );
     }
 

@@ -881,10 +881,9 @@ enum Commands {
         action: ContextAction,
     },
 
-    /// Import meetings from another app (e.g., Granola)
+    /// Import meetings from another app, or recover-process an audio file
     Import {
-        /// Source app: granola
-        #[arg(value_parser = ["granola"])]
+        /// Source app (granola), or an audio file path to process as a meeting
         from: String,
 
         /// Directory containing exported meetings (default: ~/.granola-archivist/output/)
@@ -1250,6 +1249,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
     // Route whisper.cpp + ggml stderr through the tracing subscriber we just
     // installed. Safe to call multiple times; only the first call has effect.
@@ -1986,9 +1986,12 @@ fn cmd_record(
     let startup_recording_health =
         check_meeting_system_audio_probe(capture_mode, skip_audio_probe, config)?;
 
-    // Check for conflicting live transcript session
+    // Check for conflicting live transcript session. `inspect_pid_file` so a
+    // standalone session holding the PID under a mandatory Windows lock is seen —
+    // otherwise a recording could start alongside it and clobber the shared
+    // `live-transcript.jsonl`. See #258.
     let lt_pid = minutes_core::pid::live_transcript_pid_path();
-    if let Ok(Some(_)) = minutes_core::pid::check_pid_file(&lt_pid) {
+    if minutes_core::pid::inspect_pid_file(&lt_pid).is_active() {
         anyhow::bail!("live transcript in progress — run `minutes stop` first");
     }
 
@@ -2161,7 +2164,7 @@ fn cmd_record(
 }
 
 fn spawn_queue_worker() -> Result<()> {
-    if minutes_core::jobs::current_worker_pid().is_some() {
+    if minutes_core::jobs::worker_active() {
         return Ok(());
     }
 
@@ -2279,40 +2282,43 @@ fn cmd_stop(config: &Config) -> Result<()> {
             Ok(())
         }
         Ok(None) => {
-            // No batch recording — check for live transcript session
+            // No batch recording — check for live transcript session.
+            // `inspect_pid_file` so a session holding the PID under a mandatory
+            // Windows lock is detected (the PID is unreadable there, but the stop
+            // sentinel — polled inline by the live loop — stops it on any
+            // platform). See #258.
             let lt_pid_path = minutes_core::pid::live_transcript_pid_path();
-            match minutes_core::pid::check_pid_file(&lt_pid_path) {
-                Ok(Some(pid)) => {
-                    eprintln!("Stopping live transcript (PID {})...", pid);
-                    minutes_core::pid::write_stop_sentinel()
-                        .map_err(|e| anyhow::anyhow!("failed to write stop sentinel: {}", e))?;
-                    #[cfg(unix)]
-                    {
-                        let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                        if rc != 0 {
-                            tracing::warn!("SIGTERM failed for live transcript PID {}", pid);
-                        }
-                    }
-                    // Poll for PID removal
-                    let start = std::time::Instant::now();
-                    eprint!("Finalizing live transcript");
-                    while lt_pid_path.exists()
-                        && start.elapsed() < std::time::Duration::from_secs(30)
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        eprint!(".");
-                    }
-                    eprintln!();
-                    if lt_pid_path.exists() {
-                        anyhow::bail!("live transcript process did not stop within 30 seconds");
-                    }
-                    eprintln!("Live transcript stopped.");
-                    Ok(())
+            let lt_state = minutes_core::pid::inspect_pid_file(&lt_pid_path);
+            if lt_state.is_active() {
+                match lt_state.pid() {
+                    Some(pid) => eprintln!("Stopping live transcript (PID {})...", pid),
+                    None => eprintln!("Stopping live transcript..."),
                 }
-                _ => {
-                    eprintln!("No recording or live transcript in progress.");
-                    Ok(())
+                minutes_core::pid::write_stop_sentinel()
+                    .map_err(|e| anyhow::anyhow!("failed to write stop sentinel: {}", e))?;
+                #[cfg(unix)]
+                if let Some(pid) = lt_state.pid() {
+                    let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                    if rc != 0 {
+                        tracing::warn!("SIGTERM failed for live transcript PID {}", pid);
+                    }
                 }
+                // Poll for PID removal
+                let start = std::time::Instant::now();
+                eprint!("Finalizing live transcript");
+                while lt_pid_path.exists() && start.elapsed() < std::time::Duration::from_secs(30) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    eprint!(".");
+                }
+                eprintln!();
+                if lt_pid_path.exists() {
+                    anyhow::bail!("live transcript process did not stop within 30 seconds");
+                }
+                eprintln!("Live transcript stopped.");
+                Ok(())
+            } else {
+                eprintln!("No recording or live transcript in progress.");
+                Ok(())
             }
         }
         Err(e) => Err(anyhow::anyhow!("{}", e)),
@@ -6436,6 +6442,37 @@ life (qmd://life/)
     }
 
     #[test]
+    fn import_accepts_audio_path_for_recovery_alias() {
+        let parsed = Cli::try_parse_from([
+            "minutes",
+            "import",
+            "/Users/test/.minutes/native-captures/2026-05-19-120148-call.voice.wav",
+        ])
+        .expect("import must accept audio paths so it can route to process");
+
+        match parsed.command {
+            Commands::Import { from, dir, dry_run } => {
+                assert_eq!(
+                    from,
+                    "/Users/test/.minutes/native-captures/2026-05-19-120148-call.voice.wav"
+                );
+                assert!(dir.is_none());
+                assert!(!dry_run);
+            }
+            _ => panic!("expected Import variant"),
+        }
+    }
+
+    #[test]
+    fn looks_like_audio_path_matches_supported_process_formats() {
+        assert!(looks_like_audio_path("call.voice.wav"));
+        assert!(looks_like_audio_path("meeting.MOV"));
+        assert!(looks_like_audio_path("/tmp/memo.m4a"));
+        assert!(!looks_like_audio_path("granola"));
+        assert!(!looks_like_audio_path("notes.md"));
+    }
+
+    #[test]
     fn render_decode_hints_plaintext_summary_surfaces_allowed_failures() {
         let output = render_decode_hints_plaintext_summary(
             &sample_decode_hint_eval_report_with_allowed_failures(),
@@ -7522,10 +7559,53 @@ fn cmd_context_get_moment(
 // ── Import ──────────────────────────────────────────────────
 
 fn cmd_import(from: &str, dir: Option<&Path>, dry_run: bool, config: &Config) -> Result<()> {
+    if dir.is_none() && looks_like_audio_path(from) {
+        let path = Path::new(from);
+        if dry_run {
+            eprintln!(
+                "Would process audio file as a meeting: minutes process \"{}\" --type meeting",
+                path.display()
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "dry-run",
+                    "file": path.display().to_string(),
+                    "content_type": "meeting",
+                    "command": format!("minutes process \"{}\" --type meeting", path.display()),
+                }))?
+            );
+            return Ok(());
+        }
+
+        eprintln!(
+            "Processing audio file via import compatibility path. Preferred command: minutes process \"{}\" --type meeting",
+            path.display()
+        );
+        return cmd_process(path, "meeting", None, None, config);
+    }
+
     match from {
         "granola" => import_granola(dir, dry_run, config),
-        other => anyhow::bail!("Unknown import source: {}. Supported: granola", other),
+        other => anyhow::bail!(
+            "Unknown import source: {}. Supported source: granola. To process an audio file, run: minutes process \"{}\" --type meeting",
+            other,
+            other
+        ),
     }
+}
+
+fn looks_like_audio_path(value: &str) -> bool {
+    Path::new(value)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "wav" | "m4a" | "mp3" | "ogg" | "webm" | "mp4" | "mov" | "aac"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn import_granola(dir: Option<&Path>, dry_run: bool, config: &Config) -> Result<()> {
@@ -8116,6 +8196,7 @@ fn cmd_demo(config: &Config) -> Result<()> {
     }
 }
 
+#[cfg(feature = "whisper")]
 fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -8233,6 +8314,13 @@ fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(not(feature = "whisper"))]
+fn cmd_dictate(_stdout: bool, _note_only: bool, _config: &Config) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "`minutes dictate` requires the `whisper` feature. Reinstall without `--no-default-features` to use local dictation."
+    ))
 }
 
 fn cmd_enroll(file: Option<&Path>, duration: u64, config: &Config) -> Result<()> {
@@ -8680,6 +8768,7 @@ fn cmd_confirm(
     Ok(())
 }
 
+#[cfg(feature = "whisper")]
 fn cmd_live(config: &Config) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -8747,6 +8836,14 @@ fn cmd_live(config: &Config) -> Result<()> {
     }
 }
 
+#[cfg(not(feature = "whisper"))]
+fn cmd_live(_config: &Config) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "`minutes live` requires the `whisper` feature. Reinstall without `--no-default-features` to use live transcription."
+    ))
+}
+
+#[cfg(feature = "whisper")]
 fn cmd_transcript(since: Option<&str>, status: bool, format: &str) -> Result<()> {
     if status {
         let s = minutes_core::live_transcript::session_status();
@@ -8827,4 +8924,11 @@ fn cmd_transcript(since: Option<&str>, status: bool, format: &str) -> Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(not(feature = "whisper"))]
+fn cmd_transcript(_since: Option<&str>, _status: bool, _format: &str) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "`minutes transcript` requires the `whisper` feature. Reinstall without `--no-default-features` to read live transcripts."
+    ))
 }

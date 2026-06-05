@@ -1399,6 +1399,21 @@ pub struct RecoveryItem {
     pub path: String,
     pub detail: String,
     pub retry_type: String,
+    pub modified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryRetryFailure {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryRetryAllResult {
+    pub queued: usize,
+    pub failed: Vec<RecoveryRetryFailure>,
 }
 
 fn activation_state_path() -> PathBuf {
@@ -1908,6 +1923,7 @@ pub struct ProcessingJobView {
     pub mode: String,
     pub state: String,
     pub stage: Option<String>,
+    pub stage_label: Option<String>,
     pub output_path: Option<String>,
     pub audio_path: String,
     pub error: Option<String>,
@@ -2004,11 +2020,13 @@ fn processing_job_title_fallback(mode: CaptureMode) -> &'static str {
 }
 
 fn processing_job_view(job: minutes_core::jobs::ProcessingJob) -> ProcessingJobView {
-    let fallback_title = processing_job_title_fallback(job.mode);
+    let mode = job.mode;
+    let fallback_title = processing_job_title_fallback(mode);
+    let stage_label = pipeline_stage_label(job.stage.as_deref(), Some(mode)).map(String::from);
     ProcessingJobView {
         id: job.id,
         title: job.title.unwrap_or_else(|| fallback_title.into()),
-        mode: match job.mode {
+        mode: match mode {
             CaptureMode::Meeting => "meeting".into(),
             CaptureMode::QuickThought => "quick-thought".into(),
             CaptureMode::Dictation => "dictation".into(),
@@ -2026,6 +2044,7 @@ fn processing_job_view(job: minutes_core::jobs::ProcessingJob) -> ProcessingJobV
             minutes_core::jobs::JobState::Failed => "failed".into(),
         },
         stage: job.stage,
+        stage_label,
         output_path: job.output_path,
         audio_path: job.audio_path,
         error: job.error,
@@ -2420,6 +2439,167 @@ fn preserve_failed_capture_path(path: &std::path::Path, config: &Config) -> Opti
     Some(dest)
 }
 
+#[derive(Debug, Clone)]
+struct NativeCallProcessingInput {
+    path: PathBuf,
+    recovery_warning: Option<String>,
+}
+
+fn file_has_bytes(path: &Path) -> bool {
+    path.metadata().is_ok_and(|metadata| metadata.len() > 0)
+}
+
+fn viable_native_call_stem(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.len() >= min_viable_stem_bytes(path))
+}
+
+fn native_call_recovery_health(
+    message: impl Into<String>,
+    source: minutes_core::diarize::CaptureSource,
+) -> minutes_core::markdown::RecordingHealth {
+    minutes_core::markdown::RecordingHealth {
+        voice_stem_active_ratio: None,
+        system_stem_active_ratio: None,
+        system_dominant_ratio: None,
+        capture_warnings: vec![minutes_core::markdown::CaptureWarning {
+            kind: minutes_core::diarize::FailureKind::Other {
+                code: "native-call-stem-recovery".into(),
+            },
+            source,
+            message: message.into(),
+            diagnostic_confidence: minutes_core::diarize::DiagnosticConfidence::Inferred,
+        }],
+        diarization_path: Some(minutes_core::markdown::DiarizationPath::None),
+    }
+}
+
+fn native_call_processing_input(output_path: &Path) -> io::Result<NativeCallProcessingInput> {
+    let primary_has_bytes = file_has_bytes(output_path);
+    let stems = minutes_core::capture::stem_paths_for(output_path);
+    let voice = stems.as_ref().map(|stems| stems.voice.as_path());
+    let system = stems.as_ref().map(|stems| stems.system.as_path());
+    let voice_viable = voice.is_some_and(viable_native_call_stem);
+    let system_viable = system.is_some_and(viable_native_call_stem);
+
+    if voice_viable && system_viable {
+        if !primary_has_bytes {
+            // `prepare_transcription_input` only needs the .mov path as the
+            // stem-discovery anchor; tests already use a one-byte .mov stub.
+            // If ScreenCaptureKit failed to materialize the container but the
+            // PCM stems are good, create that anchor instead of stranding both
+            // stems in native-captures.
+            std::fs::write(output_path, b"minutes native-call stem anchor")?;
+            return Ok(NativeCallProcessingInput {
+                path: output_path.to_path_buf(),
+                recovery_warning: Some(
+                    "Native call capture did not produce a usable .mov container; processing recovered PCM stems instead.".into(),
+                ),
+            });
+        }
+
+        return Ok(NativeCallProcessingInput {
+            path: output_path.to_path_buf(),
+            recovery_warning: None,
+        });
+    }
+
+    if voice_viable {
+        let voice = voice.expect("voice path present when viable");
+        return Ok(NativeCallProcessingInput {
+            path: voice.to_path_buf(),
+            recovery_warning: Some(
+                "Native call capture did not produce a usable system-audio stem; processing the local microphone stem only.".into(),
+            ),
+        });
+    }
+
+    if system_viable {
+        let system = system.expect("system path present when viable");
+        return Ok(NativeCallProcessingInput {
+            path: system.to_path_buf(),
+            recovery_warning: Some(
+                "Native call capture did not produce a usable microphone stem; processing the system-audio stem only.".into(),
+            ),
+        });
+    }
+
+    if primary_has_bytes {
+        return Ok(NativeCallProcessingInput {
+            path: output_path.to_path_buf(),
+            recovery_warning: None,
+        });
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "native call capture did not produce a usable .mov or PCM stem under {}",
+            output_path
+                .parent()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unknown>".into())
+        ),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_native_call_capture_for_processing(
+    mode: CaptureMode,
+    requested_title: Option<String>,
+    output_path: &Path,
+    user_notes: Option<String>,
+    pre_context: Option<String>,
+    recording_started_at: chrono::DateTime<chrono::Local>,
+    recording_finished_at: chrono::DateTime<chrono::Local>,
+    context_session_id: Option<String>,
+    calendar_event: Option<minutes_core::calendar::CalendarEvent>,
+    extra_warning: Option<String>,
+) -> Result<minutes_core::jobs::ProcessingJob, String> {
+    let input = native_call_processing_input(output_path).map_err(|error| {
+        format!("failed to prepare native call capture for processing: {error}")
+    })?;
+    let warning = match (extra_warning, input.recovery_warning) {
+        (Some(extra), Some(recovery)) => Some(format!("{extra} {recovery}")),
+        (Some(extra), None) => Some(extra),
+        (None, Some(recovery)) => Some(recovery),
+        (None, None) => None,
+    };
+    let source = if input
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".system.wav"))
+    {
+        minutes_core::diarize::CaptureSource::System
+    } else if input
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".voice.wav"))
+    {
+        minutes_core::diarize::CaptureSource::Voice
+    } else {
+        minutes_core::diarize::CaptureSource::Both
+    };
+    let recording_health = warning.map(|message| native_call_recovery_health(message, source));
+
+    minutes_core::jobs::queue_live_capture_with_recording_health(
+        mode,
+        requested_title,
+        &input.path,
+        user_notes,
+        pre_context,
+        Some(recording_started_at),
+        Some(recording_finished_at),
+        context_session_id,
+        calendar_event,
+        None,
+        recording_health,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Copy `src` to `dest` with two invariants beyond `std::fs::copy`:
 ///
 /// 1. **No-clobber on dest** — open with `O_CREAT|O_EXCL` (`create_new` in Rust
@@ -2754,40 +2934,98 @@ fn start_native_call_recording(
         }
         if let Some(status) = session.try_wait()? {
             if !status.success() {
-                let preserved = preserve_failed_capture_path(&output_path, config);
-                if let Some(session_id) = context_session_id.as_deref() {
-                    minutes_core::context_store::mark_capture_session_failed(
-                        session_id,
-                        Some(chrono::Local::now()),
-                        "native call capture exited early",
-                        preserved.as_deref(),
-                    )
-                    .ok();
-                }
-                minutes_core::pid::remove().ok();
-                minutes_core::pid::clear_recording_metadata().ok();
-                minutes_core::notes::cleanup();
-                recording.store(false, Ordering::Relaxed);
-                starting.store(false, Ordering::Relaxed);
-                if let Ok(mut health) = call_capture_health.lock() {
-                    *health = None;
-                }
-                if let Some(saved) = preserved {
-                    let notice = OutputNotice {
-                        kind: "preserved-capture".into(),
-                        title: "Native call capture failed".into(),
-                        path: saved.display().to_string(),
-                        detail:
-                            "ScreenCaptureKit capture ended early, but the raw output was preserved."
-                                .into(),
-                        job_id: None,
-                    };
-                    set_latest_output(latest_output, Some(notice.clone()));
-                    maybe_show_completion_notification(
-                        app_handle,
-                        completion_notifications_enabled,
-                        &notice,
-                    );
+                let recording_finished_at = chrono::Local::now();
+                let user_notes = minutes_core::notes::read_notes();
+                let pre_context = minutes_core::notes::read_context();
+                match queue_native_call_capture_for_processing(
+                    mode,
+                    requested_title.clone(),
+                    &output_path,
+                    user_notes,
+                    pre_context,
+                    recording_started_at,
+                    recording_finished_at,
+                    context_session_id.clone(),
+                    None,
+                    Some("Native call capture helper exited before normal stop.".into()),
+                ) {
+                    Ok(job) => {
+                        processing.store(true, Ordering::Relaxed);
+                        set_processing_stage(processing_stage, job.stage.as_deref());
+                        minutes_core::pid::set_processing_status(
+                            job.stage.as_deref(),
+                            Some(mode),
+                            job.title.as_deref(),
+                            Some(&job.id),
+                            minutes_core::jobs::active_job_count(),
+                        )
+                        .ok();
+                        minutes_core::pid::remove().ok();
+                        minutes_core::pid::clear_recording_metadata().ok();
+                        minutes_core::notes::cleanup();
+                        recording.store(false, Ordering::Relaxed);
+                        starting.store(false, Ordering::Relaxed);
+                        if let Ok(mut health) = call_capture_health.lock() {
+                            *health = Some(session.source_health());
+                        }
+                        spawn_processing_worker(
+                            app_handle.clone(),
+                            processing.clone(),
+                            processing_stage.clone(),
+                            latest_output.clone(),
+                            activation_progress.clone(),
+                            completion_notifications_enabled.clone(),
+                        );
+                        sync_processing_indicator(processing, processing_stage);
+                    }
+                    Err(queue_error) => {
+                        let preserved = preserve_failed_capture_path(&output_path, config);
+                        if let Some(session_id) = context_session_id.as_deref() {
+                            minutes_core::context_store::mark_capture_session_failed(
+                                session_id,
+                                Some(recording_finished_at),
+                                &format!(
+                                    "native call capture exited early; recovery queue failed: {}",
+                                    queue_error
+                                ),
+                                preserved.as_deref(),
+                            )
+                            .ok();
+                        }
+                        minutes_core::pid::remove().ok();
+                        minutes_core::pid::clear_recording_metadata().ok();
+                        minutes_core::notes::cleanup();
+                        recording.store(false, Ordering::Relaxed);
+                        starting.store(false, Ordering::Relaxed);
+                        if let Ok(mut health) = call_capture_health.lock() {
+                            *health = None;
+                        }
+                        if let Some(saved) = preserved {
+                            let notice = OutputNotice {
+                                kind: "preserved-capture".into(),
+                                title: "Native call capture failed".into(),
+                                path: saved.display().to_string(),
+                                detail: format!(
+                                    "ScreenCaptureKit capture ended early. Recovery queue failed: {queue_error}"
+                                ),
+                                job_id: None,
+                            };
+                            set_latest_output(latest_output, Some(notice.clone()));
+                            maybe_show_completion_notification(
+                                app_handle,
+                                completion_notifications_enabled,
+                                &notice,
+                            );
+                        } else {
+                            set_recording_error_notice(
+                                latest_output,
+                                "Native call capture failed",
+                                format!(
+                                    "ScreenCaptureKit capture ended early. Recovery queue failed: {queue_error}"
+                                ),
+                            );
+                        }
+                    }
                 }
                 reset_hotkey_capture_state(hotkey_runtime, discard_short_hotkey_capture);
                 return Ok(());
@@ -2797,43 +3035,109 @@ fn start_native_call_recording(
     }
 
     if let Err(error) = session.stop() {
-        let preserved = preserve_failed_capture_path(&output_path, config);
-        if let Some(session_id) = context_session_id.as_deref() {
-            minutes_core::context_store::mark_capture_session_failed(
-                session_id,
-                Some(chrono::Local::now()),
-                &format!("stopping native call capture failed: {}", error),
-                preserved.as_deref(),
-            )
-            .ok();
+        let recording_finished_at = chrono::Local::now();
+        let user_notes = minutes_core::notes::read_notes();
+        let pre_context = minutes_core::notes::read_context();
+        let queue_result = queue_native_call_capture_for_processing(
+            mode,
+            requested_title.clone(),
+            &output_path,
+            user_notes,
+            pre_context,
+            recording_started_at,
+            recording_finished_at,
+            context_session_id.clone(),
+            None,
+            Some(format!(
+                "Native call capture finalization reported an error: {error}."
+            )),
+        );
+
+        match queue_result {
+            Ok(job) => {
+                processing.store(true, Ordering::Relaxed);
+                set_processing_stage(processing_stage, job.stage.as_deref());
+                minutes_core::pid::set_processing_status(
+                    job.stage.as_deref(),
+                    Some(mode),
+                    job.title.as_deref(),
+                    Some(&job.id),
+                    minutes_core::jobs::active_job_count(),
+                )
+                .ok();
+                minutes_core::pid::remove().ok();
+                minutes_core::pid::clear_recording_metadata().ok();
+                minutes_core::notes::cleanup();
+                starting.store(false, Ordering::Relaxed);
+                recording.store(false, Ordering::Relaxed);
+                if let Ok(mut health) = call_capture_health.lock() {
+                    *health = Some(session.source_health());
+                }
+                spawn_processing_worker(
+                    app_handle.clone(),
+                    processing.clone(),
+                    processing_stage.clone(),
+                    latest_output.clone(),
+                    activation_progress.clone(),
+                    completion_notifications_enabled.clone(),
+                );
+                sync_processing_indicator(processing, processing_stage);
+                reset_hotkey_capture_state(hotkey_runtime, discard_short_hotkey_capture);
+                return Ok(());
+            }
+            Err(queue_error) => {
+                let preserved = preserve_failed_capture_path(&output_path, config);
+                if let Some(session_id) = context_session_id.as_deref() {
+                    minutes_core::context_store::mark_capture_session_failed(
+                        session_id,
+                        Some(recording_finished_at),
+                        &format!(
+                            "stopping native call capture failed: {}; recovery queue failed: {}",
+                            error, queue_error
+                        ),
+                        preserved.as_deref(),
+                    )
+                    .ok();
+                }
+                minutes_core::notes::cleanup();
+                minutes_core::pid::remove().ok();
+                minutes_core::pid::clear_recording_metadata().ok();
+                processing.store(false, Ordering::Relaxed);
+                set_processing_stage(processing_stage, None);
+                starting.store(false, Ordering::Relaxed);
+                recording.store(false, Ordering::Relaxed);
+                if let Ok(mut health) = call_capture_health.lock() {
+                    *health = None;
+                }
+                if let Some(saved) = preserved {
+                    let notice = OutputNotice {
+                        kind: "preserved-capture".into(),
+                        title: "Native call capture preserved".into(),
+                        path: saved.display().to_string(),
+                        detail: format!(
+                            "Stopping native call capture failed: {error}. Recovery queue failed: {queue_error}"
+                        ),
+                        job_id: None,
+                    };
+                    set_latest_output(latest_output, Some(notice.clone()));
+                    maybe_show_completion_notification(
+                        app_handle,
+                        completion_notifications_enabled,
+                        &notice,
+                    );
+                } else {
+                    set_recording_error_notice(
+                        latest_output,
+                        "Native call capture failed",
+                        format!(
+                            "Stopping native call capture failed: {error}. Recovery queue failed: {queue_error}"
+                        ),
+                    );
+                }
+                reset_hotkey_capture_state(hotkey_runtime, discard_short_hotkey_capture);
+                return Ok(());
+            }
         }
-        minutes_core::notes::cleanup();
-        minutes_core::pid::remove().ok();
-        minutes_core::pid::clear_recording_metadata().ok();
-        processing.store(false, Ordering::Relaxed);
-        set_processing_stage(processing_stage, None);
-        starting.store(false, Ordering::Relaxed);
-        recording.store(false, Ordering::Relaxed);
-        if let Ok(mut health) = call_capture_health.lock() {
-            *health = None;
-        }
-        if let Some(saved) = preserved {
-            let notice = OutputNotice {
-                kind: "preserved-capture".into(),
-                title: "Native call capture preserved".into(),
-                path: saved.display().to_string(),
-                detail: format!("Stopping native call capture failed: {}", error),
-                job_id: None,
-            };
-            set_latest_output(latest_output, Some(notice.clone()));
-            maybe_show_completion_notification(
-                app_handle,
-                completion_notifications_enabled,
-                &notice,
-            );
-        }
-        reset_hotkey_capture_state(hotkey_runtime, discard_short_hotkey_capture);
-        return Ok(());
     }
 
     recording.store(false, Ordering::Relaxed);
@@ -2873,14 +3177,14 @@ fn start_native_call_recording(
     // The pipeline already falls back to events_overlapping_now() during background processing.
     let calendar_event = None;
 
-    match minutes_core::jobs::enqueue_capture_job(
+    match queue_native_call_capture_for_processing(
         mode,
         requested_title,
-        output_path.clone(),
+        &output_path,
         user_notes,
         pre_context,
-        Some(recording_started_at),
-        Some(recording_finished_at),
+        recording_started_at,
+        recording_finished_at,
         context_session_id.clone(),
         calendar_event,
         None,
@@ -2947,6 +3251,15 @@ fn start_native_call_recording(
                     app_handle,
                     completion_notifications_enabled,
                     &notice,
+                );
+            } else {
+                set_recording_error_notice(
+                    latest_output,
+                    "Processing not started",
+                    format!(
+                        "Failed to queue native call capture for processing: {}",
+                        error
+                    ),
                 );
             }
             starting.store(false, Ordering::Relaxed);
@@ -3186,6 +3499,84 @@ fn set_latest_output(
     }
 }
 
+fn output_error_notice(title: impl Into<String>, detail: impl Into<String>) -> OutputNotice {
+    OutputNotice {
+        kind: "error".into(),
+        title: title.into(),
+        path: String::new(),
+        detail: detail.into(),
+        job_id: None,
+    }
+}
+
+fn recording_start_error_notice(detail: impl Into<String>) -> OutputNotice {
+    output_error_notice("Recording not started", detail)
+}
+
+fn set_recording_start_error(
+    latest_output: &Arc<Mutex<Option<OutputNotice>>>,
+    detail: impl Into<String>,
+) {
+    let detail = detail.into();
+    minutes_core::logging::log_error("desktop_recording_start", "", &detail);
+    set_latest_output(latest_output, Some(recording_start_error_notice(detail)));
+}
+
+fn set_recording_error_notice(
+    latest_output: &Arc<Mutex<Option<OutputNotice>>>,
+    title: impl Into<String>,
+    detail: impl Into<String>,
+) {
+    let detail = detail.into();
+    minutes_core::logging::log_error("desktop_recording", "", &detail);
+    set_latest_output(latest_output, Some(output_error_notice(title, detail)));
+}
+
+fn validate_recording_launch_state(state: &AppState) -> Result<(), String> {
+    if recording_active(&state.recording) || state.starting.load(Ordering::Relaxed) {
+        return Err("Already recording".into());
+    }
+    if state.live_transcript_active.load(Ordering::Relaxed) {
+        return Err("Live transcript in progress — stop it first".into());
+    }
+    // Check both the in-process atomic and the cross-process PID file,
+    // mirroring the live transcript path. `cmd_install_update` and the
+    // palette dispatcher already treat the dictation PID as authoritative
+    // for "another Minutes is dictating", so this gate stays consistent.
+    if state.dictation_active.load(Ordering::Relaxed) || dictation_pid_active() {
+        return Err("Dictation in progress — stop it first".into());
+    }
+    Ok(())
+}
+
+fn reject_recording_launch(state: &AppState, error: String) -> String {
+    set_recording_start_error(&state.latest_output, error.clone());
+    error
+}
+
+fn reserve_recording_launch(state: &AppState) -> Result<(), String> {
+    validate_recording_launch_state(state)?;
+    state
+        .starting
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+        .map(|_| ())
+        .map_err(|_| "Already recording".into())
+}
+
+fn prepare_cmd_recording_launch(state: &AppState, from_call_detect: bool) -> Result<(), String> {
+    reserve_recording_launch(state)?;
+    // Session-level flag that scopes the stop_when_call_ends auto-stop only
+    // to recordings started via the call detection banner. Manual starts
+    // never get auto-stopped, even when the config flag is on.
+    state
+        .recording_started_by_call_detect
+        .store(from_call_detect, Ordering::Relaxed);
+    // Starting a fresh recording always cancels any in-flight countdown so
+    // the UI doesn't auto-stop a session the user has already moved past.
+    reset_call_end_countdown(state);
+    Ok(())
+}
+
 fn sync_processing_indicator(
     processing: &Arc<AtomicBool>,
     processing_stage: &Arc<Mutex<Option<String>>>,
@@ -3348,7 +3739,7 @@ pub fn spawn_processing_worker(
     completion_notifications_enabled: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        if minutes_core::jobs::current_worker_pid().is_some() {
+        if minutes_core::jobs::worker_active() {
             sync_processing_indicator(&processing, &processing_stage);
             return;
         }
@@ -4336,6 +4727,26 @@ fn recovery_title(path: &std::path::Path, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+/// A dual-source capture writes `<name>.voice.wav` / `<name>.system.wav`
+/// sidecars next to the primary `<name>.wav`. Those stems are processed as part
+/// of the primary, never on their own, so they must not appear as independent
+/// recovery items when their primary is present: otherwise "Retry all" would
+/// enqueue them as standalone jobs that race (and break) the primary's job. An
+/// orphaned stem with no primary still surfaces so the user can see it.
+fn is_dual_source_stem_with_primary(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    [".voice.wav", ".system.wav"].iter().any(|suffix| {
+        name.strip_suffix(suffix)
+            .map(|base| dir.join(format!("{}.wav", base)).exists())
+            .unwrap_or(false)
+    })
+}
+
 fn scan_recovery_items(config: &Config) -> Vec<RecoveryItem> {
     let mut found: Vec<(SystemTime, RecoveryItem)> = Vec::new();
 
@@ -4351,6 +4762,7 @@ fn scan_recovery_items(config: &Config) -> Vec<RecoveryItem> {
                     path: current_wav.display().to_string(),
                     detail: "Minutes found an unfinished live capture that never made it through the pipeline.".into(),
                     retry_type: "meeting".into(),
+                    modified_at: system_time_to_rfc3339(modified),
                 },
             ));
         }
@@ -4360,7 +4772,10 @@ fn scan_recovery_items(config: &Config) -> Vec<RecoveryItem> {
     if let Ok(entries) = std::fs::read_dir(&failed_captures) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && !is_hidden_or_system_file(&path) {
+            if path.is_file()
+                && !is_hidden_or_system_file(&path)
+                && !is_dual_source_stem_with_primary(&path)
+            {
                 let modified = entry
                     .metadata()
                     .ok()
@@ -4376,6 +4791,7 @@ fn scan_recovery_items(config: &Config) -> Vec<RecoveryItem> {
                             "A live recording was preserved because capture or processing failed."
                                 .into(),
                         retry_type: "meeting".into(),
+                        modified_at: system_time_to_rfc3339(modified),
                     },
                 ));
             }
@@ -4387,7 +4803,10 @@ fn scan_recovery_items(config: &Config) -> Vec<RecoveryItem> {
         if let Ok(entries) = std::fs::read_dir(&failed_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() && !is_hidden_or_system_file(&path) {
+                if path.is_file()
+                    && !is_hidden_or_system_file(&path)
+                    && !is_dual_source_stem_with_primary(&path)
+                {
                     let modified = entry
                         .metadata()
                         .ok()
@@ -4401,6 +4820,7 @@ fn scan_recovery_items(config: &Config) -> Vec<RecoveryItem> {
                             path: path.display().to_string(),
                             detail: "A watched audio file failed to process and is waiting for manual retry.".into(),
                             retry_type: config.watch.r#type.clone(),
+                            modified_at: system_time_to_rfc3339(modified),
                         },
                     ));
                 }
@@ -4408,8 +4828,22 @@ fn scan_recovery_items(config: &Config) -> Vec<RecoveryItem> {
         }
     }
 
+    // Hide items that already have an active (queued or processing) job, so a
+    // retried item disappears from the list without us moving its file out of
+    // the recovery folder. A failed job is terminal (not active), so a failed
+    // retry correctly re-surfaces the file here; a successful one is moved out
+    // by the worker (`preserve_audio_alongside_output`) and is gone regardless.
+    let active_paths: std::collections::HashSet<PathBuf> = minutes_core::jobs::active_jobs()
+        .into_iter()
+        .map(|job| PathBuf::from(job.audio_path))
+        .collect();
+
     found.sort_by_key(|(modified, _)| Reverse(*modified));
-    found.into_iter().map(|(_, item)| item).collect()
+    found
+        .into_iter()
+        .map(|(_, item)| item)
+        .filter(|item| !active_paths.contains(&PathBuf::from(&item.path)))
+        .collect()
 }
 
 /// Handles that `start_recording` clears at the end of a session. Keeps the
@@ -4506,6 +4940,7 @@ pub fn start_recording(
         Ok(preflight) => preflight,
         Err(error) => {
             eprintln!("Recording preflight failed: {}", error);
+            set_recording_start_error(&latest_output, error.clone());
             show_user_notification(&app_handle, "Recording blocked", &error);
             starting.store(false, Ordering::Relaxed);
             recording.store(false, Ordering::Relaxed);
@@ -4524,6 +4959,7 @@ pub fn start_recording(
     if let Some(reason) = &preflight.blocking_reason {
         if !(preflight.intent == RecordingIntent::Call && native_call_capture_available) {
             eprintln!("Recording preflight blocked: {}", reason);
+            set_recording_start_error(&latest_output, reason.clone());
             show_user_notification(&app_handle, "Recording blocked", reason);
             starting.store(false, Ordering::Relaxed);
             recording.store(false, Ordering::Relaxed);
@@ -4562,7 +4998,16 @@ pub fn start_recording(
             }
             Err(error) => {
                 eprintln!("Native call recording unavailable, falling back: {}", error);
+                minutes_core::logging::log_error(
+                    "desktop_native_call_start",
+                    "",
+                    &format!("native call recording unavailable, falling back: {error}"),
+                );
                 if let Some(reason) = &preflight.blocking_reason {
+                    set_recording_start_error(
+                        &latest_output,
+                        format!("{reason}\n\nNative call capture failed: {error}"),
+                    );
                     show_user_notification(
                         &app_handle,
                         "Recording blocked",
@@ -4585,6 +5030,7 @@ pub fn start_recording(
 
     if let Err(e) = minutes_core::pid::create() {
         eprintln!("Failed to create PID: {}", e);
+        set_recording_start_error(&latest_output, format!("Could not start recording: {}", e));
         show_user_notification(
             &app_handle,
             "Recording",
@@ -4748,6 +5194,11 @@ pub fn start_recording(
                             );
                         } else {
                             eprintln!("Queue error: {}", e);
+                            set_recording_error_notice(
+                                &latest_output,
+                                "Processing not started",
+                                format!("Recording finished, but queueing processing failed: {e}"),
+                            );
                         }
                     }
                 }
@@ -4800,6 +5251,11 @@ pub fn start_recording(
                 );
             } else {
                 eprintln!("Capture error: {}", e);
+                set_recording_error_notice(
+                    &latest_output,
+                    "Recording failed",
+                    format!("Recording failed before processing: {e}"),
+                );
             }
         }
     }
@@ -4839,21 +5295,35 @@ pub fn launch_recording(
     hotkey_runtime: Option<Arc<Mutex<HotkeyRuntime>>>,
     discard_short_hotkey_capture: Option<Arc<AtomicBool>>,
 ) -> Result<(), String> {
-    if recording_active(&state.recording) || state.starting.load(Ordering::Relaxed) {
-        return Err("Already recording".into());
-    }
-    if state.live_transcript_active.load(Ordering::Relaxed) {
-        return Err("Live transcript in progress — stop it first".into());
-    }
-    // Check both the in-process atomic and the cross-process PID file,
-    // mirroring the live transcript path. `cmd_install_update` and the
-    // palette dispatcher already treat the dictation PID as authoritative
-    // for "another Minutes is dictating", so this gate stays consistent.
-    if state.dictation_active.load(Ordering::Relaxed) || dictation_pid_active() {
-        return Err("Dictation in progress — stop it first".into());
-    }
+    reserve_recording_launch(state).map_err(|error| reject_recording_launch(state, error))?;
 
-    state.starting.store(true, Ordering::Relaxed);
+    spawn_reserved_recording(
+        app,
+        state,
+        mode,
+        requested_intent,
+        allow_degraded,
+        requested_title,
+        language_override,
+        hotkey_runtime,
+        discard_short_hotkey_capture,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_reserved_recording(
+    app: tauri::AppHandle,
+    state: &AppState,
+    mode: CaptureMode,
+    requested_intent: Option<RecordingIntent>,
+    allow_degraded: bool,
+    requested_title: Option<String>,
+    language_override: Option<String>,
+    hotkey_runtime: Option<Arc<Mutex<HotkeyRuntime>>>,
+    discard_short_hotkey_capture: Option<Arc<AtomicBool>>,
+) {
     let rec = state.recording.clone();
     let starting = state.starting.clone();
     let stop = state.stop_flag.clone();
@@ -4893,8 +5363,6 @@ pub fn launch_recording(
         );
         crate::sync_tray_state(&app_done);
     });
-
-    Ok(())
 }
 
 pub fn handle_desktop_control_request(
@@ -5202,29 +5670,28 @@ pub fn cmd_start_recording(
     } else {
         requested_intent
     };
+    minutes_core::logging::log_step(
+        "desktop_recording_start",
+        "",
+        0,
+        serde_json::json!({
+            "action": "requested",
+            "mode": format!("{capture_mode:?}"),
+            "intent": requested_intent.map(|intent| format!("{intent:?}")),
+            "source": source,
+            "recording_active": recording_active(&state.recording),
+            "starting": state.starting.load(Ordering::Relaxed),
+        }),
+    );
 
-    // Early-out BEFORE mutating any call-detect session atomics: if another
-    // recording is already in flight, launch_recording will reject this call
-    // anyway, and we must not leave mangled state behind. Previously a
-    // rejected start would still flip `recording_started_by_call_detect` and
-    // cancel an in-flight auto-stop countdown — which is exactly the state
-    // athal7 hit in issue #129: the auto-stop countdown got silently killed
-    // mid-call by a start request that never actually became a recording.
-    if recording_active(&state.recording) || state.starting.load(Ordering::Relaxed) {
-        return Err("Already recording".into());
-    }
+    // Reserve the start BEFORE mutating any call-detect session atomics.
+    // Otherwise a rejected call-detect start (live transcript/dictation already
+    // active, stale starting flag, etc.) can cancel auto-stop state for a
+    // recording that never actually launched.
+    prepare_cmd_recording_launch(&state, from_call_detect)
+        .map_err(|error| reject_recording_launch(&state, error))?;
 
-    // Session-level flag that scopes the stop_when_call_ends auto-stop only
-    // to recordings started via the call detection banner. Manual starts
-    // never get auto-stopped, even when the config flag is on.
-    state
-        .recording_started_by_call_detect
-        .store(from_call_detect, Ordering::Relaxed);
-    // Starting a fresh recording always cancels any in-flight countdown so
-    // the UI doesn't auto-stop a session the user has already moved past.
-    reset_call_end_countdown(&state);
-
-    launch_recording(
+    spawn_reserved_recording(
         app,
         &state,
         capture_mode,
@@ -5234,7 +5701,8 @@ pub fn cmd_start_recording(
         language,
         None,
         None,
-    )
+    );
+    Ok(())
 }
 
 /// Reset countdown lifecycle state for a fresh recording/session boundary.
@@ -5314,6 +5782,7 @@ pub fn cmd_mic_mute_state() -> bool {
 
 fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value {
     let recording = state.recording.load(Ordering::Relaxed);
+    let starting = state.starting.load(Ordering::Relaxed);
     let shared_processing = minutes_core::pid::read_processing_status();
     // Scan ~/.minutes/jobs/ once per status call — `pid::status_with_active_jobs`
     // reuses this snapshot instead of triggering two more directory walks
@@ -5393,6 +5862,7 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
 
     let mut value = serde_json::json!({
         "recording": recording || (status.recording && !processing),
+        "starting": starting,
         "processing": processing,
         "recordingMode": status.recording_mode,
         "processingStage": processing_stage,
@@ -6326,6 +6796,99 @@ pub fn cmd_recovery_items() -> serde_json::Value {
     serde_json::to_value(scan_recovery_items(&config)).unwrap_or(serde_json::json!([]))
 }
 
+fn recovery_retry_mode(retry_type: &str) -> Result<CaptureMode, String> {
+    match retry_type {
+        "meeting" => Ok(CaptureMode::Meeting),
+        "memo" => Ok(CaptureMode::QuickThought),
+        other => Err(format!("Unsupported recovery type: {}", other)),
+    }
+}
+
+#[tauri::command]
+pub fn cmd_retry_all_recovery(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<RecoveryRetryAllResult, String> {
+    if recording_active(&state.recording) || state.starting.load(Ordering::Relaxed) {
+        return Err("Finish the current recording before retrying recovery items.".into());
+    }
+
+    let config = Config::load();
+    let items = scan_recovery_items(&config);
+    let mut queued = 0;
+    let mut first_job = None;
+    let mut failed = Vec::new();
+
+    for item in items {
+        let audio_path = PathBuf::from(&item.path);
+        if !audio_path.exists() {
+            failed.push(RecoveryRetryFailure {
+                path: item.path,
+                error: "Recovery item no longer exists.".into(),
+            });
+            continue;
+        }
+
+        let mode = match recovery_retry_mode(&item.retry_type) {
+            Ok(mode) => mode,
+            Err(error) => {
+                failed.push(RecoveryRetryFailure {
+                    path: item.path,
+                    error,
+                });
+                continue;
+            }
+        };
+
+        // Queue the recovery file IN PLACE. The worker processes it where it
+        // lives; on success `preserve_audio_alongside_output` moves it out of
+        // the recovery folder, and on failure the worker leaves it there so it
+        // stays recoverable. Moving the file into the jobs dir first could
+        // strand it (invisible to recovery scanning) if the app died mid-queue
+        // or the job later failed, since a failed job never returns the file.
+        // `scan_recovery_items` hides items that already have an active job, so
+        // queued items still leave the list without the risky move.
+        match minutes_core::jobs::enqueue_capture_job(
+            mode, None, audio_path, None, None, None, None, None, None, None,
+        ) {
+            Ok(job) => {
+                if first_job.is_none() {
+                    first_job = Some(job.clone());
+                }
+                queued += 1;
+            }
+            Err(error) => {
+                failed.push(RecoveryRetryFailure {
+                    path: item.path,
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+
+    if let Some(job) = first_job {
+        minutes_core::pid::set_processing_status(
+            job.stage.as_deref(),
+            Some(job.mode),
+            job.title.as_deref(),
+            Some(&job.id),
+            minutes_core::jobs::active_job_count(),
+        )
+        .ok();
+        sync_processing_indicator(&state.processing, &state.processing_stage);
+        spawn_processing_worker(
+            app,
+            state.processing.clone(),
+            state.processing_stage.clone(),
+            state.latest_output.clone(),
+            state.activation_progress.clone(),
+            state.completion_notifications_enabled.clone(),
+        );
+    }
+
+    Ok(RecoveryRetryAllResult { queued, failed })
+}
+
 #[tauri::command]
 pub fn cmd_retry_recovery(
     state: tauri::State<AppState>,
@@ -6341,10 +6904,25 @@ pub fn cmd_retry_recovery(
         return Err(format!("Recovery item not found: {}", path));
     }
 
-    let ct = match content_type.as_str() {
-        "meeting" => ContentType::Meeting,
-        "memo" => ContentType::Memo,
-        other => return Err(format!("Unsupported recovery type: {}", other)),
+    // Don't run the pipeline in place on a file that "Retry all" already
+    // queued: a stale single-retry click on the same item would otherwise
+    // double-process it (or race the queued job's in-place source).
+    if minutes_core::jobs::active_jobs()
+        .iter()
+        .any(|job| Path::new(&job.audio_path) == audio_path.as_path())
+    {
+        return Err("This recovery item is already queued for processing.".into());
+    }
+
+    let ct = match recovery_retry_mode(content_type.as_str())? {
+        CaptureMode::Meeting => ContentType::Meeting,
+        CaptureMode::QuickThought => ContentType::Memo,
+        other => {
+            return Err(format!(
+                "Unsupported recovery mode for direct retry: {:?}",
+                other
+            ))
+        }
     };
 
     // Run pipeline on a background thread so the UI stays responsive
@@ -7035,6 +7613,74 @@ fn context_switch_prompt(command: &str, mode: &str, title: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentResolveError {
+    pub name: String,
+    pub unusable_candidates: Vec<PathBuf>,
+}
+
+impl AgentResolveError {
+    fn user_message(&self) -> String {
+        let install_hint = if self.name == "claude" {
+            " Reinstall Claude Code, or choose another assistant in Settings."
+        } else {
+            " Reinstall that assistant CLI, or choose another assistant in Settings."
+        };
+
+        if let Some(path) = self.unusable_candidates.first() {
+            format!(
+                "Recall needs '{}', but the installed copy cannot be run.{} Minutes found the broken copy at {}.",
+                self.name,
+                install_hint,
+                path.display()
+            )
+        } else {
+            let install_hint = if self.name == "claude" {
+                " Install Claude Code, or choose another assistant in Settings."
+            } else {
+                " Install it, or choose another assistant in Settings."
+            };
+            format!(
+                "'{}' was not found on PATH or in common install locations.{} Settings file: {}",
+                self.name,
+                install_hint,
+                user_config_path_for_display(),
+            )
+        }
+    }
+}
+
+fn is_usable_agent_binary(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(windows)]
+    {
+        true
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        true
+    }
+}
+
+fn remember_unusable_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if !candidates.iter().any(|existing| existing == &path) {
+        candidates.push(path);
+    }
+}
+
 /// Resolve an agent name or path to an executable.
 ///
 /// Accepts either:
@@ -7045,11 +7691,16 @@ fn context_switch_prompt(command: &str, mode: &str, title: &str) -> String {
 ///
 /// This is intentionally open: users can set `assistant.agent` to any binary
 /// they want, including wrapper scripts or custom agent CLIs.
-pub fn find_agent_binary(name: &str) -> Option<PathBuf> {
+pub fn resolve_agent_binary(name: &str) -> Result<PathBuf, AgentResolveError> {
+    let mut unusable_candidates = Vec::new();
+
     // If it's an absolute path, check it directly
     let as_path = PathBuf::from(name);
     if as_path.is_absolute() && as_path.exists() {
-        return Some(as_path);
+        if is_usable_agent_binary(&as_path) {
+            return Ok(as_path);
+        }
+        remember_unusable_candidate(&mut unusable_candidates, as_path);
     }
 
     // PATH lookup (cross-platform). On Windows this respects PATHEXT and
@@ -7057,7 +7708,10 @@ pub fn find_agent_binary(name: &str) -> Option<PathBuf> {
     // launched from Finder/Explorer often have a minimal PATH, so the
     // fallback below catches common install dirs that aren't on PATH.
     if let Ok(path) = which::which(name) {
-        return Some(path);
+        if is_usable_agent_binary(&path) {
+            return Ok(path);
+        }
+        remember_unusable_candidate(&mut unusable_candidates, path);
     }
 
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -7099,11 +7753,21 @@ pub fn find_agent_binary(name: &str) -> Option<PathBuf> {
                 candidate.set_extension(ext);
             }
             if candidate.exists() {
-                return Some(candidate);
+                if is_usable_agent_binary(&candidate) {
+                    return Ok(candidate);
+                }
+                remember_unusable_candidate(&mut unusable_candidates, candidate);
             }
         }
     }
-    None
+    Err(AgentResolveError {
+        name: name.into(),
+        unusable_candidates,
+    })
+}
+
+pub fn find_agent_binary(name: &str) -> Option<PathBuf> {
+    resolve_agent_binary(name).ok()
 }
 
 /// Platform-correct path to the user's config file, used in error messages.
@@ -7140,20 +7804,7 @@ pub fn spawn_terminal(
         }
     } else {
         let agent_name = agent_override.unwrap_or(&config.assistant.agent);
-        let agent_bin = find_agent_binary(agent_name).ok_or_else(|| {
-            let install_hint = if agent_name == "claude" {
-                " Install Claude Code with `npm i -g @anthropic-ai/claude-code`."
-            } else {
-                ""
-            };
-            format!(
-                "'{}' not found on PATH or in common install dirs.{} \
-                 Then set the agent in {} under [assistant].",
-                agent_name,
-                install_hint,
-                user_config_path_for_display(),
-            )
-        })?;
+        let agent_bin = resolve_agent_binary(agent_name).map_err(|err| err.user_message())?;
 
         let agent_args = filtered_agent_args(agent_name, &config.assistant.agent_args);
 
@@ -7970,6 +8621,7 @@ mod tests {
 
             for key in [
                 "recording",
+                "starting",
                 "processing",
                 "recordingMode",
                 "processingStage",
@@ -8178,6 +8830,39 @@ mod tests {
         assert_eq!(
             filtered_agent_args("opencode", &args),
             vec!["--model".to_string(), "gpt-5-codex".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_binary_resolver_rejects_non_executable_absolute_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let broken = dir.path().join("claude");
+        fs::write(&broken, "").unwrap();
+        fs::set_permissions(&broken, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = resolve_agent_binary(broken.to_str().unwrap()).unwrap_err();
+        assert_eq!(err.unusable_candidates, vec![broken.clone()]);
+        assert!(err.user_message().contains("installed copy cannot be run"));
+        assert!(err.user_message().contains("choose another assistant"));
+        assert!(find_agent_binary(broken.to_str().unwrap()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_binary_resolver_accepts_executable_absolute_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let executable = dir.path().join("custom-agent");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            resolve_agent_binary(executable.to_str().unwrap()).unwrap(),
+            executable
         );
     }
 
@@ -8912,6 +9597,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_call_processing_input_uses_voice_stem_when_system_missing() {
+        let dir = TempDir::new().unwrap();
+        let mov = dir.path().join("2026-05-19-120148-call.mov");
+        std::fs::write(&mov, b"mov").unwrap();
+        let voice = dir.path().join("2026-05-19-120148-call.voice.wav");
+        write_test_wav(&voice, 48_000, 200_000);
+
+        let input = native_call_processing_input(&mov).expect("processing input");
+
+        assert_eq!(input.path, voice);
+        assert!(
+            input
+                .recovery_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("system-audio stem")),
+            "warning should explain the missing system side"
+        );
+    }
+
+    #[test]
+    fn native_call_processing_input_creates_mov_anchor_for_paired_stems() {
+        let dir = TempDir::new().unwrap();
+        let mov = dir.path().join("2026-05-19-120148-call.mov");
+        let voice = dir.path().join("2026-05-19-120148-call.voice.wav");
+        let system = dir.path().join("2026-05-19-120148-call.system.wav");
+        write_test_wav(&voice, 48_000, 200_000);
+        write_test_wav(&system, 48_000, 200_000);
+
+        let input = native_call_processing_input(&mov).expect("processing input");
+
+        assert_eq!(input.path, mov);
+        assert!(
+            input.path.exists(),
+            "missing .mov should be recreated as a stem anchor"
+        );
+        assert!(
+            input
+                .recovery_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("recovered PCM stems")),
+            "warning should explain stem-anchor recovery"
+        );
+    }
+
     /// Malformed WAV files (non-`fmt `-first chunk, zero byte_rate, or
     /// outright unreadable header) must fall back to the 48 kHz default
     /// threshold rather than letting every stem pass with a 0-byte cutoff
@@ -9380,6 +10110,45 @@ mod tests {
     }
 
     #[test]
+    fn processing_job_view_includes_user_facing_stage_label() {
+        let job = minutes_core::jobs::ProcessingJob {
+            id: "job-summary".into(),
+            title: Some("Design review".into()),
+            mode: CaptureMode::Meeting,
+            content_type: ContentType::Meeting,
+            state: minutes_core::jobs::JobState::Summarizing,
+            stage: Some("summarizing".into()),
+            output_path: Some("/tmp/design-review.md".into()),
+            audio_path: "/tmp/design-review.wav".into(),
+            error: None,
+            created_at: chrono::Local::now(),
+            started_at: Some(chrono::Local::now()),
+            finished_at: None,
+            notice_dismissed_at: None,
+            recording_started_at: None,
+            recording_finished_at: None,
+            context_session_id: None,
+            user_notes: None,
+            pre_context: None,
+            calendar_event: None,
+            template_slug: None,
+            word_count: None,
+            owner_pid: None,
+            retry_count: 0,
+            recording_health: None,
+        };
+
+        let view = processing_job_view(job);
+
+        assert_eq!(view.state, "summarizing");
+        assert_eq!(view.stage.as_deref(), Some("summarizing"));
+        assert_eq!(
+            view.stage_label.as_deref(),
+            Some("Generating meeting summary")
+        );
+    }
+
+    #[test]
     fn parse_optional_string_setting_preserves_auto_detect_state() {
         assert_eq!(parse_optional_string_setting(""), None);
         assert_eq!(parse_optional_string_setting("   "), None);
@@ -9430,6 +10199,105 @@ mod tests {
 
         set_call_detection_sentinel(&mut config, "google-meet", false);
         assert!(!call_detection_has_sentinel(&config, "google-meet"));
+    }
+
+    #[test]
+    fn recording_start_error_notice_has_no_openable_path() {
+        let notice = recording_start_error_notice("ScreenCaptureKit tap unavailable");
+
+        assert_eq!(notice.kind, "error");
+        assert_eq!(notice.title, "Recording not started");
+        assert_eq!(notice.path, "");
+        assert_eq!(notice.detail, "ScreenCaptureKit tap unavailable");
+    }
+
+    #[test]
+    fn rejected_call_detect_start_does_not_mutate_auto_stop_state() {
+        with_temp_home(|_| {
+            let state = test_app_state();
+            state.live_transcript_active.store(true, Ordering::Relaxed);
+            state
+                .call_end_countdown_active
+                .store(true, Ordering::Relaxed);
+            state
+                .call_end_countdown_cancel
+                .store(false, Ordering::Relaxed);
+            state.call_end_countdown_terminal_state.store(
+                CallEndCountdownTerminalState::UserCancelled as u8,
+                Ordering::Relaxed,
+            );
+
+            let result = prepare_cmd_recording_launch(&state, true);
+
+            assert_eq!(
+                result.unwrap_err(),
+                "Live transcript in progress — stop it first"
+            );
+            assert!(!state.starting.load(Ordering::Relaxed));
+            assert!(!state
+                .recording_started_by_call_detect
+                .load(Ordering::Relaxed));
+            assert!(state.call_end_countdown_active.load(Ordering::Relaxed));
+            assert!(!state.call_end_countdown_cancel.load(Ordering::Relaxed));
+            assert_eq!(
+                CallEndCountdownTerminalState::from_u8(
+                    state
+                        .call_end_countdown_terminal_state
+                        .load(Ordering::Relaxed)
+                ),
+                CallEndCountdownTerminalState::UserCancelled
+            );
+        });
+    }
+
+    #[test]
+    fn call_detect_start_mutates_auto_stop_state_only_after_reservation() {
+        with_temp_home(|_| {
+            let state = test_app_state();
+            state
+                .call_end_countdown_active
+                .store(true, Ordering::Relaxed);
+            state
+                .call_end_countdown_cancel
+                .store(false, Ordering::Relaxed);
+            state.call_end_countdown_terminal_state.store(
+                CallEndCountdownTerminalState::UserCancelled as u8,
+                Ordering::Relaxed,
+            );
+
+            prepare_cmd_recording_launch(&state, true).unwrap();
+
+            assert!(state.starting.load(Ordering::Relaxed));
+            assert!(state
+                .recording_started_by_call_detect
+                .load(Ordering::Relaxed));
+            assert!(!state.call_end_countdown_active.load(Ordering::Relaxed));
+            assert!(state.call_end_countdown_cancel.load(Ordering::Relaxed));
+            assert_eq!(
+                CallEndCountdownTerminalState::from_u8(
+                    state
+                        .call_end_countdown_terminal_state
+                        .load(Ordering::Relaxed)
+                ),
+                CallEndCountdownTerminalState::None
+            );
+
+            state.starting.store(false, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn rejected_recording_launch_sets_visible_error_notice() {
+        let state = test_app_state();
+
+        let error = reject_recording_launch(&state, "Dictation in progress — stop it first".into());
+
+        assert_eq!(error, "Dictation in progress — stop it first");
+        let notice = state.latest_output.lock().unwrap().clone().unwrap();
+        assert_eq!(notice.kind, "error");
+        assert_eq!(notice.title, "Recording not started");
+        assert_eq!(notice.path, "");
+        assert_eq!(notice.detail, "Dictation in progress — stop it first");
     }
 
     #[test]
@@ -11068,14 +11936,20 @@ pub fn cmd_stop_live_transcript(state: tauri::State<AppState>) -> Result<(), Str
             .store(true, Ordering::Relaxed);
         return Ok(());
     }
-    // Check for external live transcript (started from CLI)
+    // Check for external live transcript (started from CLI). `inspect_pid_file`
+    // so a session holding the PID under a mandatory Windows lock is detected; the
+    // stop sentinel (polled inline by the live loop) stops it on any platform, and
+    // the Unix SIGTERM is sent only when the PID is readable. See #258.
     let lt_pid = minutes_core::pid::live_transcript_pid_path();
-    if let Ok(Some(pid)) = minutes_core::pid::check_pid_file(&lt_pid) {
+    let lt_state = minutes_core::pid::inspect_pid_file(&lt_pid);
+    if lt_state.is_active() {
         minutes_core::pid::write_stop_sentinel()
             .map_err(|e| format!("failed to write stop sentinel: {}", e))?;
         #[cfg(unix)]
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
+        if let Some(pid) = lt_state.pid() {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
         }
         return Ok(());
     }

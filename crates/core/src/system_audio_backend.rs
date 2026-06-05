@@ -795,7 +795,7 @@ fn core_audio_error(context: &str, error: impl std::fmt::Display) -> CaptureErro
     CaptureError::Io(std::io::Error::other(format!("{context}: {error}")))
 }
 
-#[cfg(any(not(target_os = "macos"), not(feature = "streaming")))]
+#[cfg(all(target_os = "macos", not(feature = "streaming")))]
 fn core_audio_tap_probe(_secs: u32) -> Result<ProbeResult, CaptureError> {
     Ok(ProbeResult {
         observed_signal: ObservedSignal {

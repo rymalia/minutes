@@ -267,16 +267,36 @@ pub fn job_capture_path(job_id: &str) -> PathBuf {
     jobs_dir().join(format!("{}.wav", job_id))
 }
 
+fn job_capture_path_for_source(job_id: &str, source: &Path) -> PathBuf {
+    let ext = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("wav");
+    jobs_dir().join(format!("{}.{}", job_id, ext))
+}
+
 pub fn create_worker_guard() -> Result<PidGuard, crate::error::PidError> {
     pid::create_pid_guard(&worker_pid_path())
 }
 
+/// The worker PID when readable. NOTE: this cannot detect a `LockedAlive` worker
+/// on Windows (the lock makes the PID unreadable). For a presence check, prefer
+/// [`worker_active`], which is correct on every platform.
 pub fn current_worker_pid() -> Option<u32> {
     pid::check_pid_file(&worker_pid_path()).ok().flatten()
 }
 
+/// Whether a background worker is currently running. Uses `inspect_pid_file` so a
+/// worker holding its PID file under a mandatory Windows lock is still detected —
+/// `current_worker_pid` would read the locked file as absent and let a duplicate
+/// worker spawn. See #258 and `pid::PidFileState`.
+pub fn worker_active() -> bool {
+    pid::inspect_pid_file(&worker_pid_path()).is_active()
+}
+
 pub fn move_capture_into_job(job_id: &str, current_wav: &Path) -> std::io::Result<PathBuf> {
-    let dest = job_capture_path(job_id);
+    let dest = job_capture_path_for_source(job_id, current_wav);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -627,7 +647,12 @@ fn list_archive_jobs() -> Vec<ProcessingJob> {
 /// process restarts; tests get fresh state because each `with_temp_home`
 /// gives them an isolated `~/.minutes/`.
 fn ensure_archive_initialized() {
-    let marker = jobs_dir().join(MIGRATION_MARKER);
+    let root = jobs_dir();
+    if let Err(error) = fs::create_dir_all(&root) {
+        tracing::warn!(error = %error, "failed to initialize jobs directory");
+        return;
+    }
+    let marker = root.join(MIGRATION_MARKER);
     if marker.exists() {
         return;
     }
@@ -1014,8 +1039,9 @@ fn terminal_state_for_artifact(artifact: &pipeline::TranscriptArtifact) -> JobSt
     }
 }
 
-/// Move the captured WAV alongside the output markdown so users can reprocess later.
+/// Move the captured audio alongside the output markdown so users can reprocess later.
 /// e.g. ~/meetings/2026-04-02-standup.md → ~/meetings/2026-04-02-standup.wav
+/// or, for native call captures, ~/meetings/2026-04-02-call.mov.
 fn preserve_audio_alongside_output(job: &ProcessingJob) {
     let Some(ref output_path) = job.output_path else {
         return;
@@ -1025,7 +1051,10 @@ fn preserve_audio_alongside_output(job: &ProcessingJob) {
     if !audio_src.exists() {
         return;
     }
-    let audio_dest = output.with_extension("wav");
+    let audio_dest = match audio_src.extension().filter(|ext| !ext.is_empty()) {
+        Some(ext) => output.with_extension(ext),
+        None => output.with_extension("wav"),
+    };
     if let Err(e) = fs::rename(&audio_src, &audio_dest) {
         // rename fails across filesystems; fall back to copy + delete
         if let Err(e2) = fs::copy(&audio_src, &audio_dest) {
@@ -1483,6 +1512,48 @@ mod tests {
     }
 
     #[test]
+    fn queue_live_capture_preserves_native_mov_extension_and_stems() {
+        with_temp_home(|tmp| {
+            let native_dir = tmp.path().join(".minutes/native-captures");
+            fs::create_dir_all(&native_dir).unwrap();
+            let current_mov = native_dir.join("2026-05-19-120148-call.mov");
+            fs::write(&current_mov, b"mov-placeholder").unwrap();
+
+            let stems = crate::capture::stem_paths_for(&current_mov).unwrap();
+            fs::write(&stems.voice, b"voice").unwrap();
+            fs::write(&stems.system, b"system").unwrap();
+
+            let job = queue_live_capture(
+                CaptureMode::Meeting,
+                Some("Native call".into()),
+                &current_mov,
+                None,
+                None,
+                Some(Local::now()),
+                Some(Local::now()),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let job_audio = PathBuf::from(&job.audio_path);
+            assert_eq!(
+                job_audio.extension().and_then(|ext| ext.to_str()),
+                Some("mov")
+            );
+            assert!(job_audio.exists());
+            assert!(!current_mov.exists());
+
+            let moved_stems = crate::capture::stem_paths_for(&job_audio).unwrap();
+            assert!(moved_stems.voice.exists());
+            assert!(moved_stems.system.exists());
+            assert!(!stems.voice.exists());
+            assert!(!stems.system.exists());
+        });
+    }
+
+    #[test]
     fn queue_live_capture_persists_recording_health() {
         with_temp_home(|_| {
             let current_wav = pid::current_wav_path();
@@ -1563,6 +1634,64 @@ mod tests {
             let preserved_audio = output_path.with_extension("wav");
             let preserved_stems = crate::capture::stem_paths_for(&preserved_audio).unwrap();
             assert!(preserved_audio.exists());
+            assert!(preserved_stems.voice.exists());
+            assert!(preserved_stems.system.exists());
+            assert!(!audio_path.exists());
+            assert!(!stems.voice.exists());
+            assert!(!stems.system.exists());
+        });
+    }
+
+    #[test]
+    fn preserve_audio_alongside_output_preserves_native_mov_extension_and_stems() {
+        with_temp_home(|tmp| {
+            let jobs_root = jobs_dir();
+            fs::create_dir_all(&jobs_root).unwrap();
+
+            let audio_path = jobs_root.join("job-preserve-native.mov");
+            fs::write(&audio_path, b"mov-anchor").unwrap();
+            let stems = crate::capture::stem_paths_for(&audio_path).unwrap();
+            fs::write(&stems.voice, b"voice").unwrap();
+            fs::write(&stems.system, b"system").unwrap();
+
+            let output_path = tmp.path().join("meetings/native-final.md");
+            fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+            fs::write(&output_path, "# native final").unwrap();
+
+            let job = ProcessingJob {
+                id: "job-preserve-native".into(),
+                mode: CaptureMode::Meeting,
+                content_type: ContentType::Meeting,
+                title: Some("preserve native".into()),
+                audio_path: audio_path.display().to_string(),
+                output_path: Some(output_path.display().to_string()),
+                state: JobState::Complete,
+                stage: None,
+                created_at: Local::now(),
+                started_at: None,
+                finished_at: None,
+                notice_dismissed_at: None,
+                recording_started_at: None,
+                recording_finished_at: None,
+                context_session_id: None,
+                user_notes: None,
+                pre_context: None,
+                calendar_event: None,
+                template_slug: None,
+                recording_health: None,
+                word_count: None,
+                error: None,
+                owner_pid: None,
+                retry_count: 0,
+            };
+            write_job(&job).unwrap();
+
+            preserve_audio_alongside_output(&job);
+
+            let preserved_audio = output_path.with_extension("mov");
+            let preserved_stems = crate::capture::stem_paths_for(&preserved_audio).unwrap();
+            assert!(preserved_audio.exists());
+            assert!(!output_path.with_extension("wav").exists());
             assert!(preserved_stems.voice.exists());
             assert!(preserved_stems.system.exists());
             assert!(!audio_path.exists());
@@ -2094,6 +2223,23 @@ mod tests {
             assert!(
                 job_path(&later.id).exists(),
                 "post-marker terminal jobs are routed by update_job_state, not by migration"
+            );
+        });
+    }
+
+    #[test]
+    fn ensure_archive_initialized_writes_marker_when_jobs_dir_is_missing() {
+        with_temp_home(|_| {
+            assert!(
+                !jobs_dir().exists(),
+                "fresh installs should start without a jobs directory"
+            );
+
+            ensure_archive_initialized();
+
+            assert!(
+                jobs_dir().join(MIGRATION_MARKER).exists(),
+                "fresh installs should still record a quiet successful migration"
             );
         });
     }

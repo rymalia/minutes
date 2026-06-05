@@ -115,6 +115,7 @@ minutes note "Logan agreed"                       # LLM weights your notes heavi
 ### Process voice memos
 ```bash
 minutes process ~/Downloads/voice-memo.m4a        # Any audio format
+minutes process ~/.minutes/native-captures/2026-05-19-120148-call.voice.wav --type meeting
 minutes watch                                     # Auto-process new files in inbox
 ```
 
@@ -390,6 +391,8 @@ This adds `device` and `captured_at` to the meeting's frontmatter. Works with an
 
 Supports `.m4a`, `.mp3`, `.wav`, `.ogg`, `.webm`. Format conversion is automatic — uses [ffmpeg](https://ffmpeg.org/) when available (recommended for non-English audio), falls back to [symphonia](https://github.com/pdeljanov/Symphonia).
 
+If a desktop call capture leaves a raw file under `~/.minutes/native-captures/`, process that audio file directly with `minutes process <path> --type meeting`. For compatibility, `minutes import <audio-file>` also routes to the same meeting-processing path; `minutes import granola` remains the Granola history importer.
+
 ### Vault sync (Obsidian / Logseq)
 
 ```bash
@@ -519,7 +522,7 @@ command = "npx"
 args = ["minutes-mcp"]
 ```
 
-All 29 tools are available in Vibe as `minutes_*` (e.g. `minutes_start_recording`, `minutes_search_meetings`).
+All 31 tools are available in Vibe as `minutes_*` (e.g. `minutes_start_recording`, `minutes_search_meetings`).
 
 ### Claude Code (Plugin)
 
@@ -1129,13 +1132,13 @@ agent_args = []           # Optional extra args, e.g. ["--dangerously-skip-permi
 
 ```
 minutes/
-├── crates/core/          45 Rust modules — the engine (shared by all interfaces)
+├── crates/core/          53 Rust modules — the engine (shared by all interfaces)
 ├── crates/cli/           CLI binary — 52 commands (recording, search, health, storage, templates, workflows)
 ├── crates/whisper-guard/ Anti-hallucination toolkit (VAD gating, dedup, noise trimming)
 ├── crates/reader/        Lightweight read-only meeting parser (no audio deps)
 ├── crates/assets/        Bundled assets (demo.wav)
 ├── crates/sdk/           TypeScript SDK — `npm install minutes-sdk` (query meetings programmatically)
-├── crates/mcp/           MCP server — 29 tools + 7 resources + interactive dashboard
+├── crates/mcp/           MCP server — 31 tools + 7 resources + interactive dashboard
 │   └── ui/               MCP App dashboard (vanilla TS → single-file HTML)
 ├── tauri/                Menu bar app — system tray, recording UI, singleton AI Assistant
 └── .claude/plugins/minutes/   Claude Code plugin — 19 skills + 1 agent + 2 hooks

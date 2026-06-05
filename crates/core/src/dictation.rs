@@ -231,9 +231,10 @@ where
         return Err(DictationError::RecordingActive.into());
     }
 
-    // Check for conflicts: live transcript must not be active
+    // Check for conflicts: live transcript must not be active. `inspect_pid_file`
+    // so a session holding the PID under a mandatory Windows lock is detected. #258.
     let lt_pid = pid::live_transcript_pid_path();
-    if let Ok(Some(_)) = pid::check_pid_file(&lt_pid) {
+    if pid::inspect_pid_file(&lt_pid).is_active() {
         return Err(DictationError::LiveTranscriptActive.into());
     }
 
@@ -658,15 +659,15 @@ fn parakeet_dictation_ready(config: &Config) -> bool {
 
 #[cfg(feature = "whisper")]
 fn finalize_dictation_transcription(
-    config: &Config,
-    final_backend: DictationFinalBackend,
-    final_utterance_samples: &[f32],
+    _config: &Config,
+    _final_backend: DictationFinalBackend,
+    _final_utterance_samples: &[f32],
     streaming: &mut StreamingWhisper,
     whisper_ctx: &whisper_rs::WhisperContext,
 ) -> Option<StreamingResult> {
     #[cfg(target_os = "macos")]
-    if final_backend == DictationFinalBackend::AppleSpeech {
-        match transcribe_utterance_with_apple_speech(final_utterance_samples, config) {
+    if _final_backend == DictationFinalBackend::AppleSpeech {
+        match transcribe_utterance_with_apple_speech(_final_utterance_samples, _config) {
             Ok(Some(result)) => return Some(result),
             Ok(None) => {}
             Err(error) => {
@@ -679,8 +680,8 @@ fn finalize_dictation_transcription(
     }
 
     #[cfg(feature = "parakeet")]
-    if final_backend == DictationFinalBackend::Parakeet {
-        match transcribe_utterance_with_parakeet(final_utterance_samples, config) {
+    if _final_backend == DictationFinalBackend::Parakeet {
+        match transcribe_utterance_with_parakeet(_final_utterance_samples, _config) {
             Ok(Some(result)) => return Some(result),
             Ok(None) => {}
             Err(error) => {
