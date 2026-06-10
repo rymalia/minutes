@@ -1494,7 +1494,10 @@ fn trim_front(buffer: &mut Vec<f32>, max_len: usize) {
     }
 }
 
-#[cfg(all(feature = "whisper", any(feature = "parakeet", target_os = "macos")))]
+// Gated on `whisper` alone: its only caller (`transcribe_utterance_for_sidecar`)
+// is cfg(feature = "whisper"), and a narrower gate breaks Linux default-feature
+// builds (whisper on, parakeet off, not macOS).
+#[cfg(feature = "whisper")]
 fn transcribe_with_whisper_for_live_sidecar(
     samples: &[f32],
     whisper_ctx: &whisper_rs::WhisperContext,
