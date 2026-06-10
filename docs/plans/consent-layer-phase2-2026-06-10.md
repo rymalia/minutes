@@ -10,7 +10,7 @@ Builds on: `consent-layer-spec-2026-06-04.md` (v1, shipped in #276 at `0322c64`)
 Two curves are moving at different speeds:
 
 - **Adoption**: default-on workplace recording is normalizing (ambient notetakers,
-  meeting bots, wearables). a16z's "Everything is Recorded Now" (Torenberg, June 2026)
+  meeting bots, wearables). a16z's "Everything is Recorded Now" (David Haber, June 2026)
   is the category's bull case, and it names the gap itself: governance gets
   "retrofitted on top" after the fact.
 - **Governance demand**: lags adoption but is steeper when it kicks. EU AI Act
