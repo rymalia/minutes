@@ -331,7 +331,7 @@ export default function Home() {
 
         <p className="mx-auto mt-12 max-w-[620px] rounded-[5px] border border-[color:var(--border)] bg-[var(--bg-elevated)] px-4 py-3 font-mono text-[12px] leading-5 text-[var(--text-secondary)]">
           <span className="text-[var(--accent)]">v{MINUTES_RELEASE_VERSION}</span>{" "}
-          adds sensitive no-capture meetings, a desktop Require-consent gate, truthful calendar status, and in-window Cmd+K.{" "}
+          fixes desktop ffmpeg resolution, loads the whisper model once per file instead of once per silence gap, and keeps dev-build Gatekeeper seals valid.{" "}
           <a
             href={`https://github.com/silverstein/minutes/releases/tag/v${MINUTES_RELEASE_VERSION}`}
             className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"
@@ -644,9 +644,9 @@ export default function Home() {
             </p>
             <p className="mt-3 text-[14px] leading-6 text-[var(--text-secondary)]">
               Every recording stamps its consent basis into the file&apos;s
-              frontmatter. An optional disclosure reminder shows before each
-              meeting, and Require mode blocks CLI recording until consent is
-              confirmed.
+              frontmatter. Sensitive meetings capture no audio but keep
+              structured notes, and Require mode blocks every desktop and CLI
+              entry point until consent is confirmed.
             </p>
           </div>
           <div className="rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-5 shadow-[var(--shadow-panel)]">
@@ -654,9 +654,9 @@ export default function Home() {
               Next
             </p>
             <p className="mt-3 text-[14px] leading-6 text-[var(--text-secondary)]">
-              Sensitive meetings that never touch the recorder but still produce
-              structured notes, and retention rules the corpus enforces on its
-              own audio.
+              Retention rules the corpus enforces on its own audio, and
+              enforcement of the sensitivity contract across every agent
+              surface, not just the debrief path.
             </p>
           </div>
           <div className="rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-5 shadow-[var(--shadow-panel)]">
