@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Minutes — build → link → run, and the three front-ends</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  /* ============ THEME — blueprint ============ */
+  :root {
+    --font-body: 'Space Grotesk', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+
+    --bg: #e9eef5;
+    --grid: rgba(37, 99, 235, 0.07);
+    --surface: #ffffff;
+    --surface2: #f3f6fb;
+    --border: rgba(20, 35, 59, 0.10);
+    --border-bright: rgba(20, 35, 59, 0.20);
+    --text: #14233b;
+    --text-dim: #56688a;
+
+    --core: #0d9488;      /* minutes-core */
+    --core-dim: rgba(13, 148, 136, 0.10);
+    --cli: #2563eb;       /* CLI */
+    --cli-dim: rgba(37, 99, 235, 0.10);
+    --app: #7c3aed;       /* Tauri app */
+    --app-dim: rgba(124, 58, 237, 0.10);
+    --mcp: #d97706;       /* MCP */
+    --mcp-dim: rgba(217, 119, 6, 0.10);
+    --danger: #dc2626;
+    --danger-dim: rgba(220, 38, 38, 0.10);
+    --ok: #15803d;
+    --ok-dim: rgba(21, 128, 61, 0.12);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0a1120;
+      --grid: rgba(96, 165, 250, 0.06);
+      --surface: #111c30;
+      --surface2: #16243d;
+      --border: rgba(220, 230, 245, 0.10);
+      --border-bright: rgba(220, 230, 245, 0.22);
+      --text: #dbe6f5;
+      --text-dim: #8aa0c2;
+
+      --core: #2dd4bf;
+      --core-dim: rgba(45, 212, 191, 0.14);
+      --cli: #60a5fa;
+      --cli-dim: rgba(96, 165, 250, 0.14);
+      --app: #c4b5fd;
+      --app-dim: rgba(196, 181, 253, 0.14);
+      --mcp: #fbbf24;
+      --mcp-dim: rgba(251, 191, 36, 0.14);
+      --danger: #f87171;
+      --danger-dim: rgba(248, 113, 113, 0.14);
+      --ok: #4ade80;
+      --ok-dim: rgba(74, 222, 128, 0.14);
+    }
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  *, *::before, *::after { min-width: 0; }
+
+  body {
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 28px 28px;
+    color: var(--text);
+    font-family: var(--font-body);
+    padding: 44px 40px 80px;
+    min-height: 100vh;
+    line-height: 1.5;
+  }
+
+  @keyframes fadeUp { from { opacity:0; transform: translateY(12px);} to {opacity:1; transform:none;} }
+  .animate { animation: fadeUp .45s ease-out both; animation-delay: calc(var(--i,0)*.06s); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration:.01ms!important; animation-delay:0ms!important; transition-duration:.01ms!important; }
+  }
+
+  .container { max-width: 1080px; margin: 0 auto; }
+
+  .eyebrow {
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: 2px;
+    text-transform: uppercase; color: var(--cli); margin-bottom: 10px;
+  }
+  h1 { font-size: 36px; font-weight: 700; letter-spacing: -1px; text-wrap: balance; margin-bottom: 8px; }
+  .subtitle { color: var(--text-dim); font-family: var(--font-mono); font-size: 12.5px; margin-bottom: 26px; }
+
+  .description { font-size: 14.5px; line-height: 1.7; color: var(--text-dim); margin-bottom: 28px; max-width: 760px; }
+  .description code, .callout code, td code, .legend code {
+    font-family: var(--font-mono); font-size: .85em; background: var(--cli-dim);
+    color: var(--cli); padding: 1px 5px; border-radius: 3px; word-break: break-word;
+  }
+
+  h2 {
+    font-size: 13px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--text); margin: 38px 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--border-bright);
+  }
+
+  /* ============ MERMAID ============ */
+  .mermaid-wrap {
+    position: relative; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 28px 20px; overflow: auto; margin-bottom: 12px;
+    scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+  .mermaid-wrap::-webkit-scrollbar { width: 7px; height: 7px; }
+  .mermaid-wrap::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 4px; }
+  .mermaid-wrap .mermaid { display: flex; justify-content: center; transition: transform .2s ease; transform-origin: top center; }
+  .mermaid-wrap.is-zoomed { cursor: grab; }
+  .mermaid-wrap.is-panning { cursor: grabbing; user-select: none; }
+
+  .zoom-controls {
+    position: absolute; top: 10px; right: 10px; display: flex; gap: 2px; z-index: 10;
+    background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; padding: 2px;
+  }
+  .zoom-controls button {
+    width: 28px; height: 28px; border: none; background: transparent; color: var(--text-dim);
+    font-family: var(--font-mono); font-size: 15px; cursor: pointer; border-radius: 5px;
+    display: flex; align-items: center; justify-content: center; transition: background .15s, color .15s;
+  }
+  .zoom-controls button:hover { background: var(--border); color: var(--text); }
+
+  .mermaid .nodeLabel { font-family: var(--font-body) !important; font-size: 14px !important; line-height: 1.45 !important; }
+  .mermaid .cluster-label .nodeLabel, .mermaid .cluster span { font-family: var(--font-mono) !important; font-weight: 700 !important; }
+  .mermaid .edgeLabel { font-family: var(--font-mono) !important; font-size: 12px !important; }
+  .mermaid .node rect, .mermaid .node polygon { stroke-width: 1.5px !important; }
+
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 14px 2px 0; }
+  .legend-item { display: flex; align-items: center; gap: 7px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
+  .legend-swatch { width: 13px; height: 13px; border-radius: 3px; flex: none; }
+
+  /* ============ TABLE ============ */
+  .table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th {
+    position: sticky; top: 0; background: var(--surface2); text-align: left;
+    font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+    color: var(--text-dim); padding: 12px 16px; border-bottom: 1px solid var(--border-bright); white-space: nowrap;
+  }
+  tbody td { padding: 12px 16px; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: break-word; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:nth-child(even) { background: var(--surface2); }
+  tbody tr:hover { background: var(--cli-dim); }
+  td.num { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .src { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
+
+  .badge { font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 999px; white-space: nowrap; }
+  .b-core { background: var(--core-dim); color: var(--core); }
+  .b-cli  { background: var(--cli-dim);  color: var(--cli); }
+  .b-app  { background: var(--app-dim);  color: var(--app); }
+  .b-mcp  { background: var(--mcp-dim);  color: var(--mcp); }
+  .b-ok   { background: var(--ok-dim);   color: var(--ok); }
+  .b-warn { background: var(--danger-dim); color: var(--danger); }
+
+  .callout {
+    background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--cli);
+    border-radius: 0 10px 10px 0; padding: 16px 20px; font-size: 13.5px; line-height: 1.65;
+    color: var(--text-dim); margin-top: 16px;
+  }
+  .callout + .callout { margin-top: 10px; }
+  .callout.warn { border-left-color: var(--danger); }
+  .callout.ok { border-left-color: var(--ok); }
+  .callout strong { color: var(--text); }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } body { padding: 20px 16px 60px; } h1 { font-size: 25px; } }
+
+  .foot { margin-top: 40px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); line-height: 1.8; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="eyebrow animate" style="--i:0">minutes · verified from source @ 0.18.14</div>
+  <h1 class="animate" style="--i:1">build → link → run</h1>
+  <p class="subtitle animate" style="--i:2">one library crate, two binaries that embed it, one TypeScript server that shells out</p>
+
+  <p class="description animate" style="--i:3">
+    <code>minutes-core</code> is a <strong>library crate</strong> — it has no <code>main()</code> and compiles to a
+    <code>.rlib</code>, so it cannot run on its own. <code>minutes-cli</code> and <code>minutes-app</code> are
+    <strong>binary crates</strong> that depend on it via a local <code>path</code> dependency. At link time the compiler
+    copies core's compiled code <em>into</em> each binary (static linking) — so each binary carries its own embedded copy.
+    The MCP server is the asterisk: it is TypeScript, embeds nothing, and reaches core by running the <code>minutes</code> CLI.
+  </p>
+
+  <div class="mermaid-wrap animate" style="--i:4">
+    <div class="zoom-controls">
+      <button onclick="zoomDiagram(this,1.2)" title="Zoom in">+</button>
+      <button onclick="zoomDiagram(this,0.8)" title="Zoom out">&minus;</button>
+      <button onclick="resetZoom(this)" title="Reset">&#8634;</button>
+    </div>
+    <pre class="mermaid">
+flowchart TD
+  subgraph S1["1 · SOURCE — one repo checkout, everything 0.18.14"]
+    direction TB
+    CORE["minutes-core<br/>crates/core/ · library crate<br/>version.workspace = true<br/>no main() · compiles to .rlib"]
+    CLIS["minutes-cli<br/>crates/cli/ → bin 'minutes'<br/>dep: path = ../core"]
+    APPS["minutes-app<br/>tauri/src-tauri/ → bin 'minutes-app'<br/>dep: path = ../../crates/core"]
+    CLIS -. "links" .-> CORE
+    APPS -. "links" .-> CORE
+  end
+  S1 ==&gt; S2
+  subgraph S2["2 · COMPILE — cargo build (release: strip=true, lto=thin)"]
+    direction TB
+    RLIB["libminutes_core-(hash).rlib<br/>target/release/deps/<br/>build intermediate · never installed · never run"]
+  end
+  S2 ==&gt; S3
+  subgraph S3["3 · LINK — core copied INTO each binary (static)"]
+    direction TB
+    BCLI["target/release/minutes<br/>cli code + COPY of core<br/>≈ 32 MB"]
+    BAPP["target/release/minutes-app<br/>app code + COPY of core + Tauri/WebView<br/>≈ 47 MB"]
+  end
+  S3 ==&gt; S4
+  subgraph S4["4 · INSTALL — separate channels, can drift in version"]
+    direction TB
+    ICLI["~/.local/bin/minutes → 0.18.6<br/>~/.cargo/bin/minutes → 0.18.5"]
+    IAPP["/Applications/Minutes.app<br/>Contents/MacOS/minutes-app · built Jun 2"]
+  end
+  S4 ==&gt; S5
+  subgraph S5["5 · RUN — process names you would see"]
+    direction TB
+    PCLI["process: minutes"]
+    PAPP["process: minutes-app"]
+    PSC["child: example-server<br/>(parakeet warm-sidecar path)"]
+    NOCORE["✗ no 'minutes-core' process<br/>it is baked-in library code"]
+  end
+  MCP["minutes-mcp · TypeScript<br/>embeds NO core<br/>execFile('minutes', …) → CLI on PATH"]
+  MCP -. "shells out" .-> ICLI
+
+  classDef core fill:#0d948814,stroke:#0d9488,color:#0d9488,stroke-width:1.5px;
+  classDef cli fill:#2563eb14,stroke:#2563eb,color:#2563eb,stroke-width:1.5px;
+  classDef app fill:#7c3aed14,stroke:#7c3aed,color:#7c3aed,stroke-width:1.5px;
+  classDef mcp fill:#d9770614,stroke:#d97706,color:#b45309,stroke-width:1.5px;
+  classDef warn fill:#dc262614,stroke:#dc2626,color:#dc2626,stroke-width:1.5px;
+  classDef neutral fill:#56688a14,stroke:#56688a,color:#56688a,stroke-width:1.5px;
+  class CORE,RLIB core;
+  class CLIS,BCLI,ICLI,PCLI cli;
+  class APPS,BAPP,IAPP,PAPP app;
+  class MCP mcp;
+  class NOCORE warn;
+  class PSC neutral;
+    </pre>
+  </div>
+
+  <div class="legend animate" style="--i:5">
+    <div class="legend-item"><span class="legend-swatch" style="background:var(--core)"></span> minutes-core (library)</div>
+    <div class="legend-item"><span class="legend-swatch" style="background:var(--cli)"></span> CLI lineage</div>
+    <div class="legend-item"><span class="legend-swatch" style="background:var(--app)"></span> Tauri app lineage</div>
+    <div class="legend-item"><span class="legend-swatch" style="background:var(--mcp)"></span> MCP (shells out)</div>
+    <div class="legend-item"><span class="legend-swatch" style="background:var(--danger)"></span> not a runtime entity</div>
+  </div>
+
+  <h2 class="animate" style="--i:6">Verified evidence — every claim above, traced to a file or command</h2>
+  <div class="table-wrap animate" style="--i:6">
+    <table>
+      <thead>
+        <tr><th>What</th><th>Verified value</th><th>Source (this session)</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="badge b-core">core</span> is a library crate</td>
+          <td>No <code>[[bin]]</code>; <code>version.workspace = true</code>; produces <code>.rlib</code></td>
+          <td class="src">crates/core/Cargo.toml</td>
+        </tr>
+        <tr>
+          <td><span class="badge b-core">core</span> .rlib exists only as build scrap</td>
+          <td><code>libminutes_core-(hash).rlib</code> + <code>.rmeta</code>, multiple hashes</td>
+          <td class="src">find target/release/deps</td>
+        </tr>
+        <tr>
+          <td><span class="badge b-cli">cli</span> depends on core by path</td>
+          <td><code>path = "../core"</code> (the <code>version="0.18.6"</code> is a crates.io floor, ignored for path builds)</td>
+          <td class="src">crates/cli/Cargo.toml</td>
+        </tr>
+        <tr>
+          <td><span class="badge b-app">app</span> depends on core by path</td>
+          <td><code>path = "../../crates/core"</code>, features <code>["streaming","diarize"]</code></td>
+          <td class="src">tauri/src-tauri/Cargo.toml</td>
+        </tr>
+        <tr>
+          <td>release strips symbols</td>
+          <td><code>strip = true</code>, <code>lto = "thin"</code> (why <code>nm</code> finds 0 core symbols though code is embedded)</td>
+          <td class="src">Cargo.toml [profile.release]</td>
+        </tr>
+        <tr>
+          <td><span class="badge b-cli">cli</span> binary #1 (on PATH)</td>
+          <td class="num">32,201,968 B · v0.18.6</td>
+          <td class="src">~/.local/bin/minutes · capabilities --json</td>
+        </tr>
+        <tr>
+          <td><span class="badge b-cli">cli</span> binary #2 (older)</td>
+          <td class="num">32,917,776 B · v0.18.5</td>
+          <td class="src">~/.cargo/bin/minutes · capabilities --json</td>
+        </tr>
+        <tr>
+          <td><span class="badge b-app">app</span> real executable</td>
+          <td class="num">46,967,968 B · built Jun 2</td>
+          <td class="src">/Applications/Minutes.app/Contents/MacOS/minutes-app</td>
+        </tr>
+        <tr>
+          <td><span class="badge b-warn">stub</span> bundle's "minutes" file</td>
+          <td>52 B POSIX shell script: <code>echo 'minutes CLI placeholder'; exit 1</code> (this build ships no real CLI inside the bundle)</td>
+          <td class="src">file …/MacOS/minutes</td>
+        </tr>
+        <tr>
+          <td><span class="badge b-mcp">mcp</span> reaches core via the CLI</td>
+          <td>"All tools use execFile to shell out to the <code>minutes</code> CLI binary"; <code>findMinutesBinary()</code></td>
+          <td class="src">crates/mcp/src/index.ts:29, :478</td>
+        </tr>
+        <tr>
+          <td>parakeet is compile-time, per binary</td>
+          <td><code>#[cfg(feature="parakeet")]</code> dispatch; else <code>EngineNotAvailable("parakeet")</code></td>
+          <td class="src">crates/core/src/transcribe.rs:330, 673, 723</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 class="animate" style="--i:7">Where the version number lives</h2>
+  <div class="table-wrap animate" style="--i:7">
+    <table>
+      <thead>
+        <tr><th>Crate / artifact</th><th>How it declares version</th><th>Resolves to</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>[workspace.package]</code></td><td>literal — the single source of truth</td><td><span class="badge b-ok">0.18.14</span></td></tr>
+        <tr><td><span class="badge b-core">core</span> crates/core</td><td><code>version.workspace = true</code></td><td><span class="badge b-ok">0.18.14</span></td></tr>
+        <tr><td><span class="badge b-cli">cli</span> crates/cli</td><td><code>version.workspace = true</code></td><td><span class="badge b-ok">0.18.14</span></td></tr>
+        <tr><td><span class="badge b-app">app</span> tauri/src-tauri Cargo.toml</td><td><code>version = "0.1.0"</code> — vestigial, not user-facing</td><td>0.1.0</td></tr>
+        <tr><td><span class="badge b-app">app</span> tauri.conf.json</td><td>the real app version (hand-synced)</td><td><span class="badge b-ok">0.18.14</span></td></tr>
+        <tr><td>mcp / sdk / manifest.json</td><td>npm + bundle manifests</td><td><span class="badge b-ok">0.18.14</span></td></tr>
+        <tr><td>crates/whisper-guard</td><td><strong>independent cadence</strong> — bumped & published separately</td><td>0.3.0</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 class="animate" style="--i:8">Two axes of "can they be out of sync?"</h2>
+  <div class="grid2">
+    <div class="callout ok animate" style="--i:8">
+      <strong>Within one checkout → No.</strong> Both binaries use a <code>path</code> dependency on the same
+      <code>crates/core/</code> folder, and core inherits the one workspace version. At a given commit there is exactly
+      one core source, so cli and app embed an <em>identical</em> core. They cannot diverge from the same tree.
+    </div>
+    <div class="callout warn animate" style="--i:9">
+      <strong>Across install moments → Yes.</strong> The installed CLI and app update through separate channels, so the
+      artifacts on disk drift. Proven on this machine: two CLIs at <code>0.18.6</code> / <code>0.18.5</code>, and an app
+      executable built Jun 2 — three different points in time, three potentially different cores.
+    </div>
+  </div>
+
+  <div class="callout animate" style="--i:10">
+    <strong>The litmus test.</strong> "Where is the <code>minutes-core</code> executable installed?" — trick question:
+    there isn't one. It is library code that only exists as source (<code>crates/core/</code>) and as <code>.rlib</code>
+    build scraps, baked into the two binaries at link time. You will never see <code>minutes-core</code> in Activity Monitor.
+  </div>
+
+  <p class="foot animate" style="--i:11">
+    All values verified via file reads + shell (ls / file / nm / cargo capabilities --json) on 2026-06-21.
+    Byte sizes and versions reflect the artifacts currently installed on this machine, not the repo HEAD (0.18.14).
+  </p>
+
+</div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  import elkLayouts from 'https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk/dist/mermaid-layout-elk.esm.min.mjs';
+  const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.registerLayoutLoaders(elkLayouts);
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    look: 'classic',
+    layout: 'elk',
+    flowchart: { htmlLabels: true, padding: 12 },
+    themeVariables: {
+      primaryColor: isDark ? '#16243d' : '#f3f6fb',
+      primaryBorderColor: isDark ? '#60a5fa' : '#2563eb',
+      primaryTextColor: isDark ? '#dbe6f5' : '#14233b',
+      lineColor: isDark ? '#8aa0c2' : '#56688a',
+      fontSize: '14px',
+      fontFamily: "'Space Grotesk', system-ui, sans-serif",
+      clusterBkg: isDark ? '#0e1830' : '#ffffff',
+      clusterBorder: isDark ? 'rgba(220,230,245,0.20)' : 'rgba(20,35,59,0.20)',
+    }
+  });
+</script>
+<script>
+  function updateZoomState(wrap){ var t=wrap.querySelector('.mermaid'); wrap.classList.toggle('is-zoomed', parseFloat(t.dataset.zoom||'1')>1); }
+  function zoomDiagram(btn,f){ var w=btn.closest('.mermaid-wrap'),t=w.querySelector('.mermaid'),c=parseFloat(t.dataset.zoom||'1'),n=Math.min(Math.max(c*f,.3),5); t.dataset.zoom=n; t.style.transform='scale('+n+')'; updateZoomState(w); }
+  function resetZoom(btn){ var w=btn.closest('.mermaid-wrap'),t=w.querySelector('.mermaid'); t.dataset.zoom='1'; t.style.transform='scale(1)'; updateZoomState(w); }
+  document.querySelectorAll('.mermaid-wrap').forEach(function(wrap){
+    wrap.addEventListener('wheel', function(e){
+      if(!e.ctrlKey && !e.metaKey) return; e.preventDefault();
+      var t=wrap.querySelector('.mermaid'), c=parseFloat(t.dataset.zoom||'1'), f=e.deltaY<0?1.1:0.9, n=Math.min(Math.max(c*f,.3),5);
+      t.dataset.zoom=n; t.style.transform='scale('+n+')'; updateZoomState(wrap);
+    }, {passive:false});
+    var sx,sy,sl,st;
+    wrap.addEventListener('mousedown', function(e){
+      if(e.target.closest('.zoom-controls')) return;
+      var t=wrap.querySelector('.mermaid'); if(parseFloat(t.dataset.zoom||'1')<=1) return;
+      wrap.classList.add('is-panning'); sx=e.clientX; sy=e.clientY; sl=wrap.scrollLeft; st=wrap.scrollTop;
+    });
+    window.addEventListener('mousemove', function(e){ if(!wrap.classList.contains('is-panning')) return; wrap.scrollLeft=sl-(e.clientX-sx); wrap.scrollTop=st-(e.clientY-sy); });
+    window.addEventListener('mouseup', function(){ wrap.classList.remove('is-panning'); });
+  });
+</script>
+</body>
+</html>
