@@ -32,12 +32,41 @@ expression: schema
         "null"
       ]
     },
+    "capture": {
+      "description": "Capture mode for the artifact. Absent means a normal captured meeting.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CapturePolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "captured_at": {
       "type": [
         "string",
         "null"
       ],
       "format": "date-time"
+    },
+    "consent": {
+      "description": "How consent to capture was obtained, if attested.\n\nPrivacy metadata only, not a determination about requirements. See\n[`crate::config::ConsentConfig`].",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConsentBasis"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "consent_notice": {
+      "description": "The exact disclosure the user gave or used, if any.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "context": {
       "type": [
@@ -48,6 +77,17 @@ expression: schema
     "date": {
       "type": "string",
       "format": "date-time"
+    },
+    "debrief": {
+      "description": "Debrief completion state for no-capture meetings.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DebriefStatus"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "decisions": {
       "type": "array",
@@ -97,6 +137,17 @@ expression: schema
       "anyOf": [
         {
           "$ref": "#/$defs/RecordingHealth"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sensitivity": {
+      "description": "Sensitivity designation. Absent means the normal sensitivity policy.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Sensitivity"
         },
         {
           "type": "null"
@@ -199,6 +250,16 @@ expression: schema
         "stem-recovery"
       ]
     },
+    "CapturePolicy": {
+      "description": "How a meeting artifact was captured.",
+      "oneOf": [
+        {
+          "description": "No audio was captured for this meeting artifact.",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
     "CaptureSource": {
       "type": "string",
       "enum": [
@@ -240,6 +301,17 @@ expression: schema
         "low"
       ]
     },
+    "ConsentBasis": {
+      "description": "Attested basis for capturing a conversation.\n\nThis is privacy metadata only, not a determination about requirements.",
+      "type": "string",
+      "enum": [
+        "verbal_all_parties",
+        "notice_in_invite",
+        "recorded_disclosed",
+        "na",
+        "unattested"
+      ]
+    },
     "ContentType": {
       "description": "Content types for output files.",
       "type": "string",
@@ -247,6 +319,26 @@ expression: schema
         "meeting",
         "memo",
         "dictation"
+      ]
+    },
+    "DebriefStatus": {
+      "description": "Human debrief state for no-capture meeting artifacts.",
+      "oneOf": [
+        {
+          "description": "The meeting was stopped without an interactive debrief.",
+          "type": "string",
+          "const": "pending"
+        },
+        {
+          "description": "A human supplied the debrief (at stop time or later via the\nassistant flow); the artifact is the finished record.",
+          "type": "string",
+          "const": "complete"
+        },
+        {
+          "description": "The human marked the debrief unnecessary (test run, accidental\ntrigger); nothing further is expected.",
+          "type": "string",
+          "const": "not-applicable"
+        }
       ]
     },
     "Decision": {
@@ -505,6 +597,21 @@ expression: schema
           "format": "float"
         }
       }
+    },
+    "Sensitivity": {
+      "description": "Sensitivity designation for agent-facing policy layers.",
+      "oneOf": [
+        {
+          "description": "Standard meeting artifact.",
+          "type": "string",
+          "const": "normal"
+        },
+        {
+          "description": "Restricted artifact; agent surfaces enforce this in a later wave.",
+          "type": "string",
+          "const": "restricted"
+        }
+      ]
     },
     "SpeakerAttribution": {
       "description": "A mapping from an anonymous speaker label to a real person.",

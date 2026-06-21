@@ -29,7 +29,7 @@ So `minutes record --device "MacBook Pro Microphone"` always wins over `[recordi
 | `vad_model` | `"silero-v6.2.0"` | Silero VAD model name; empty string disables |
 | `min_words` | `3` | Drop utterances with fewer than this many words |
 | `parakeet_binary` | `"parakeet"` | PATH lookup or absolute path to the parakeet binary |
-| `parakeet_sidecar_enabled` | `false` | Opt-in warm sidecar path (beta) |
+| `parakeet_sidecar_enabled` | auto | Warm sidecar: auto-enables when parakeet is the engine and `example-server` resolves. `true`/`"on"` forces on, `"off"` forces off. A legacy bool `false` is treated as auto (pre-0.18.8 saves wrote it into every config) (#295) |
 | `parakeet_fp16` | `true` | GPU fp16 inference for lower memory use |
 | `parakeet_boost_limit` / `parakeet_boost_score` | `0` / `2.0` | Knowledge-graph phrase boosting; 0 = off |
 
@@ -118,6 +118,54 @@ server compatibility.
 When `capture_backend = "core-audio-tap"`, set `call = "auto"`. The backend
 captures the default macOS system output via Core Audio Process Tap instead of
 opening a named loopback input device.
+
+### `[consent]` — recording disclosure aid
+
+For meeting recordings, Minutes can show a disclosure reminder, ask for an
+interactive acknowledgement, and write the selected basis into frontmatter.
+Non-interactive callers are never blocked: if `mode = "require"` is used from
+a non-TTY process without `--consent`, Minutes records the basis as
+`unattested` and prints a warning.
+
+| key | default | meaning |
+|---|---|---|
+| `mode` | `"remind"` | `"off"` skips reminder text, `"remind"` prints the script, `"require"` asks for an interactive acknowledgement only when stdin is a TTY |
+| `disclosure_script` | built-in local transcript disclosure | One-line script to read aloud or paste before recording |
+| `default_basis` | unset | Optional basis stamped when no `--consent` flag is provided |
+
+Supported basis values are `verbal_all_parties`, `notice_in_invite`,
+`recorded_disclosed`, `na`, and `unattested`.
+
+```toml
+[consent]
+mode = "remind"
+disclosure_script = "Heads up: I'm using Minutes to transcribe this conversation locally on my device for my own notes. Let me know if you'd prefer I didn't."
+# default_basis = "notice_in_invite"
+```
+
+CLI flags override the config for a single recording:
+
+```bash
+minutes record --consent verbal_all_parties
+minutes record --consent notice_in_invite --consent-notice "Notice was included in the calendar invite."
+```
+
+### Sensitive meeting frontmatter
+
+`minutes sensitive start` opens a no-capture meeting session for typed markers.
+`minutes sensitive stop` writes a regular markdown meeting artifact, but marks
+the capture and sensitivity policy explicitly:
+
+```yaml
+capture: none
+sensitivity: restricted
+consent: na
+debrief: pending
+```
+
+`debrief: pending` is present only when the session is saved without any typed
+debrief content. Non-interactive callers never wait for prompts; they save the
+artifact immediately and leave the debrief status for a later assistant pass.
 
 ### `[retention]` — raw audio policy
 
@@ -277,8 +325,6 @@ This section is intentionally narrow:
 | `capture_browser_context` | `false` | Opt in to browser-page title context (URL/domain enrichment remains deferred) |
 | `allowed_apps` | `[]` | Optional allowlist of app or bundle-id fragments |
 | `denied_apps` | `[]` | Optional denylist of app or bundle-id fragments |
-| `allowed_domains` | `[]` | Reserved for future browser URL/domain enrichment policy |
-| `denied_domains` | `[]` | Reserved for future browser URL/domain enrichment policy |
 
 This section is the policy layer for meeting-adjacent desktop context:
 

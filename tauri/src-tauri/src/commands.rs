@@ -2,8 +2,11 @@ use crate::call_capture;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::StreamExt;
 use minisign_verify::{PublicKey, Signature};
-use minutes_core::capture::RecordingIntent;
-use minutes_core::config::{VALID_LIVE_TRANSCRIPT_BACKENDS, VALID_PARAKEET_MODELS};
+use minutes_core::capture::{
+    should_bypass_preflight_block_for_native_call_capture, RecordingIntent,
+};
+use minutes_core::config::{ConsentMode, VALID_LIVE_TRANSCRIPT_BACKENDS, VALID_PARAKEET_MODELS};
+use minutes_core::markdown::ConsentBasis;
 use minutes_core::{CaptureMode, Config, ContentType};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH};
 use std::cmp::Reverse;
@@ -545,10 +548,10 @@ fn batch_transcription_readiness_view(config: &Config) -> SurfaceReadinessView {
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
             format!(
-                "Batch and recording transcription use Parakeet. Model: {}. Tokenizer: {}. Warm: {}.",
+                "Batch and recording transcription use Parakeet. Model: {}. Tokenizer: {}. Sidecar: {}.",
                 status.model,
                 tokenizer_label,
-                if status.warm { "yes" } else { "no" }
+                status.sidecar
             )
         } else {
             format!(
@@ -1015,6 +1018,14 @@ pub fn cmd_get_meeting_prompt(
     }
 }
 
+#[tauri::command]
+pub fn cmd_close_meeting_prompt(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("meeting-prompt") {
+        win.destroy().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Surface a deferred update notification if one is pending and no session is active.
 /// Call this after recording/live/dictation stops.
 pub fn surface_deferred_update(app: &tauri::AppHandle) {
@@ -1295,6 +1306,13 @@ pub struct MeetingDetail {
     pub adjacent_artifacts: Vec<RecentArtifactView>,
     pub sections: Vec<MeetingSection>,
     pub speaker_map: Vec<SpeakerAttributionView>,
+    /// Capture policy from frontmatter ("none" for sensitive no-capture
+    /// meetings); absent for normal captured meetings.
+    pub capture: Option<String>,
+    /// Sensitivity designation from frontmatter ("restricted"), if any.
+    pub sensitivity: Option<String>,
+    /// Debrief status from frontmatter ("pending"), if any.
+    pub debrief: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2583,6 +2601,11 @@ fn queue_native_call_capture_for_processing(
         minutes_core::diarize::CaptureSource::Both
     };
     let recording_health = warning.map(|message| native_call_recovery_health(message, source));
+    let (consent, consent_notice) = if mode == CaptureMode::Meeting {
+        minutes_core::notes::load_consent()
+    } else {
+        (None, None)
+    };
 
     minutes_core::jobs::queue_live_capture_with_recording_health(
         mode,
@@ -2595,6 +2618,8 @@ fn queue_native_call_capture_for_processing(
         context_session_id,
         calendar_event,
         None,
+        consent,
+        consent_notice,
         recording_health,
     )
     .map_err(|error| error.to_string())
@@ -2867,6 +2892,12 @@ fn start_native_call_recording(
     requested_title: Option<String>,
 ) -> Result<(), String> {
     minutes_core::pid::create().map_err(|error| error.to_string())?;
+    // Re-check sensitive exclusivity with the PID (the atomic anchor) held;
+    // closes the start/start interleaving in both directions (review F3).
+    if let Err(error) = minutes_core::sensitive::ensure_inactive_for_recording() {
+        minutes_core::pid::remove().ok();
+        return Err(error.to_string());
+    }
     let mut session = match call_capture::start_native_call_capture() {
         Ok(session) => session,
         Err(error) => {
@@ -2895,6 +2926,7 @@ fn start_native_call_recording(
         .ok();
     crate::sync_tray_state(app_handle);
     minutes_core::notes::save_recording_start().ok();
+    maybe_save_and_show_recording_consent(app_handle, mode, config);
     minutes_core::events::append_event(minutes_core::events::recording_started_event(
         context_session_id.clone(),
         "capture",
@@ -3376,6 +3408,16 @@ fn parse_optional_string_setting(value: &str) -> Option<String> {
     }
 }
 
+fn parse_optional_consent_basis_setting(value: &str) -> Result<Option<String>, String> {
+    let Some(basis) = parse_optional_string_setting(value) else {
+        return Ok(None);
+    };
+    basis
+        .parse::<ConsentBasis>()
+        .map_err(|error| error.to_string())?;
+    Ok(Some(basis))
+}
+
 /// Parse a comma-separated setting string (e.g. `"foo, bar, baz"`) into a
 /// `Vec<String>`. Trims whitespace around each entry, drops empties, preserves
 /// input order. Case-sensitive — callers that need case-insensitive dedup
@@ -3532,6 +3574,142 @@ fn set_recording_error_notice(
     set_latest_output(latest_output, Some(output_error_notice(title, detail)));
 }
 
+fn consent_mode_as_str(mode: ConsentMode) -> &'static str {
+    match mode {
+        ConsentMode::Off => "off",
+        ConsentMode::Remind => "remind",
+        ConsentMode::Require => "require",
+    }
+}
+
+/// Result of a desktop recording start request.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum StartRecordingOutcome {
+    /// Recording launch has been accepted.
+    Started,
+    /// The frontend must show the Require-mode confirmation dialog first.
+    ConsentRequired {
+        /// Disclosure text to show verbatim in the dialog.
+        disclosure: String,
+    },
+}
+
+fn desktop_recording_consent_basis(config: &Config) -> ConsentBasis {
+    config
+        .consent
+        .default_basis
+        .as_deref()
+        .and_then(|basis| match basis.parse::<ConsentBasis>() {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                tracing::warn!(
+                    basis,
+                    error = %error,
+                    "invalid configured consent default_basis; recording as unattested"
+                );
+                None
+            }
+        })
+        .unwrap_or(ConsentBasis::Unattested)
+}
+
+fn desktop_recording_consent_required(
+    mode: CaptureMode,
+    config: &Config,
+    consent_confirmed: bool,
+) -> Option<String> {
+    if mode != CaptureMode::Meeting
+        || config.consent.mode != ConsentMode::Require
+        || consent_confirmed
+    {
+        return None;
+    }
+
+    let disclosure = config.consent.disclosure_script.trim();
+    if disclosure.is_empty() {
+        Some(Config::default().consent.disclosure_script)
+    } else {
+        Some(disclosure.to_string())
+    }
+}
+
+fn show_user_notification_nonmodal(app_handle: &tauri::AppHandle, title: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let identifier = app_handle.config().identifier.as_str();
+        let _ = notify_rust::set_application(identifier);
+
+        let mut notification = notify_rust::Notification::new();
+        notification.summary(title);
+        notification.body(body);
+        notification.auto_icon();
+
+        if notification.show().is_ok() {
+            return;
+        }
+    }
+
+    if app_handle
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .is_ok()
+    {
+        return;
+    }
+
+    tracing::warn!(title, "non-modal notification unavailable");
+}
+
+fn maybe_save_and_show_recording_consent(
+    app_handle: &tauri::AppHandle,
+    mode: CaptureMode,
+    config: &Config,
+) {
+    minutes_core::notes::clear_consent();
+    if mode != CaptureMode::Meeting {
+        return;
+    }
+
+    let basis = desktop_recording_consent_basis(config);
+    let disclosure = config.consent.disclosure_script.trim();
+    let notice = if config.consent.mode == ConsentMode::Off {
+        None
+    } else {
+        (!disclosure.is_empty()).then_some(disclosure)
+    };
+
+    if let Err(error) = minutes_core::notes::save_consent(Some(basis), notice) {
+        minutes_core::notes::clear_consent();
+        tracing::warn!(error = %error, "failed to save recording consent sidecar");
+    }
+
+    match config.consent.mode {
+        ConsentMode::Off => {}
+        ConsentMode::Remind => {
+            let mut body =
+                "Recording + transcribing locally - audio stays on your device.".to_string();
+            if let Some(disclosure) = notice {
+                body.push('\n');
+                body.push_str(disclosure);
+            }
+            eprintln!("[minutes] {}", body.replace('\n', " "));
+            show_user_notification_nonmodal(app_handle, "Recording disclosure", &body);
+        }
+        ConsentMode::Require => {
+            if let Some(disclosure) = notice {
+                eprintln!(
+                    "[minutes] Recording + transcribing locally - audio stays on your device. {}",
+                    disclosure
+                );
+            }
+        }
+    }
+}
+
 fn validate_recording_launch_state(state: &AppState) -> Result<(), String> {
     if recording_active(&state.recording) || state.starting.load(Ordering::Relaxed) {
         return Err("Already recording".into());
@@ -3546,6 +3724,7 @@ fn validate_recording_launch_state(state: &AppState) -> Result<(), String> {
     if state.dictation_active.load(Ordering::Relaxed) || dictation_pid_active() {
         return Err("Dictation in progress — stop it first".into());
     }
+    minutes_core::sensitive::ensure_inactive_for_recording().map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -3674,6 +3853,11 @@ fn latest_retryable_output_notice() -> Option<OutputNotice> {
                 minutes_core::jobs::JobState::Failed | minutes_core::jobs::JobState::NeedsReview
             ) && job.notice_dismissed_at.is_none()
                 && startup_retryable_notice_is_recent(job)
+                // Retry re-processes the raw capture, so a notice promising
+                // "can be retried" is a lie once the wav has been cleaned up
+                // (`remove_capture_artifacts`) — requeue_job would just fail
+                // with "audio file missing".
+                && Path::new(&job.audio_path).exists()
         })
         .collect::<Vec<_>>();
 
@@ -4490,10 +4674,36 @@ fn calendar_status(config: &Config) -> ReadinessItem {
 
     #[cfg(target_os = "macos")]
     {
+        // Non-prompting probe (#300): readiness must distinguish "no
+        // meetings" from "access insufficient" or reminders die silently.
+        use minutes_core::calendar::CalendarAccess;
+        let access = minutes_core::calendar::calendar_access_status();
+        let (state, detail): (&str, String) = match access {
+            CalendarAccess::FullAccess => (
+                "ready",
+                "Calendar suggestions are enabled with Full Calendar access. Meeting reminders are active.".into(),
+            ),
+            CalendarAccess::WriteOnly => (
+                "attention",
+                "Calendar access is Add-Only, so Minutes cannot read upcoming meetings and reminders are OFF. Fix: System Settings > Privacy & Security > Calendars > Minutes > Full Calendar access.".into(),
+            ),
+            CalendarAccess::Denied | CalendarAccess::Restricted => (
+                "attention",
+                "Calendar access is denied, so meeting reminders are OFF. Fix: System Settings > Privacy & Security > Calendars > Minutes > Full Calendar access.".into(),
+            ),
+            CalendarAccess::NotDetermined => (
+                "attention",
+                "Calendar access has not been requested yet. The first calendar feature use will prompt; grant Full Calendar access to enable meeting reminders.".into(),
+            ),
+            CalendarAccess::Unknown => (
+                "attention",
+                "Calendar access state could not be determined (helper missing?). Meeting reminders may be off.".into(),
+            ),
+        };
         ReadinessItem {
             label: "Calendar suggestions".into(),
-            state: "ready".into(),
-            detail: "Calendar suggestions are enabled. Minutes checks Calendar access only when it needs upcoming-meeting context, not from Settings.".into(),
+            state: state.into(),
+            detail,
             optional: true,
         }
     }
@@ -4957,7 +5167,10 @@ pub fn start_recording(
             call_capture::CallCaptureAvailability::Available { .. }
         );
     if let Some(reason) = &preflight.blocking_reason {
-        if !(preflight.intent == RecordingIntent::Call && native_call_capture_available) {
+        if !should_bypass_preflight_block_for_native_call_capture(
+            &preflight,
+            native_call_capture_available,
+        ) {
             eprintln!("Recording preflight blocked: {}", reason);
             set_recording_start_error(&latest_output, reason.clone());
             show_user_notification(&app_handle, "Recording blocked", reason);
@@ -5044,6 +5257,15 @@ pub fn start_recording(
         );
         return;
     }
+    // Re-check sensitive exclusivity with the PID held (review F3).
+    if let Err(error) = minutes_core::sensitive::ensure_inactive_for_recording() {
+        minutes_core::pid::remove().ok();
+        let message = error.to_string();
+        set_recording_start_error(&latest_output, message.clone());
+        show_user_notification(&app_handle, "Recording", &message);
+        starting.store(false, Ordering::Relaxed);
+        return;
+    }
     starting.store(false, Ordering::Relaxed);
     recording.store(true, Ordering::Relaxed);
     stop_flag.store(false, Ordering::Relaxed);
@@ -5060,6 +5282,7 @@ pub fn start_recording(
     crate::sync_tray_state(&app_handle);
 
     minutes_core::notes::save_recording_start().ok();
+    maybe_save_and_show_recording_consent(&app_handle, mode, &config);
     eprintln!("{} started...", mode.noun());
 
     // Inject live transcript context into the assistant workspace so the Recall
@@ -5119,11 +5342,16 @@ pub fn start_recording(
                 let recording_finished_at = chrono::Local::now();
                 let user_notes = minutes_core::notes::read_notes();
                 let pre_context = minutes_core::notes::read_context();
+                let (consent, consent_notice) = if mode == CaptureMode::Meeting {
+                    minutes_core::notes::load_consent()
+                } else {
+                    (None, None)
+                };
                 // Don't block the stop path with a calendar query (can take 10s if Calendar.app hangs).
                 // The pipeline already falls back to events_overlapping_now() during background processing.
                 let calendar_event = None;
 
-                match minutes_core::jobs::queue_live_capture(
+                match minutes_core::jobs::queue_live_capture_with_recording_health(
                     mode,
                     requested_title.clone(),
                     &wav_path,
@@ -5133,6 +5361,9 @@ pub fn start_recording(
                     Some(recording_finished_at),
                     context_session_id.clone(),
                     calendar_event,
+                    None,
+                    consent,
+                    consent_notice,
                     None,
                 ) {
                     Ok(job) => {
@@ -5283,6 +5514,17 @@ pub fn start_recording(
     );
 }
 
+/// Result of an internal (non-JS) recording launch request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchOutcome {
+    /// The launch was accepted and capture is being reserved/spawned.
+    Started,
+    /// Require mode intercepted the launch: the blocking consent modal was
+    /// shown in the main window and capture starts only after the user
+    /// confirms there (review F1/F2).
+    ConsentRequested,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn launch_recording(
     app: tauri::AppHandle,
@@ -5294,7 +5536,23 @@ pub fn launch_recording(
     language_override: Option<String>,
     hotkey_runtime: Option<Arc<Mutex<HotkeyRuntime>>>,
     discard_short_hotkey_capture: Option<Arc<AtomicBool>>,
-) -> Result<(), String> {
+) -> Result<LaunchOutcome, String> {
+    if mode == CaptureMode::Meeting {
+        let config = Config::load();
+        if let Some(disclosure) = desktop_recording_consent_required(mode, &config, false) {
+            // Palette, tray, hotkey, and desktop-control starts end in the
+            // same UI, so Require routes them to the same blocking modal as
+            // the in-window button instead of erroring or bypassing
+            // (spec Part A; review F1/F2). The frontend listener stashes the
+            // pending args and re-invokes with consent confirmed.
+            crate::show_main_window(&app);
+            let _ = app.emit(
+                "minutes://recording-consent-required",
+                serde_json::json!({ "disclosure": disclosure }),
+            );
+            return Ok(LaunchOutcome::ConsentRequested);
+        }
+    }
     reserve_recording_launch(state).map_err(|error| reject_recording_launch(state, error))?;
 
     spawn_reserved_recording(
@@ -5309,7 +5567,7 @@ pub fn launch_recording(
         discard_short_hotkey_capture,
     );
 
-    Ok(())
+    Ok(LaunchOutcome::Started)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5396,7 +5654,15 @@ pub fn handle_desktop_control_request(
                 None,
                 None,
             ) {
-                Ok(()) => {
+                Ok(LaunchOutcome::ConsentRequested) => {
+                    return minutes_core::desktop_control::DesktopControlResponse {
+                        id: request.id,
+                        handled_at: chrono::Local::now(),
+                        accepted: true,
+                        detail: "Require mode: confirmation shown in the Minutes window; recording starts after the user confirms.".into(),
+                    };
+                }
+                Ok(LaunchOutcome::Started) => {
                     let start = Instant::now();
                     while start.elapsed() < Duration::from_secs(12) {
                         if recording_active(&state.recording) {
@@ -5661,7 +5927,8 @@ pub fn cmd_start_recording(
     title: Option<String>,
     language: Option<String>,
     source: Option<String>,
-) -> Result<(), String> {
+    consent_confirmed: Option<bool>,
+) -> Result<StartRecordingOutcome, String> {
     let capture_mode = parse_capture_mode(mode.as_deref())?;
     let requested_intent = parse_recording_intent(intent.as_deref())?;
     let from_call_detect = source.as_deref() == Some("call_detect");
@@ -5684,6 +5951,17 @@ pub fn cmd_start_recording(
         }),
     );
 
+    validate_recording_launch_state(&state)
+        .map_err(|error| reject_recording_launch(&state, error))?;
+    let config = Config::load();
+    if let Some(disclosure) = desktop_recording_consent_required(
+        capture_mode,
+        &config,
+        consent_confirmed.unwrap_or(false),
+    ) {
+        return Ok(StartRecordingOutcome::ConsentRequired { disclosure });
+    }
+
     // Reserve the start BEFORE mutating any call-detect session atomics.
     // Otherwise a rejected call-detect start (live transcript/dictation already
     // active, stale starting flag, etc.) can cancel auto-stop state for a
@@ -5702,7 +5980,7 @@ pub fn cmd_start_recording(
         None,
         None,
     );
-    Ok(())
+    Ok(StartRecordingOutcome::Started)
 }
 
 /// Reset countdown lifecycle state for a fresh recording/session boundary.
@@ -5763,9 +6041,79 @@ pub fn cmd_add_note(text: String) -> Result<String, String> {
     minutes_core::notes::add_note(&text)
 }
 
+/// Start a no-capture sensitive meeting from the desktop app.
+#[tauri::command]
+pub fn cmd_sensitive_start(title: Option<String>) -> Result<serde_json::Value, String> {
+    let session =
+        minutes_core::sensitive::start(title.as_deref()).map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "id": session.id,
+        "title": session.title,
+        "startedAt": session.started_at.to_rfc3339(),
+    }))
+}
+
+/// Stop the active desktop sensitive meeting and open the assistant debrief flow.
+#[tauri::command]
+pub fn cmd_sensitive_stop(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let config = Config::load();
+    let result = minutes_core::sensitive::stop(None, &config).map_err(|error| error.to_string())?;
+    let path = result.path.to_string_lossy().to_string();
+    if let Err(error) = spawn_terminal(&app, &state.pty_manager, "meeting", Some(&path), None) {
+        show_user_notification(&app, "Sensitive meeting saved", &error);
+    } else if let Ok(mut manager) = state.pty_manager.lock() {
+        if let Some(command) = manager.session_command(crate::pty::ASSISTANT_SESSION_ID) {
+            let debrief_prompt = "Run /minutes-debrief for CURRENT_MEETING.md.";
+            let input = if is_shell_command(&command) {
+                format!("cat <<'__MINUTES__'\n{debrief_prompt}\n__MINUTES__\n")
+            } else {
+                format!("{debrief_prompt}\n")
+            };
+            let _ = manager.write_input(crate::pty::ASSISTANT_SESSION_ID, input.as_bytes());
+        }
+    }
+    Ok(serde_json::json!({
+        "path": path,
+        "title": result.title,
+        "debrief": "pending",
+    }))
+}
+
 /// Toggle (or force-set) the Minutes-local mic mute for the active
 /// dual-source recording. Returns the new muted state. System audio
 /// keeps capturing; only the mic stream is silenced.
+/// Hand an existing meeting to the assistant with a debrief prompt.
+///
+/// Used by the detail view's "Run debrief" action on no-capture sensitive
+/// meetings whose frontmatter says `debrief: pending` (bead minutes-3yub.5);
+/// mirrors the handoff `cmd_sensitive_stop` performs at stop time.
+#[tauri::command]
+pub fn cmd_run_meeting_debrief(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    path: String,
+) -> Result<(), String> {
+    let config = Config::load();
+    let meeting_path = std::path::PathBuf::from(&path);
+    minutes_core::notes::validate_meeting_path(&meeting_path, &config.output_dir)?;
+    spawn_terminal(&app, &state.pty_manager, "meeting", Some(&path), None)?;
+    if let Ok(mut manager) = state.pty_manager.lock() {
+        if let Some(command) = manager.session_command(crate::pty::ASSISTANT_SESSION_ID) {
+            let debrief_prompt = "Run /minutes-debrief for CURRENT_MEETING.md.";
+            let input = if is_shell_command(&command) {
+                format!("cat <<'__MINUTES__'\n{debrief_prompt}\n__MINUTES__\n")
+            } else {
+                format!("{debrief_prompt}\n")
+            };
+            let _ = manager.write_input(crate::pty::ASSISTANT_SESSION_ID, input.as_bytes());
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn cmd_toggle_mic_mute(force_state: Option<bool>) -> bool {
     match force_state {
@@ -5828,6 +6176,7 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
         .map(|guard| guard.clone())
         .unwrap_or_default();
     let recording_active = recording || (status.recording && !processing);
+    let sensitive_session = minutes_core::sensitive::active_session();
 
     // Get elapsed time if recording
     let elapsed = if recording_active {
@@ -5853,6 +6202,14 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
     } else {
         None
     };
+    let sensitive_elapsed = sensitive_session.as_ref().map(|session| {
+        let now = chrono::Local::now();
+        let e = now
+            .signed_duration_since(session.started_at)
+            .num_seconds()
+            .max(0) as u64;
+        format!("{}:{:02}", e / 60, e % 60)
+    });
 
     let audio_level = if recording_active {
         minutes_core::capture::audio_level()
@@ -5876,6 +6233,14 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
         "callCaptureHealth": call_capture_health,
         "pid": status.pid,
         "elapsed": elapsed,
+        "sensitive": sensitive_session.as_ref().map(|session| serde_json::json!({
+            "active": true,
+            "id": session.id,
+            "title": session.title,
+            "startedAt": session.started_at.to_rfc3339(),
+            "elapsed": sensitive_elapsed,
+            "markerCount": session.markers.len(),
+        })),
         "audioLevel": audio_level,
     });
 
@@ -6610,11 +6975,46 @@ pub fn cmd_clear_latest_output(state: tauri::State<AppState>) {
     set_latest_output(&state.latest_output, None);
 }
 
+/// Persist the completion-notification preference to `config.toml`.
+///
+/// Extracted so the round-trip test can exercise the real save path without
+/// constructing a `tauri::State` (which has no public test constructor). The
+/// setter command below seeds AppState and then delegates here.
+fn persist_completion_notifications(enabled: bool) -> Result<(), String> {
+    let mut config = Config::load();
+    config.notifications.completion_enabled = enabled;
+    config
+        .save()
+        .map_err(|e| format!("Failed to save config: {}", e))
+}
+
+/// Persist the Quick-Thought global hotkey to `config.toml`.
+///
+/// Extracted (like `persist_completion_notifications`) so the round-trip test
+/// can verify the on-disk write without a `tauri::AppHandle` / global-shortcut
+/// manager. `cmd_set_global_hotkey` and the `quick_thought` slot of
+/// `cmd_set_shortcut` both target the same `[global_hotkey]` fields.
+fn persist_global_hotkey(enabled: bool, shortcut: &str) -> Result<(), String> {
+    let mut config = Config::load();
+    config.global_hotkey.shortcut_enabled = enabled;
+    config.global_hotkey.shortcut = shortcut.to_string();
+    config
+        .save()
+        .map_err(|e| format!("Failed to save config: {}", e))
+}
+
 #[tauri::command]
-pub fn cmd_set_completion_notifications(state: tauri::State<AppState>, enabled: bool) {
+pub fn cmd_set_completion_notifications(
+    state: tauri::State<AppState>,
+    enabled: bool,
+) -> Result<(), String> {
     state
         .completion_notifications_enabled
         .store(enabled, Ordering::Relaxed);
+
+    persist_completion_notifications(enabled)?;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -6662,8 +7062,10 @@ pub fn cmd_set_global_hotkey(
         .global_hotkey_enabled
         .store(enabled, Ordering::Relaxed);
     if let Ok(mut current) = state.global_hotkey_shortcut.lock() {
-        *current = next_shortcut;
+        *current = next_shortcut.clone();
     }
+
+    persist_global_hotkey(enabled, &next_shortcut)?;
 
     Ok(current_hotkey_settings(&state))
 }
@@ -7068,6 +7470,10 @@ pub fn cmd_get_meeting_detail(path: String) -> Result<MeetingDetail, String> {
 
     let related = build_related_context(&config, &meeting_path, &frontmatter);
 
+    let capture_is_none = matches!(
+        frontmatter.capture,
+        Some(minutes_core::markdown::CapturePolicy::None)
+    );
     Ok(MeetingDetail {
         path,
         title: frontmatter.title,
@@ -7084,9 +7490,36 @@ pub fn cmd_get_meeting_detail(path: String) -> Result<MeetingDetail, String> {
         related_topics: related.related_topics,
         related_meetings: related.related_meetings,
         related_commitments: related.related_commitments,
-        adjacent_artifacts: related.adjacent_artifacts,
+        // Adjacent prep/brief artifacts are navigation noise on a no-capture
+        // sensitive meeting; the card is about its own markers and debrief.
+        adjacent_artifacts: if capture_is_none {
+            Vec::new()
+        } else {
+            related.adjacent_artifacts
+        },
         sections: parse_sections(body),
         speaker_map,
+        capture: frontmatter.capture.map(|c| {
+            match c {
+                minutes_core::markdown::CapturePolicy::None => "none",
+            }
+            .to_string()
+        }),
+        sensitivity: frontmatter.sensitivity.map(|s| {
+            match s {
+                minutes_core::markdown::Sensitivity::Normal => "normal",
+                minutes_core::markdown::Sensitivity::Restricted => "restricted",
+            }
+            .to_string()
+        }),
+        debrief: frontmatter.debrief.map(|d| {
+            match d {
+                minutes_core::markdown::DebriefStatus::Pending => "pending",
+                minutes_core::markdown::DebriefStatus::Complete => "complete",
+                minutes_core::markdown::DebriefStatus::NotApplicable => "not-applicable",
+            }
+            .to_string()
+        }),
     })
 }
 
@@ -7829,9 +8262,8 @@ pub fn spawn_terminal(
     // Emit recall:expand event to the main window instead of opening a
     // separate terminal window. The JS in index.html handles the panel
     // expand animation and xterm.js initialisation.
-    if let Some(win) = app.get_webview_window("main") {
-        win.show().ok();
-        win.set_focus().ok();
+    if app.get_webview_window("main").is_some() {
+        crate::show_main_window(app);
         app.emit_to(
             "main",
             "recall:expand",
@@ -8015,7 +8447,11 @@ pub fn cmd_get_settings() -> serde_json::Value {
             "language": config.transcription.language,
             "parakeet_model": config.transcription.parakeet_model,
             "parakeet_binary": config.transcription.parakeet_binary,
-            "parakeet_sidecar_enabled": config.transcription.parakeet_sidecar_enabled,
+            "parakeet_sidecar_enabled": match config.transcription.parakeet_sidecar_enabled {
+                None => "auto",
+                Some(true) => "true",
+                Some(false) => "false",
+            },
             "parakeet_compiled": cfg!(feature = "parakeet"),
             "parakeet_status": parakeet_status_view(&config),
             "apple_speech_status": apple_speech_status_view(),
@@ -8060,6 +8496,11 @@ pub fn cmd_get_settings() -> serde_json::Value {
         },
         "privacy": {
             "hide_from_screen_share": config.privacy.hide_from_screen_share,
+        },
+        "consent": {
+            "mode": consent_mode_as_str(config.consent.mode),
+            "disclosure_script": config.consent.disclosure_script,
+            "default_basis": config.consent.default_basis,
         },
         "assistant": {
             "agent": config.assistant.agent,
@@ -8106,6 +8547,13 @@ pub fn cmd_get_settings() -> serde_json::Value {
         "palette": {
             "shortcut_enabled": config.palette.shortcut_enabled,
             "shortcut": config.palette.shortcut,
+        },
+        "global_hotkey": {
+            "shortcut_enabled": config.global_hotkey.shortcut_enabled,
+            "shortcut": config.global_hotkey.shortcut,
+        },
+        "notifications": {
+            "completion_enabled": config.notifications.completion_enabled,
         },
         "identity": {
             "name": config.identity.name,
@@ -8239,7 +8687,17 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
             config.transcription.parakeet_vocab = format!("{}.tokenizer.vocab", value);
         }
         ("transcription", "parakeet_sidecar_enabled") => {
-            config.transcription.parakeet_sidecar_enabled = value == "true";
+            config.transcription.parakeet_sidecar_enabled = match value.as_str() {
+                "auto" | "" => None,
+                "true" | "on" => Some(true),
+                "false" | "off" => Some(false),
+                other => {
+                    return Err(format!(
+                        "unknown parakeet_sidecar_enabled '{}'. Valid: auto, on, off",
+                        other
+                    ))
+                }
+            };
         }
         ("transcription", "language") => {
             config.transcription.language = parse_optional_string_setting(&value);
@@ -8249,6 +8707,28 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
         ("recording", "device") => {
             config.recording.device =
                 minutes_core::capture::canonicalize_input_device_setting(&value);
+        }
+
+        // Consent
+        ("consent", "mode") => {
+            let mode = match value.as_str() {
+                "off" => ConsentMode::Off,
+                "remind" => ConsentMode::Remind,
+                "require" => ConsentMode::Require,
+                other => {
+                    return Err(format!(
+                        "unknown consent mode '{}'. Valid: off, remind, require",
+                        other
+                    ))
+                }
+            };
+            config.consent.mode = mode;
+        }
+        ("consent", "disclosure_script") => {
+            config.consent.disclosure_script = value.clone();
+        }
+        ("consent", "default_basis") => {
+            config.consent.default_basis = parse_optional_consent_basis_setting(&value)?;
         }
 
         // Diarization
@@ -8297,12 +8777,6 @@ pub fn cmd_set_setting(section: String, key: String, value: String) -> Result<St
         }
         ("desktop_context", "denied_apps") => {
             config.desktop_context.denied_apps = parse_comma_separated_setting(&value);
-        }
-        ("desktop_context", "allowed_domains") => {
-            config.desktop_context.allowed_domains = parse_comma_separated_setting(&value);
-        }
-        ("desktop_context", "denied_domains") => {
-            config.desktop_context.denied_domains = parse_comma_separated_setting(&value);
         }
 
         // Assistant
@@ -8925,19 +9399,18 @@ mod tests {
         ("dictation", "auto_paste"),
         ("dictation", "cleanup_engine"),
         ("dictation", "destination"),
-        // dictation.shortcut_enabled is written directly by cmd_set_shortcut
-        // via `config.dictation.shortcut_enabled = ...` — the cmd_set_setting
-        // arm is vestigial. Keep for symmetry with other shortcut slots.
-        ("dictation", "shortcut_enabled"),
+        // NOTE: ("dictation", "shortcut_enabled") used to live here as a
+        // vestigial arm (cmd_set_shortcut writes the field directly). It now
+        // has a real caller via the central path — the round-trip persistence
+        // test `dictation_shortcut_round_trips_to_config` exercises it — so it
+        // dropped off the allowlist. The arm⇒caller guard's stale-orphan check
+        // enforces this: leaving it here would fail the guard.
         // screen_context.keep_after_summary controls post-summary screenshot
         // retention. Low-traffic; TOML-only is fine.
         ("screen_context", "keep_after_summary"),
-        // Desktop-context domain policy is intentionally deferred until the
-        // browser capture path graduates beyond window-title-only context.
-        ("desktop_context", "allowed_domains"),
-        ("desktop_context", "denied_domains"),
-        // Parakeet sidecar is beta / opt-in. No UI until the sidecar path is
-        // out of beta.
+        // Parakeet sidecar auto-resolves from engine + binary presence since
+        // #295; the arm accepts auto/on/off for power users but the resolved
+        // state (not a toggle) is what Settings displays.
         ("transcription", "parakeet_sidecar_enabled"),
     ];
 
@@ -9035,6 +9508,396 @@ mod tests {
              Remove these from the allowlist so the guard catches future \
              regressions on them.",
             stale.join("\n  ")
+        );
+    }
+
+    /// Extract every *statically literal* `(section, key)` pair targeted by a
+    /// `cmd_set_setting` call — both the HTML
+    /// `invoke('cmd_set_setting', { section: 'X', key: 'Y', ... })` shape
+    /// (single- or multi-line) and the Rust
+    /// `cmd_set_setting("X".into(), "Y".into(), ...)` shape.
+    ///
+    /// Calls whose `key` (or `section`) is a non-literal expression — e.g. the
+    /// `desktop_context` wrappers that pass a `key` *variable* — are skipped:
+    /// they can't be resolved statically and are already covered by the
+    /// arm⇒caller wrapper allowlist in `arm_has_caller`.
+    /// Remove top-level `#[cfg(test)] mod ... { ... }` blocks from Rust source.
+    /// Test modules in these files are top-level (their closing `}` sits at
+    /// column 0), so a simple state machine that drops everything from the
+    /// `#[cfg(test)]` attribute through the next column-0 `}` is sufficient.
+    /// Used by the caller⇒arm guard so test scaffolding and the guard's own
+    /// literal anchors aren't mistaken for shipping call sites.
+    fn strip_cfg_test_modules(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut in_test = false;
+        let mut pending_cfg = false;
+        for line in src.lines() {
+            if in_test {
+                if line == "}" {
+                    in_test = false;
+                }
+                out.push('\n');
+                continue;
+            }
+            let trimmed = line.trim();
+            if trimmed == "#[cfg(test)]" {
+                pending_cfg = true;
+                out.push('\n');
+                continue;
+            }
+            if pending_cfg {
+                pending_cfg = false;
+                if trimmed.starts_with("mod ") && trimmed.ends_with('{') {
+                    in_test = true;
+                    out.push('\n');
+                    continue;
+                }
+                // `#[cfg(test)]` on a non-module item (e.g. a single test fn or
+                // use); keep this line, it won't contain a real call site.
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    fn extract_set_setting_callers(haystack: &str) -> Vec<(String, String)> {
+        let mut callers = Vec::new();
+        // Build every anchor at runtime (split literals) so this scanner's own
+        // source — the `anchors` array below — is not parsed as a real call
+        // site when the guard scans this file.
+        let rust_anchor = ["cmd_set_setting", "("].concat();
+        // HTML/JS `invoke(...)` anchors, both quoting styles. The single-quoted
+        // form is the legacy in-tree style; the double-quoted form catches a
+        // future `invoke("cmd_set_setting", { section: "x", key: "y" })`, which
+        // is otherwise invisible to caller⇒arm and would compile, ship, and
+        // silently drop. The object-value parser already handles either quote.
+        let html_anchor_single = ["'", "cmd_set_setting", "'"].concat();
+        let html_anchor_double = ["\"", "cmd_set_setting", "\""].concat();
+        let anchors = [
+            rust_anchor.as_str(),
+            html_anchor_single.as_str(),
+            html_anchor_double.as_str(),
+        ];
+        for anchor in &anchors {
+            let mut cursor = 0;
+            while let Some(offset) = haystack[cursor..].find(anchor) {
+                let abs = cursor + offset;
+                // Skip anchors that sit *inside* a string literal (the char
+                // right before the anchor is a quote), e.g. the `"cmd_set_setting("`
+                // array element in this very function. Those aren't call sites.
+                let preceded_by_quote = abs
+                    .checked_sub(1)
+                    .map(|i| matches!(haystack.as_bytes()[i], b'"' | b'\''))
+                    .unwrap_or(false);
+                if *anchor == rust_anchor.as_str() && preceded_by_quote {
+                    cursor = abs + anchor.len();
+                    continue;
+                }
+                let window_end = (abs + 320).min(haystack.len());
+                let window = &haystack[abs..window_end];
+
+                let pair = if *anchor == rust_anchor.as_str() {
+                    // Rust: cmd_set_setting("section".into(), "key".into(), ..)
+                    // First two quoted string literals after the paren.
+                    let after = &window[anchor.len()..];
+                    extract_first_two_double_quoted(after)
+                } else {
+                    // HTML: invoke('cmd_set_setting', { section: 'X', key: 'Y' })
+                    let section = extract_object_literal_value(window, "section:");
+                    let key = extract_object_literal_value(window, "key:");
+                    match (section, key) {
+                        (Some(s), Some(k)) => Some((s, k)),
+                        _ => None,
+                    }
+                };
+
+                if let Some(pair) = pair {
+                    callers.push(pair);
+                }
+                cursor = abs + anchor.len();
+            }
+        }
+        callers
+    }
+
+    /// Pull the first two `"..."`-quoted string literals out of a Rust slice.
+    fn extract_first_two_double_quoted(s: &str) -> Option<(String, String)> {
+        let (first, rest) = next_double_quoted(s)?;
+        let (second, _) = next_double_quoted(rest)?;
+        Some((first, second))
+    }
+
+    fn next_double_quoted(s: &str) -> Option<(String, &str)> {
+        let start = s.find('"')?;
+        let after = &s[start + 1..];
+        let end = after.find('"')?;
+        Some((after[..end].to_string(), &after[end + 1..]))
+    }
+
+    /// Resolve a `field: 'literal'` (or `field: "literal"`) value in a JS object
+    /// literal window. Returns `None` if the value is a non-literal expression
+    /// (variable / template / call), so dynamic callers are skipped rather than
+    /// mis-parsed.
+    fn extract_object_literal_value(window: &str, field: &str) -> Option<String> {
+        let idx = window.find(field)?;
+        let after = window[idx + field.len()..].trim_start();
+        let mut chars = after.char_indices();
+        let (_, quote) = chars.next()?;
+        if quote != '\'' && quote != '"' {
+            // Non-literal value (e.g. `key,` shorthand or an expression).
+            return None;
+        }
+        let body = &after[quote.len_utf8()..];
+        let end = body.find(quote)?;
+        Some(body[..end].to_string())
+    }
+
+    /// Both `invoke('cmd_set_setting', …)` (single-quoted, legacy in-tree
+    /// style) and `invoke("cmd_set_setting", …)` (double-quoted) call sites are
+    /// visible to `extract_set_setting_callers`. The double-quoted form was a
+    /// blind spot: `every_cmd_set_setting_caller_has_an_arm` would have missed
+    /// a future double-quoted caller to a (section, key) with no arm, letting it
+    /// compile, ship, and silently drop. The fixture anchors are assembled from
+    /// split literals so this test's own source isn't parsed as a call site.
+    #[test]
+    fn extract_set_setting_callers_handles_both_quote_styles() {
+        let invoke = "invoke(";
+        let cmd = "cmd_set_setting";
+        let single = format!(
+            "{}'{}', {{ section: 'bogus_single', key: 'k1' }})",
+            invoke, cmd
+        );
+        let double = format!(
+            "{}\"{}\", {{ section: \"bogus_double\", key: \"k2\" }})",
+            invoke, cmd
+        );
+        let haystack = format!("{}\n{}\n", single, double);
+
+        let callers = extract_set_setting_callers(&haystack);
+        assert!(
+            callers.contains(&("bogus_single".to_string(), "k1".to_string())),
+            "single-quoted caller not detected: {:?}",
+            callers
+        );
+        assert!(
+            callers.contains(&("bogus_double".to_string(), "k2".to_string())),
+            "double-quoted caller not detected (blind spot the anchor fix closes): {:?}",
+            callers
+        );
+    }
+
+    /// CI guard (inverse direction): every `cmd_set_setting` *call site* — HTML
+    /// `invoke` or Rust-internal — must target a `(section, key)` that actually
+    /// has a match arm. This catches the recurring palette-style regression
+    /// where a frontend call uses a section/key with no arm: it compiles,
+    /// ships, and silently drops. `every_cmd_set_setting_arm_has_a_caller`
+    /// proves arm⇒caller; this proves caller⇒arm.
+    #[test]
+    fn every_cmd_set_setting_caller_has_an_arm() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let commands_path = format!("{}/src/commands.rs", manifest);
+        let commands = std::fs::read_to_string(&commands_path).expect("failed to read commands.rs");
+        let arms = extract_set_setting_arms(&commands);
+        assert!(!arms.is_empty(), "found no cmd_set_setting arms");
+        let arm_set: std::collections::HashSet<(String, String)> = arms.into_iter().collect();
+
+        let mut missing: Vec<String> = Vec::new();
+
+        // Rust callers: scan every src/*.rs EXCEPT the test module's own
+        // synthetic literals would otherwise self-match. We strip the match
+        // block from commands.rs (the arms themselves are `("X", "Y") =>`, not
+        // `cmd_set_setting("X", ...)` calls, so they're already ignored by the
+        // anchor — but stripping keeps the window clean) and scan the rest.
+        let rust_root = format!("{}/src", manifest);
+        for path in walk_with_extensions(&rust_root, &["rs"]) {
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Strip test modules first: `#[cfg(test)]` code is scaffolding, not
+            // a shipping call site, and the guard's own parser/assertion-string
+            // literals would otherwise self-match. Then strip the match block in
+            // commands.rs (arm definitions aren't callers).
+            let no_tests = strip_cfg_test_modules(&contents);
+            let filtered = if path.file_name().and_then(|n| n.to_str()) == Some("commands.rs") {
+                strip_set_setting_match_block(&no_tests)
+            } else {
+                no_tests
+            };
+            for (s, k) in extract_set_setting_callers(&filtered) {
+                if !arm_set.contains(&(s.clone(), k.clone())) {
+                    missing.push(format!("Rust {}: (\"{}\", \"{}\")", path.display(), s, k));
+                }
+            }
+        }
+
+        // HTML/JS callers.
+        let html_root = format!("{}/../src", manifest);
+        for path in walk_with_extensions(&html_root, &["html", "js"]) {
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (s, k) in extract_set_setting_callers(&contents) {
+                if !arm_set.contains(&(s.clone(), k.clone())) {
+                    missing.push(format!("HTML {}: (\"{}\", \"{}\")", path.display(), s, k));
+                }
+            }
+        }
+
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "cmd_set_setting call sites target a (section, key) with NO match arm \
+             (would compile, ship, and silently drop):\n  {}\n\n\
+             Add the arm in cmd_set_setting (and the config field), or fix the \
+             caller's section/key.",
+            missing.join("\n  ")
+        );
+    }
+
+    /// Round-trip: `cmd_set_completion_notifications`' persistence step writes
+    /// `notifications.completion_enabled` to config.toml and survives a fresh
+    /// `Config::load()`. Would have caught confirmed drop #2.
+    #[test]
+    fn completion_notifications_round_trips_to_config() {
+        with_temp_home(|_| {
+            // Default is true; flip to false and confirm it lands on disk.
+            persist_completion_notifications(false).unwrap();
+            assert!(
+                !Config::load().notifications.completion_enabled,
+                "completion_enabled=false did not persist"
+            );
+
+            persist_completion_notifications(true).unwrap();
+            assert!(
+                Config::load().notifications.completion_enabled,
+                "completion_enabled=true did not persist"
+            );
+        });
+    }
+
+    /// Round-trip: the Quick-Thought global hotkey persistence step (shared by
+    /// `cmd_set_global_hotkey` and the `quick_thought` slot of
+    /// `cmd_set_shortcut`) writes `global_hotkey.{shortcut_enabled,shortcut}`
+    /// to config.toml. Would have caught confirmed drops #1 and #3.
+    #[test]
+    fn global_hotkey_round_trips_to_config() {
+        with_temp_home(|_| {
+            // Default is disabled with CmdOrCtrl+Shift+M.
+            persist_global_hotkey(true, "CmdOrCtrl+Shift+J").unwrap();
+            let loaded = Config::load();
+            assert!(
+                loaded.global_hotkey.shortcut_enabled,
+                "global_hotkey.shortcut_enabled=true did not persist"
+            );
+            assert_eq!(
+                loaded.global_hotkey.shortcut, "CmdOrCtrl+Shift+J",
+                "global_hotkey.shortcut did not persist"
+            );
+
+            persist_global_hotkey(false, "CmdOrCtrl+Shift+T").unwrap();
+            let loaded = Config::load();
+            assert!(
+                !loaded.global_hotkey.shortcut_enabled,
+                "global_hotkey.shortcut_enabled=false did not persist"
+            );
+            assert_eq!(loaded.global_hotkey.shortcut, "CmdOrCtrl+Shift+T");
+        });
+    }
+
+    /// Round-trip regression coverage: the dictation shortcut written through
+    /// the `cmd_set_setting` central path persists. (`cmd_set_dictation_shortcut`
+    /// and the Dictation slot of `cmd_set_shortcut` write the same fields via
+    /// `Config::load()`→mutate→`save()`; this exercises the on-disk write of
+    /// those fields without a `tauri::AppHandle`.)
+    #[test]
+    fn dictation_shortcut_round_trips_to_config() {
+        with_temp_home(|_| {
+            cmd_set_setting("dictation".into(), "shortcut_enabled".into(), "true".into()).unwrap();
+            cmd_set_setting(
+                "dictation".into(),
+                "shortcut".into(),
+                "CmdOrCtrl+Alt+Space".into(),
+            )
+            .unwrap();
+            let loaded = Config::load();
+            assert!(loaded.dictation.shortcut_enabled);
+            assert_eq!(loaded.dictation.shortcut, "CmdOrCtrl+Alt+Space");
+        });
+    }
+
+    /// Ban the `.ok()`/`let _ =` swallow on `cmd_set_setting`. A discarded
+    /// Result hides an "Unknown setting" error and silently drops the write —
+    /// the exact failure mode behind the palette/live regressions. Require `?`
+    /// or an explicit `if let Err(e) = ... { log }` instead.
+    #[test]
+    fn cmd_set_setting_result_is_never_swallowed() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let rust_root = format!("{}/src", manifest);
+        // Build the banned anchors at runtime (split literals) so this very
+        // test's source — which must mention them to scan for them — does not
+        // self-match. A bare contiguous `cmd_set_setting(` never appears in
+        // this function's body.
+        let call_anchor = ["cmd_set_setting", "("].concat();
+        let discard_let = ["let _ = cmd_set", "_setting"].concat();
+        let ok_tail = [".ok", "()"].concat();
+        let mut offenders: Vec<String> = Vec::new();
+        for path in walk_with_extensions(&rust_root, &["rs"]) {
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let lines: Vec<&str> = contents.lines().collect();
+            for (lineno, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+
+                // Shape A: `let _ = cmd_set_setting(...)`.
+                if line.contains(&discard_let) {
+                    offenders.push(format!("{}:{} {}", path.display(), lineno + 1, trimmed));
+                    continue;
+                }
+
+                // Shape B (inline): `cmd_set_setting(...).ok()` on one line.
+                if line.contains(&call_anchor) && line.contains(&ok_tail) {
+                    offenders.push(format!("{}:{} {}", path.display(), lineno + 1, trimmed));
+                    continue;
+                }
+
+                // Shape C (multi-line tail): a standalone `.ok()` line whose
+                // statement opened with a `cmd_set_setting(` call. Look back a
+                // few lines for the opener, stopping at a statement boundary
+                // (`;` or `{`/`}`) so array literals like
+                // `[cmd_set_setting(...), ...];` (terminated by `;`) don't match.
+                if trimmed.starts_with(&ok_tail) {
+                    for back in 1..=8usize {
+                        let Some(prev_idx) = lineno.checked_sub(back) else {
+                            break;
+                        };
+                        let prev = lines[prev_idx].trim();
+                        if prev.contains(&call_anchor) {
+                            offenders.push(format!(
+                                "{}:{} {}",
+                                path.display(),
+                                prev_idx + 1,
+                                lines[prev_idx].trim_start()
+                            ));
+                            break;
+                        }
+                        // Stop at a statement boundary that isn't the call we want.
+                        if prev.ends_with(';') || prev.ends_with('{') || prev.ends_with('}') {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "cmd_set_setting Result is swallowed (use `?` or `if let Err(e) = ..`):\n  {}",
+            offenders.join("\n  ")
         );
     }
 
@@ -10140,6 +11003,8 @@ mod tests {
             word_count: None,
             owner_pid: None,
             retry_count: 0,
+            consent: None,
+            consent_notice: None,
             recording_health: None,
         };
 
@@ -10161,6 +11026,26 @@ mod tests {
         assert_eq!(
             parse_optional_string_setting(" es "),
             Some("es".to_string())
+        );
+    }
+
+    #[test]
+    fn desktop_require_consent_returns_confirmation_until_confirmed() {
+        let mut config = Config::default();
+        config.consent.mode = ConsentMode::Require;
+        config.consent.disclosure_script = "Please confirm before recording.".into();
+
+        assert_eq!(
+            desktop_recording_consent_required(CaptureMode::Meeting, &config, false).as_deref(),
+            Some("Please confirm before recording.")
+        );
+        assert_eq!(
+            desktop_recording_consent_required(CaptureMode::Meeting, &config, true),
+            None
+        );
+        assert_eq!(
+            desktop_recording_consent_required(CaptureMode::QuickThought, &config, false),
+            None
         );
     }
 
@@ -10561,10 +11446,15 @@ mod tests {
             }],
             intents: vec![],
             recorded_by: None,
+            capture: None,
+            sensitivity: None,
+            debrief: None,
             visibility: None,
             speaker_map: vec![],
             template: None,
             filter_diagnosis: None,
+            consent: None,
+            consent_notice: None,
             recording_health: None,
             processing_warnings: Vec::new(),
         };
@@ -10619,10 +11509,15 @@ mod tests {
             }],
             intents: vec![],
             recorded_by: None,
+            capture: None,
+            sensitivity: None,
+            debrief: None,
             visibility: None,
             speaker_map: vec![],
             template: None,
             filter_diagnosis: None,
+            consent: None,
+            consent_notice: None,
             recording_health: None,
             processing_warnings: Vec::new(),
         };
@@ -10668,10 +11563,15 @@ mod tests {
             decisions: vec![],
             intents: vec![],
             recorded_by: None,
+            capture: None,
+            sensitivity: None,
+            debrief: None,
             visibility: None,
             speaker_map: vec![],
             template: None,
             filter_diagnosis: None,
+            consent: None,
+            consent_notice: None,
             recording_health: None,
             processing_warnings: Vec::new(),
         };
@@ -10938,6 +11838,8 @@ mod tests {
             word_count: Some(0),
             owner_pid: None,
             retry_count: 0,
+            consent: None,
+            consent_notice: None,
             recording_health: None,
         };
 
@@ -10973,6 +11875,8 @@ mod tests {
             word_count: Some(0),
             owner_pid: None,
             retry_count: 0,
+            consent: None,
+            consent_notice: None,
             recording_health: None,
         };
 
@@ -11018,6 +11922,8 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                consent: None,
+                consent_notice: None,
                 recording_health: None,
             };
 
@@ -11031,8 +11937,10 @@ mod tests {
 
     #[test]
     fn latest_retryable_notice_falls_back_to_older_undismissed_job() {
-        with_temp_home(|_| {
+        with_temp_home(|dir| {
             let now = chrono::Local::now();
+            let older_wav = dir.join("old-visible.wav");
+            std::fs::write(&older_wav, b"riff").unwrap();
             let dismissed_job = minutes_core::jobs::ProcessingJob {
                 id: "job-new-dismissed".into(),
                 title: Some("New dismissed".into()),
@@ -11057,6 +11965,8 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                consent: None,
+                consent_notice: None,
                 recording_health: None,
             };
             let older_job = minutes_core::jobs::ProcessingJob {
@@ -11067,7 +11977,7 @@ mod tests {
                 state: minutes_core::jobs::JobState::Failed,
                 stage: minutes_core::jobs::JobState::Failed.default_stage(),
                 output_path: None,
-                audio_path: "/tmp/old-visible.wav".into(),
+                audio_path: older_wav.display().to_string(),
                 error: Some("older failure".into()),
                 created_at: now - chrono::Duration::minutes(10),
                 started_at: None,
@@ -11083,6 +11993,8 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                consent: None,
+                consent_notice: None,
                 recording_health: None,
             };
 
@@ -11091,7 +12003,49 @@ mod tests {
 
             let notice = latest_retryable_output_notice().expect("older retryable notice");
             assert_eq!(notice.job_id.as_deref(), Some("job-old-visible"));
-            assert_eq!(notice.path, "/tmp/old-visible.wav");
+            assert_eq!(notice.path, older_wav.display().to_string());
+        });
+    }
+
+    #[test]
+    fn latest_retryable_notice_skips_jobs_whose_capture_was_deleted() {
+        with_temp_home(|dir| {
+            let now = chrono::Local::now();
+            let missing_wav = dir.join("vanished.wav");
+            let job = minutes_core::jobs::ProcessingJob {
+                id: "job-capture-gone".into(),
+                title: Some("consent-e2e-check".into()),
+                mode: CaptureMode::Meeting,
+                content_type: ContentType::Meeting,
+                state: minutes_core::jobs::JobState::Failed,
+                stage: minutes_core::jobs::JobState::Failed.default_stage(),
+                output_path: None,
+                audio_path: missing_wav.display().to_string(),
+                error: Some("engine 'parakeet' not compiled in".into()),
+                created_at: now - chrono::Duration::minutes(1),
+                started_at: None,
+                finished_at: Some(now),
+                notice_dismissed_at: None,
+                recording_started_at: None,
+                recording_finished_at: None,
+                context_session_id: None,
+                user_notes: None,
+                pre_context: None,
+                calendar_event: None,
+                template_slug: None,
+                word_count: Some(0),
+                owner_pid: None,
+                retry_count: 0,
+                consent: None,
+                consent_notice: None,
+                recording_health: None,
+            };
+            minutes_core::jobs::write_job(&job).unwrap();
+
+            assert!(
+                latest_retryable_output_notice().is_none(),
+                "a notice promising retry must not surface once the raw capture is gone"
+            );
         });
     }
 
@@ -11123,6 +12077,8 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                consent: None,
+                consent_notice: None,
                 recording_health: None,
             };
             minutes_core::jobs::write_job(&job).unwrap();
@@ -11164,6 +12120,8 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                consent: None,
+                consent_notice: None,
                 recording_health: None,
             };
             minutes_core::jobs::write_job(&job).unwrap();
@@ -11221,6 +12179,8 @@ mod tests {
                 word_count: Some(0),
                 owner_pid: None,
                 retry_count: 0,
+                consent: None,
+                consent_notice: None,
                 recording_health: None,
             };
             minutes_core::jobs::write_job(&job).unwrap();
@@ -11692,9 +12652,11 @@ pub fn cmd_stop_dictation(state: tauri::State<AppState>) -> Result<String, Strin
 fn show_dictation_overlay(app: &tauri::AppHandle) {
     use tauri::WebviewUrl;
 
-    // Close existing overlay if any
+    // Destroy existing overlay synchronously before rebuilding the same label.
+    // `close()` only queues a close-request event; a stale transparent WebView
+    // can otherwise overlap the new overlay during AppKit/WebKit frame updates.
     if let Some(win) = app.get_webview_window("dictation-overlay") {
-        win.close().ok();
+        win.destroy().ok();
     }
 
     // Position: bottom-right HUD, anchored to the current monitor work area.
@@ -11919,6 +12881,16 @@ pub fn cmd_start_live_transcript(
 ) -> Result<(), String> {
     try_acquire_live(&state)?;
 
+    let permission_preflight = minutes_core::capture::preflight_microphone_only();
+    if let Some(reason) = permission_preflight.blocking_reason {
+        state.live_transcript_active.store(false, Ordering::SeqCst);
+        return Err(reason);
+    }
+    for warning in permission_preflight.warnings {
+        eprintln!("[live-transcript] {}", warning);
+        app.emit("live-transcript:warning", warning.as_str()).ok();
+    }
+
     let active = state.live_transcript_active.clone();
     let stop_flag = state.live_transcript_stop_flag.clone();
     stop_flag.store(false, Ordering::Relaxed);
@@ -12071,9 +13043,8 @@ pub fn cmd_set_live_shortcut(
         "live_transcript".into(),
         "shortcut_enabled".into(),
         enabled.to_string(),
-    )
-    .ok();
-    cmd_set_setting("live_transcript".into(), "shortcut".into(), next_shortcut).ok();
+    )?;
+    cmd_set_setting("live_transcript".into(), "shortcut".into(), next_shortcut)?;
 
     Ok(cmd_live_shortcut_settings(state))
 }
@@ -12193,7 +13164,18 @@ pub fn cmd_set_palette_shortcut(
                 state
                     .palette_shortcut_enabled
                     .store(false, Ordering::Relaxed);
-                cmd_set_setting("palette".into(), "shortcut_enabled".into(), "false".into()).ok();
+                // We're already returning an error to the user; if persisting
+                // the force-disabled state ALSO fails, log it rather than
+                // swallow (the original registration error is what the user
+                // needs to see, so don't override the return value here).
+                if let Err(persist_err) =
+                    cmd_set_setting("palette".into(), "shortcut_enabled".into(), "false".into())
+                {
+                    eprintln!(
+                        "[palette-shortcut] failed to persist force-disabled state: {}",
+                        persist_err
+                    );
+                }
                 return Err(format!(
                     "Could not register {} and could not restore the previous shortcut. \
                      Palette shortcut is now disabled — set a different binding from \
@@ -12221,9 +13203,8 @@ pub fn cmd_set_palette_shortcut(
         "palette".into(),
         "shortcut_enabled".into(),
         enabled.to_string(),
-    )
-    .ok();
-    cmd_set_setting("palette".into(), "shortcut".into(), next_shortcut).ok();
+    )?;
+    cmd_set_setting("palette".into(), "shortcut".into(), next_shortcut)?;
 
     Ok(cmd_palette_settings(state))
 }
@@ -12608,7 +13589,7 @@ fn finish_dictation_overlay_lifecycle(app: &tauri::AppHandle, guard: Option<Dict
         None,
     );
     if let Some(window) = app.get_webview_window("dictation-overlay") {
-        if let Err(error) = window.close() {
+        if let Err(error) = window.destroy() {
             tracing::debug!(error = %error, "could not close dictation overlay");
             dictation_focus_debug(
                 "overlay_close_failed",
@@ -12685,6 +13666,15 @@ fn start_dictation_session(
         active: Arc::clone(&state.dictation_active),
         app: app.clone(),
     };
+
+    let permission_preflight = minutes_core::capture::preflight_microphone_only();
+    if let Some(reason) = permission_preflight.blocking_reason {
+        return Err(reason);
+    }
+    for warning in permission_preflight.warnings {
+        eprintln!("[dictation] {}", warning);
+        app.emit("dictation:warning", warning.as_str()).ok();
+    }
 
     let dictation_target_context = take_pending_dictation_target(&state)
         .or_else(crate::text_insertion::capture_active_target_context);
@@ -12948,7 +13938,10 @@ pub fn cmd_set_shortcut(
                     config.dictation.hotkey_enabled = false;
                 }
             }
-            ShortcutSlot::QuickThought => {}
+            ShortcutSlot::QuickThought => {
+                config.global_hotkey.shortcut_enabled = true;
+                config.global_hotkey.shortcut = status.shortcut.clone();
+            }
         }
         config
             .save()
@@ -12979,7 +13972,12 @@ pub fn cmd_set_shortcut(
                     }
                 }
             }
-            ShortcutSlot::QuickThought => {}
+            ShortcutSlot::QuickThought => {
+                config.global_hotkey.shortcut_enabled = false;
+                if !shortcut.is_empty() {
+                    config.global_hotkey.shortcut = shortcut;
+                }
+            }
         }
         config
             .save()
@@ -13489,6 +14487,15 @@ pub fn handle_palette_shortcut_event(
 /// still live and a reopen race could attach to a window that is
 /// about to disappear. `destroy()` skips the close-request event and
 /// removes the window immediately.
+/// In-window accelerator: plain Cmd+K opens the palette when the main
+/// Minutes window already has focus (bead minutes-s5fb). The GLOBAL
+/// binding stays Cmd+Shift+K; a global plain Cmd+K would shadow the
+/// palette key of half the apps on the machine.
+#[tauri::command]
+pub fn cmd_toggle_palette(app: tauri::AppHandle) {
+    toggle_palette_window(&app);
+}
+
 pub fn toggle_palette_window(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
 

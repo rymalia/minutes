@@ -860,10 +860,22 @@
       color: var(--live);
     }
 
+    .status-pill.sensitive {
+      font-size: 11px;
+      padding: 3px 10px;
+      width: auto;
+      height: auto;
+      border-radius: 12px;
+      opacity: 1;
+      background: var(--accent-tint);
+      color: var(--accent);
+    }
+
     html[data-platform="macos"] .header .status-pill.recording,
     html[data-platform="macos"] .header .status-pill.starting,
     html[data-platform="macos"] .header .status-pill.processing,
-    html[data-platform="macos"] .header .status-pill.live {
+    html[data-platform="macos"] .header .status-pill.live,
+    html[data-platform="macos"] .header .status-pill.sensitive {
       font-size: 0;
       padding: 0;
       width: 8px;
@@ -2891,6 +2903,23 @@
       display: flex;
     }
 
+    .consent-overlay {
+      position: fixed;
+      inset: 0;
+      background: var(--modal-scrim);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      z-index: 130;
+    }
+
+    .consent-overlay.active {
+      display: flex;
+    }
+
     .readiness-card {
       width: min(720px, 100%);
       max-height: calc(100vh - 40px);
@@ -3005,6 +3034,10 @@
       margin-top: 10px;
     }
 
+    .consent-actions {
+      padding: 0 20px 18px;
+    }
+
     .readiness-action-status {
       width: 100%;
       font-size: 11px;
@@ -3014,6 +3047,21 @@
 
     .readiness-action-status.error {
       color: var(--orange);
+    }
+
+    .consent-script-label {
+      font-family: var(--font-mono, monospace);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: var(--text-secondary);
+      margin: 0 0 8px;
+    }
+    .consent-disclosure {
+      margin: 0;
+      white-space: pre-wrap;
+      color: var(--text);
+      line-height: 1.5;
     }
 
     /* ── Recovery view ── */
@@ -4734,6 +4782,26 @@
     </div>
   </div>
 
+  <!-- Recording consent confirmation -->
+  <div class="consent-overlay" id="recording-consent-overlay">
+    <div class="readiness-card" role="dialog" aria-modal="true" aria-labelledby="recording-consent-title">
+      <div class="readiness-header">
+        <div>
+          <div class="readiness-title" id="recording-consent-title">Before you record</div>
+          <div class="readiness-sub">Require mode is on: make sure everyone gets told this is being recorded, now or as they join.</div>
+        </div>
+      </div>
+      <div class="readiness-scroll">
+        <p class="consent-script-label">Your disclosure script, when the moment comes:</p>
+        <p class="consent-disclosure" id="recording-consent-disclosure"></p>
+      </div>
+      <div class="readiness-actions consent-actions">
+        <button class="btn btn-primary btn-sm" id="recording-consent-confirm">I&apos;ll make sure, start recording</button>
+        <button class="btn btn-secondary btn-sm" id="recording-consent-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Recovery -->
   <div class="recovery-overlay" id="recovery-overlay">
     <div class="recovery-card" role="dialog" aria-modal="true" aria-labelledby="recovery-title">
@@ -5337,6 +5405,37 @@
         </div>
         <div class="about-controls">
           <div class="about-controls-group">
+            <div class="about-controls-copy">Recording consent reminder</div>
+            <div class="about-controls-meta">Shows a local-transcription disclosure before recording a meeting. A disclosure aid, not advice; make sure everyone present has agreed where required.</div>
+            <select id="settings-consent-mode" class="settings-field">
+              <option value="off">Off</option>
+              <option value="remind">Remind me (default)</option>
+              <option value="require">Require confirmation (CLI blocks; app reminds for now)</option>
+            </select>
+          </div>
+        </div>
+        <div class="about-controls">
+          <div class="about-controls-group">
+            <div class="about-controls-copy">Disclosure script</div>
+            <input type="text" id="settings-consent-disclosure" class="settings-field" spellcheck="false">
+          </div>
+        </div>
+        <div class="about-controls">
+          <div class="about-controls-group">
+            <div class="about-controls-copy">Default frontmatter basis</div>
+            <div class="about-controls-meta">Optional value stamped into meeting frontmatter when no per-recording basis is supplied.</div>
+            <select id="settings-consent-default-basis" class="settings-field">
+              <option value="">Unattested unless supplied</option>
+              <option value="verbal_all_parties">Verbal, all parties</option>
+              <option value="notice_in_invite">Notice in invite</option>
+              <option value="recorded_disclosed">Recording disclosed</option>
+              <option value="na">Not applicable</option>
+              <option value="unattested">Unattested</option>
+            </select>
+          </div>
+        </div>
+        <div class="about-controls">
+          <div class="about-controls-group">
             <div class="about-controls-copy">Meeting-adjacent desktop context</div>
             <div class="about-controls-meta" id="settings-desktop-context-status">
               Off. App/window context stays disabled until you turn it on.
@@ -5665,6 +5764,10 @@
     const readinessOverlay = document.getElementById('readiness-overlay');
     const readinessButton = document.getElementById('btn-readiness');
     const readinessScroll = document.getElementById('readiness-scroll');
+    const recordingConsentOverlay = document.getElementById('recording-consent-overlay');
+    const recordingConsentDisclosure = document.getElementById('recording-consent-disclosure');
+    const recordingConsentConfirm = document.getElementById('recording-consent-confirm');
+    const recordingConsentCancel = document.getElementById('recording-consent-cancel');
     const jobsButton = document.getElementById('btn-jobs');
     const jobsCount = document.getElementById('jobs-count');
     const jobsOverlay = document.getElementById('jobs-overlay');
@@ -5700,6 +5803,7 @@
     let isStarting = false;
     let isProcessing = false;
     let isLiveTranscript = false;
+    let isSensitiveMeeting = false;
     let currentMeetingPath = null;
     const liveBar = document.getElementById('live-bar');
     // Live bar elements are accessed by ID inline (live-time, live-utterances)
@@ -5924,7 +6028,7 @@
       if (status.ready) {
         const installedAt = status.metadata?.installedAt ? ` Installed ${new Date(status.metadata.installedAt).toLocaleString()}.` : '';
         const tokenizer = status.tokenizerLabel ? ` Tokenizer: ${status.tokenizerLabel}.` : '';
-        const warm = ` Warm: ${status.warm ? 'yes' : 'no'}.`;
+        const warm = status.sidecar ? ` Sidecar: ${status.sidecar}.` : '';
         return {
           summary: `${status.model} is ready for local transcription.`,
           detail: `Backend: Parakeet. Binary: ${status.binary}.${tokenizer}${warm}${installedAt}`.trim(),
@@ -6421,6 +6525,7 @@
         isRecording = status.recording;
         isStarting = !!status.starting;
         isProcessing = !!status.processing;
+        isSensitiveMeeting = !!(status.sensitive && status.sensitive.active);
         updateJobsChip(status.processingJobCount || 0);
         renderProcessingJobs(status.processingJobs || []);
         updateOutputNotice(status.latestOutput);
@@ -6541,6 +6646,21 @@
           if (wasRecording) {
             playCue('stop');
           }
+        } else if (isSensitiveMeeting) {
+          statusPill.className = 'status-pill sensitive';
+          statusPill.textContent = 'sensitive';
+          recordingBar.classList.add('active');
+          recordingLabel.textContent = status.sensitive.title
+            ? `Sensitive meeting · ${status.sensitive.title}`
+            : 'Sensitive meeting';
+          recordingSourceHealth.classList.remove('active');
+          processingBar.classList.remove('active');
+          liveBar.classList.remove('active');
+          callBanner.classList.remove('active');
+          setFooterCaptureMode(true, 'recording');
+          recordingTime.textContent = status.sensitive.elapsed || '';
+          updateViz(0);
+          startFastPoll();
         } else {
           // Check live transcript status
           let wasLive = isLiveTranscript;
@@ -6805,12 +6925,15 @@
       // Skip entirely if the unified shortcut system is active
       if (typeof unifiedShortcutsActive !== 'undefined' && unifiedShortcutsActive) return;
       try {
+        // config.toml is the source of truth: cmd_global_hotkey_settings
+        // returns AppState, which is seeded from config.global_hotkey at
+        // startup. localStorage is no longer authoritative (the old shadow
+        // store masked the config drop fixed in the settings round-trip
+        // audit); we keep writing it for backward-compat but never read it
+        // as the deciding value.
         const settings = await invoke('cmd_global_hotkey_settings');
-        hotkeyShortcut =
-          localStorage.getItem('minutes.globalHotkeyShortcut') || settings.shortcut || hotkeyShortcut;
-        const storedEnabled = localStorage.getItem('minutes.globalHotkeyEnabled');
-        const desiredEnabled = storedEnabled === null ? !!settings.enabled : storedEnabled === 'true';
-        await syncHotkey(desiredEnabled, hotkeyShortcut);
+        hotkeyShortcut = settings.shortcut || hotkeyShortcut;
+        await syncHotkey(!!settings.enabled, hotkeyShortcut);
       } catch (e) {
         console.error('Load hotkey settings:', e);
         setHotkeyStatus('Global shortcut is unavailable right now.', true);
@@ -7256,10 +7379,42 @@
       return undefined;
     }
 
-    function startDesktopRecordingFromUi() {
-      const args = recordingStartArgsForCurrentUi();
-      return args ? invoke('cmd_start_recording', args) : invoke('cmd_start_recording');
+    let pendingRecordingStartArgs = null;
+
+    function closeRecordingConsentModal() {
+      recordingConsentOverlay.classList.remove('active');
+      pendingRecordingStartArgs = null;
     }
+
+    function showRecordingConsentModal(disclosure, args) {
+      pendingRecordingStartArgs = args || {};
+      recordingConsentDisclosure.textContent = disclosure || '';
+      recordingConsentOverlay.classList.add('active');
+      recordingConsentConfirm.focus();
+    }
+
+    async function startDesktopRecordingWithArgs(args, consentConfirmed = false) {
+      const payload = { ...(args || {}) };
+      if (consentConfirmed) payload.consentConfirmed = true;
+      const result = await invoke('cmd_start_recording', payload);
+      if (result && result.status === 'consentRequired') {
+        setFooterCaptureMode(false);
+        showRecordingConsentModal(result.disclosure, args);
+      }
+      return result;
+    }
+
+    function startDesktopRecordingFromUi() {
+      return startDesktopRecordingWithArgs(recordingStartArgsForCurrentUi());
+    }
+
+    // Palette / tray / hotkey / desktop-control starts under Require mode
+    // arrive as a backend event rather than a JS invoke result; show the
+    // same modal (review F1/F2). Confirm restarts with pipeline defaults.
+    window.__TAURI__.event.listen('minutes://recording-consent-required', (event) => {
+      const disclosure = event?.payload?.disclosure || '';
+      showRecordingConsentModal(disclosure, {});
+    });
 
     function showRecordingStartError(error) {
       const detail = typeof error === 'string'
@@ -7280,6 +7435,44 @@
         await startDesktopRecordingFromUi();
       } catch (e) {
         console.error('Record:', e);
+        showRecordingStartError(e);
+        setFooterCaptureMode(false);
+      }
+    });
+
+    recordingConsentConfirm.addEventListener('click', async () => {
+      const args = pendingRecordingStartArgs || {};
+      closeRecordingConsentModal();
+      try {
+        setFooterCaptureMode(true, 'starting');
+        startFastPoll();
+        await startDesktopRecordingWithArgs(args, true);
+      } catch (e) {
+        console.error('Record confirm:', e);
+        showRecordingStartError(e);
+        setFooterCaptureMode(false);
+      }
+    });
+
+    recordingConsentCancel.addEventListener('click', () => {
+      closeRecordingConsentModal();
+      setFooterCaptureMode(false);
+    });
+
+    recordingConsentOverlay.addEventListener('click', (e) => {
+      if (e.target === recordingConsentOverlay) {
+        closeRecordingConsentModal();
+        setFooterCaptureMode(false);
+      }
+    });
+
+    window.__TAURI__.event.listen('recording:start-requested', async (event) => {
+      try {
+        setFooterCaptureMode(true, 'starting');
+        startFastPoll();
+        await startDesktopRecordingWithArgs(event?.payload || {});
+      } catch (e) {
+        console.error('Record request:', e);
         showRecordingStartError(e);
         setFooterCaptureMode(false);
       }
@@ -7325,11 +7518,15 @@
         statusPill.textContent = 'stopping';
         recordingLabel.textContent = 'Finishing recording…';
         processingBar.classList.add('active');
-        processingTitle.textContent = 'Stopping recording';
-        processingStage.textContent = 'Saving audio and wrapping up…';
+        processingTitle.textContent = isSensitiveMeeting ? 'Stopping sensitive meeting' : 'Stopping recording';
+        processingStage.textContent = isSensitiveMeeting ? 'Saving typed markers…' : 'Saving audio and wrapping up…';
         setFooterCaptureMode(false);
         startFastPoll();
-        await invoke('cmd_stop_recording');
+        if (isSensitiveMeeting) {
+          await invoke('cmd_sensitive_stop');
+        } else {
+          await invoke('cmd_stop_recording');
+        }
       } catch (e) {
         stopRequested = false;
         document.getElementById('btn-stop').disabled = false;
@@ -8001,13 +8198,76 @@
         detailScroll.appendChild(artifactsCard);
       }
 
-      if (!detail.sections || detail.sections.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'detail-empty';
-        empty.textContent = 'No transcript content available for this recording.';
-        detailScroll.appendChild(empty);
+      if (detail.capture === 'none') {
+        // No-capture sensitive meeting: replace the raw "Audio was not
+        // captured" transcript line with a purposeful status card, including
+        // the debrief affordance the frontmatter promises (minutes-3yub.5).
+        const sensitiveCard = document.createElement('div');
+        sensitiveCard.className = 'detail-context';
+        const sensitiveLabel = document.createElement('div');
+        sensitiveLabel.className = 'detail-context-label';
+        sensitiveLabel.textContent = 'Sensitive Meeting';
+        const sensitiveBody = document.createElement('div');
+        sensitiveBody.className = 'detail-action-list';
+        const statusRow = document.createElement('div');
+        statusRow.className = 'detail-action-item';
+        const statusText = document.createElement('span');
+        statusText.className = 'detail-action-text';
+        const debriefSuffix = detail.debrief === 'complete'
+          ? ' Debrief complete.'
+          : detail.debrief === 'not-applicable'
+            ? ' Debrief marked not applicable.'
+            : '';
+        statusText.textContent = 'No audio was captured, by design. Markers and the debrief are the record.' + debriefSuffix;
+        statusRow.appendChild(statusText);
+        sensitiveBody.appendChild(statusRow);
+        if (detail.debrief === 'pending') {
+          const debriefRow = document.createElement('div');
+          debriefRow.className = 'detail-action-item';
+          const debriefText = document.createElement('span');
+          debriefText.className = 'detail-action-text';
+          debriefText.textContent = 'Debrief pending: capture decisions and action items while they are fresh.';
+          debriefRow.appendChild(debriefText);
+          const debriefBtn = document.createElement('button');
+          debriefBtn.className = 'btn btn-primary btn-sm';
+          debriefBtn.textContent = 'Run debrief';
+          debriefBtn.addEventListener('click', async () => {
+            try {
+              await invoke('cmd_run_meeting_debrief', { path: detail.path });
+              // The debrief prompt lands in the assistant session BEHIND
+              // this overlay; close it so the handoff is visible instead of
+              // appearing to do nothing (Mat's first-use catch).
+              closeDetailView();
+            } catch (e) {
+              showDetailFeedback(`Could not start debrief: ${e}`, 'error');
+            }
+          });
+          debriefRow.appendChild(debriefBtn);
+          sensitiveBody.appendChild(debriefRow);
+        }
+        sensitiveCard.appendChild(sensitiveLabel);
+        sensitiveCard.appendChild(sensitiveBody);
+        detailScroll.appendChild(sensitiveCard);
+      }
+
+      const renderableSections = (detail.sections || []).filter((section) => {
+        // The transcript section of a no-capture meeting is a fixed
+        // placeholder line; the sensitive card above carries that message.
+        if (detail.capture === 'none' && /^transcript$/i.test(section.heading || '')) {
+          return false;
+        }
+        return true;
+      });
+
+      if (!renderableSections || renderableSections.length === 0) {
+        if (detail.capture !== 'none') {
+          const empty = document.createElement('div');
+          empty.className = 'detail-empty';
+          empty.textContent = 'No transcript content available for this recording.';
+          detailScroll.appendChild(empty);
+        }
       } else {
-        for (const section of detail.sections) {
+        for (const section of renderableSections) {
           const sectionEl = document.createElement('section');
           sectionEl.className = 'detail-section';
 
@@ -8350,7 +8610,7 @@
         try {
           setFooterCaptureMode(true, 'starting');
           startFastPoll();
-          await invoke('cmd_start_recording');
+          await startDesktopRecordingWithArgs();
         } catch (e) {
           console.error('First recording:', e);
           showRecordingStartError(e);
@@ -8490,6 +8750,18 @@
 
     // ⌘, keyboard shortcut
     document.addEventListener('keydown', (e) => { if (e.metaKey && e.key === ',') { e.preventDefault(); openSettings(); } });
+    // Plain Cmd+K opens the palette when the Minutes window has focus
+    // (minutes-s5fb). Skip while typing in inputs; the global Cmd+Shift+K
+    // binding is unchanged.
+    document.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key === 'k') {
+        const target = e.target;
+        const tag = target && target.tagName ? target.tagName.toLowerCase() : '';
+        if (tag === 'input' || tag === 'textarea' || (target && target.isContentEditable)) return;
+        e.preventDefault();
+        invoke('cmd_toggle_palette').catch(() => {});
+      }
+    });
 
     async function loadSettings() {
       try {
@@ -8504,8 +8776,13 @@
           document.getElementById('settings-identity-emails').value = (s.identity.emails || []).join(', ');
           document.getElementById('settings-identity-aliases').value = (s.identity.aliases || []).join(', ');
         }
-        // General: sync with existing app state
-        setSettingsToggle('settings-notifications', notifyOnCompletion);
+        // General: notifications come from config (single source of truth);
+        // paint both the settings toggle and the footer toggle / in-memory var
+        // from notifications.completion_enabled, not the cached JS value.
+        const notifyEnabled = s?.notifications?.completion_enabled !== false;
+        setNotificationToggle(notifyEnabled);
+        setSettingsToggle('settings-notifications', notifyEnabled);
+        // Cues are localStorage-only (no config section).
         setSettingsToggle('settings-cues', playCaptureCues);
         // Autostart
         try { const autoOn = await invoke('cmd_get_autostart'); setSettingsToggle('settings-autostart', autoOn); } catch (e) { console.error('autostart check:', e); }
@@ -8626,6 +8903,13 @@
           document.getElementById('settings-agent-command-status').textContent = sumAgents.find(a => a.name === currentCmd) ? 'Installed' : 'Custom command';
         } catch (e) { console.error('agent command picker:', e); }
         setSettingsToggle('settings-screen-share', Boolean(s.privacy?.hide_from_screen_share));
+        const consentMode = s.consent?.mode || 'remind';
+        const consentModeSelect = document.getElementById('settings-consent-mode');
+        if (consentModeSelect) consentModeSelect.value = consentMode;
+        const consentDisclosure = document.getElementById('settings-consent-disclosure');
+        if (consentDisclosure) consentDisclosure.value = s.consent?.disclosure_script || '';
+        const consentDefaultBasis = document.getElementById('settings-consent-default-basis');
+        if (consentDefaultBasis) consentDefaultBasis.value = s.consent?.default_basis || '';
         if (s.desktop_context) {
           setSettingsToggle('settings-desktop-context', Boolean(s.desktop_context.enabled));
           setSettingsToggle('settings-desktop-window-titles', s.desktop_context.capture_window_titles !== false);
@@ -9164,6 +9448,27 @@
         : dl.length ? 'Downloaded: ' + dl.join(', ') + '  •  "' + e.target.value + '" not yet downloaded' : 'No models downloaded yet.';
       document.getElementById('btn-download-model').classList.toggle('is-hidden', isDownloaded);
     });
+    document.getElementById('settings-consent-mode')?.addEventListener('change', async (e) => {
+      try {
+        await invoke('cmd_set_setting', { section: 'consent', key: 'mode', value: e.target.value });
+      } catch (err) {
+        console.error('consent mode:', err);
+      }
+    });
+    document.getElementById('settings-consent-disclosure')?.addEventListener('change', async (e) => {
+      try {
+        await invoke('cmd_set_setting', { section: 'consent', key: 'disclosure_script', value: e.target.value });
+      } catch (err) {
+        console.error('consent disclosure:', err);
+      }
+    });
+    document.getElementById('settings-consent-default-basis')?.addEventListener('change', async (e) => {
+      try {
+        await invoke('cmd_set_setting', { section: 'consent', key: 'default_basis', value: e.target.value });
+      } catch (err) {
+        console.error('consent default basis:', err);
+      }
+    });
     document.getElementById('btn-download-model').addEventListener('click', async () => {
       const model = document.getElementById('settings-whisper-model').value;
       const btn = document.getElementById('btn-download-model');
@@ -9653,7 +9958,9 @@
     function updateSlotUI(slot, status) {
       unifiedSlotState[slot] = status;
 
-      // Sync QuickThought state to localStorage for persistence and legacy compat
+      // Mirror QuickThought state to localStorage for legacy compat only.
+      // config.toml (via cmd_set_shortcut → config.global_hotkey) is the
+      // source of truth now; nothing reads this value as authoritative.
       if (slot === 'quick_thought') {
         localStorage.setItem('minutes.globalHotkeyEnabled', status.enabled ? 'true' : 'false');
         if (status.shortcut) localStorage.setItem('minutes.globalHotkeyShortcut', status.shortcut);
@@ -9943,9 +10250,89 @@
     // Flag: set synchronously so loadHotkeySettings() knows to skip
     let unifiedShortcutsActive = true;
 
+    // ── One-time legacy localStorage → config.toml migration ──────────────
+    // Before this change, two settings lived ONLY in localStorage (and the
+    // in-memory AppState seeded from it), never in config.toml:
+    //   • minutes.notifyOnCompletion   → notifications.completion_enabled
+    //   • minutes.globalHotkeyEnabled  → global_hotkey.shortcut_enabled
+    //   • minutes.globalHotkeyShortcut → global_hotkey.shortcut
+    // config.toml is now the single source of truth for both. On the first
+    // launch after this update we copy any pre-existing localStorage value
+    // INTO config, then DELETE the localStorage key so the migration runs
+    // exactly once and the old drift source is gone. Key-removal is the
+    // one-time guard: once removed, getItem() returns null and the block is
+    // a no-op, so a machine that already migrated can never have a stale JS
+    // value clobber config. A separate `minutes.localStorageConfigMigrated`
+    // sentinel is also set as a belt-and-suspenders marker.
+    //
+    // The promise is awaited by the unified-shortcut restore below (and the
+    // notifications init reads config after it resolves) so the migrated
+    // values are on disk BEFORE anything reads cmd_get_settings.
+    const legacyConfigMigrationReady = (async () => {
+      // One-time guard. updateSlotUI('quick_thought', …) re-writes the legacy
+      // hotkey mirror keys on every status update (they're kept as legacy
+      // compat), so key-removal alone is not durable — the sentinel is. Once
+      // set, this whole block short-circuits and config stays authoritative.
+      if (localStorage.getItem('minutes.localStorageConfigMigrated') === '1') return;
+      try {
+        // Notifications: only migrate an explicit stored value. The historical
+        // default was On, so a *missing* key means "user never changed it" →
+        // leave config's own default (completion_enabled = true) authoritative.
+        const storedNotify = localStorage.getItem('minutes.notifyOnCompletion');
+        if (storedNotify !== null) {
+          try {
+            await invoke('cmd_set_completion_notifications', { enabled: storedNotify !== 'false' });
+          } catch (e) {
+            console.error('Migrate notifyOnCompletion → config:', e);
+          }
+          localStorage.removeItem('minutes.notifyOnCompletion');
+        }
+
+        // Quick-Thought global hotkey: migrate the legacy enable+shortcut shadow
+        // into config via the unified ShortcutManager path (cmd_set_shortcut,
+        // slot quick_thought). We deliberately do NOT use cmd_set_global_hotkey
+        // here: that registers the OS chord through the plugin, and the unified
+        // restore below would then register the SAME chord again through the
+        // ShortcutManager → duplicate-registration error. Routing the migration
+        // through cmd_set_shortcut registers exactly once and persists the same
+        // config.global_hotkey.{shortcut_enabled,shortcut} fields, after which
+        // the restore loop's `current.enabled` guard skips the slot.
+        const storedHkEnabled = localStorage.getItem('minutes.globalHotkeyEnabled');
+        const storedHkShortcut = localStorage.getItem('minutes.globalHotkeyShortcut');
+        if (storedHkEnabled !== null || storedHkShortcut !== null) {
+          const enabled = storedHkEnabled === 'true';
+          const shortcut = storedHkShortcut || hotkeyShortcut || 'CmdOrCtrl+Shift+M';
+          // Migrate regardless of enabled state so a custom (but disabled)
+          // chord is preserved in config — the Rust disable arm keeps a
+          // non-empty shortcut. Skip only the pure no-op (disabled with no
+          // custom chord), where config's defaults already match.
+          if (enabled || storedHkShortcut !== null) {
+            try {
+              const status = await invoke('cmd_set_shortcut', {
+                slot: 'quick_thought', enabled, shortcut, keycode: -1,
+              });
+              updateSlotUI('quick_thought', status);
+            } catch (e) {
+              console.error('Migrate globalHotkey → config:', e);
+            }
+          }
+          // Remove BOTH legacy keys so the migration is one-shot. (updateSlotUI
+          // for quick_thought re-writes these as legacy-compat mirrors, so
+          // remove them AFTER the cmd_set_shortcut call above.)
+          localStorage.removeItem('minutes.globalHotkeyEnabled');
+          localStorage.removeItem('minutes.globalHotkeyShortcut');
+        }
+      } finally {
+        localStorage.setItem('minutes.localStorageConfigMigrated', '1');
+      }
+    })();
+
     // Load initial state for all slots
     // Also restore from saved config
     (async () => {
+      // Wait for the one-time migration so config reflects any legacy
+      // localStorage hotkey value before we read it as the source of truth.
+      await legacyConfigMigrationReady;
       const settings = await invoke('cmd_get_settings').catch(() => null);
       for (const slot of UNIFIED_SLOTS) {
         await loadSlotStatus(slot);
@@ -9973,11 +10360,13 @@
           }
 
           if (slot === 'quick_thought') {
-            const storedEnabled = localStorage.getItem('minutes.globalHotkeyEnabled');
-            const storedShortcut = localStorage.getItem('minutes.globalHotkeyShortcut');
-            if (storedEnabled === 'true') {
+            // config.toml is the source of truth (settings.global_hotkey),
+            // mirroring the dictation slot above. The old localStorage shadow
+            // store is no longer read here — it masked the config drop fixed
+            // in the settings round-trip audit.
+            if (settings.global_hotkey?.shortcut_enabled) {
               shouldRestore = true;
-              shortcut = storedShortcut || shortcut;
+              shortcut = settings.global_hotkey.shortcut || shortcut;
               keycode = -1;
             }
           }
@@ -10349,6 +10738,14 @@
     }
 
     // ── Expand / collapse with window resize ──
+    function applyRecallWindowLayout(width, options = {}) {
+      return invoke('cmd_apply_recall_window_layout', {
+        width,
+        height: 640,
+        avoidRightEdge: !!options.avoidRightEdge,
+      });
+    }
+
     async function expandRecallPanel() {
       if (recallExpanded || expandAnimating) return;
       expandAnimating = true;
@@ -10358,26 +10755,9 @@
       const isFullscreen = await currentWindow.isFullscreen().catch(() => false);
 
       if (!isFullscreen) {
-        try {
-          // outerPosition() returns physical pixels; convert to logical
-          // so setPosition(LogicalPosition) doesn't shift on Retina displays.
-          const scaleFactor = await currentWindow.scaleFactor();
-          const pos = await currentWindow.outerPosition();
-          const logicalX = pos.x / scaleFactor;
-          const logicalY = pos.y / scaleFactor;
-          const screenWidth = window.screen.availWidth;
-          const newRight = logicalX + EXPANDED_WIDTH;
-          if (newRight > screenWidth) {
-            const shiftX = Math.max(0, logicalX - (newRight - screenWidth));
-            await currentWindow.setPosition(new window.__TAURI__.window.LogicalPosition(shiftX, logicalY));
-          }
-        } catch (e) {
-          console.error('Screen edge check:', e);
-        }
-
-        await currentWindow.setSize(
-          new window.__TAURI__.window.LogicalSize(EXPANDED_WIDTH, 640)
-        );
+        await applyRecallWindowLayout(EXPANDED_WIDTH, { avoidRightEdge: true }).catch((e) => {
+          console.error('Recall expand layout:', e);
+        });
       }
 
       applyRecallRatio(getStoredRecallRatio());
@@ -10411,9 +10791,7 @@
 
       setTimeout(async () => {
         if (!isFullscreen) {
-          await currentWindow.setSize(
-            new window.__TAURI__.window.LogicalSize(COLLAPSED_WIDTH, 640)
-          );
+          await applyRecallWindowLayout(COLLAPSED_WIDTH).catch(() => { });
         }
         recallExpanded = false;
         expandAnimating = false;
@@ -10529,8 +10907,7 @@
 
       // Only steal focus on first detection, not periodic reminders
       if (!is_reminder) {
-        currentWindow.show();
-        currentWindow.setFocus();
+        invoke('cmd_show_main_window').catch(() => {});
       }
     });
 
@@ -10541,7 +10918,7 @@
         // Mark the session as call-detection-initiated so stop_when_call_ends
         // knows this recording is eligible for the auto-stop prompt when the
         // call app exits. Manual `minutes record` / hotkey starts never set this.
-        await invoke('cmd_start_recording', { intent: 'call', source: 'call_detect' });
+        await startDesktopRecordingWithArgs({ intent: 'call', source: 'call_detect' });
       } catch (e) {
         console.error('Call recording:', e);
         showRecordingStartError(e);
@@ -11112,12 +11489,10 @@
     }
 
     // Idempotent DOM writes — skip when the value is unchanged. The status poll
-    // (checkStatus) reasserts identical idle text every 2s forever; on the main
-    // window (transparent + NSVisualEffectMaterial::Sidebar vibrancy) every text
-    // mutation forces WindowServer to re-blend the whole window, so unguarded
-    // no-op writes peg WindowServer while the app sits idle. These let an
-    // unchanged idle tick produce zero DOM churn. clearChildren() above is
-    // already idempotent (no-ops when the node is empty).
+    // (checkStatus) reasserts identical idle text every 2s forever; repeated
+    // no-op writes still make WebKit re-layout the main app surface while idle.
+    // These let an unchanged idle tick produce zero DOM churn. clearChildren()
+    // above is already idempotent (no-ops when the node is empty).
     function setText(el, value) {
       if (el && el.textContent !== value) el.textContent = value;
     }
@@ -11700,9 +12075,7 @@
     currentWindow.onResized(async () => {
       const fs = await currentWindow.isFullscreen().catch(() => false);
       if (wasFullscreen && !fs && recallExpanded) {
-        await currentWindow.setSize(
-          new window.__TAURI__.window.LogicalSize(EXPANDED_WIDTH, 640)
-        ).catch(() => { });
+        await applyRecallWindowLayout(EXPANDED_WIDTH).catch(() => { });
         if (recallFitAddon) recallFitAddon.fit();
       }
       wasFullscreen = fs;
@@ -12553,21 +12926,28 @@
     });
 
     // ── Init ──
-    const storedNotify = localStorage.getItem('minutes.notifyOnCompletion');
-    if (storedNotify === 'false') {
-      setNotificationToggle(false);
-    } else {
-      setNotificationToggle(true);
-    }
+    // Notifications: config.toml is the source of truth. Wait for the one-time
+    // localStorage→config migration, then paint the toggle from
+    // notifications.completion_enabled (cmd_get_settings). We no longer read
+    // minutes.notifyOnCompletion here, and we no longer push the JS value into
+    // config on launch — that push was what stomped a config `false` back to
+    // `true` whenever localStorage was absent/stale.
+    (async () => {
+      try {
+        await legacyConfigMigrationReady;
+        const s = await invoke('cmd_get_settings');
+        setNotificationToggle(s?.notifications?.completion_enabled !== false);
+      } catch (e) {
+        console.error('Init notifications from config:', e);
+      }
+    })();
+    // Capture cues are localStorage-only (no config section); unchanged.
     const storedCues = localStorage.getItem('minutes.playCaptureCues');
     if (storedCues === 'false') {
       setCueToggle(false);
     } else {
       setCueToggle(true);
     }
-    invoke('cmd_set_completion_notifications', { enabled: notifyOnCompletion }).catch((e) => {
-      console.error('Init notifications:', e);
-    });
     loadDesktopCapabilities();
     loadHotkeySettings();
     checkSetup();

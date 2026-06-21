@@ -104,6 +104,19 @@ if [[ -f "$SIDECAR" ]]; then
         --sign "$SIGN_ID" \
         "$SIDECAR"
     echo "  Signed sidecar with identity: $SIGN_ID"
+    # Re-signing nested code after the bundle was sealed invalidates the
+    # outer seal (#311): copied/downloaded apps then fail Gatekeeper as
+    # "damaged". Re-seal the outer bundle (no --deep, preserving the
+    # sidecar's entitlements) and verify strictly.
+    if [[ "$SIGN_ID" == "-" ]]; then
+        codesign --force --sign - "$APP_BUNDLE"
+    else
+        codesign --force --options runtime --timestamp \
+            --entitlements tauri/src-tauri/entitlements.plist \
+            --sign "$SIGN_ID" \
+            "$APP_BUNDLE"
+    fi
+    codesign --verify --deep --strict "$APP_BUNDLE" && echo "  Bundle seal OK"
 else
     echo "  WARNING: expected sidecar not found at $SIDECAR — skipping re-sign."
 fi
@@ -122,7 +135,12 @@ PY
 echo "=== Signing + Installing CLI ==="
 mkdir -p ~/.local/bin
 codesign -s - -f target/release/minutes 2>/dev/null || true
-cp -f target/release/minutes ~/.local/bin/minutes && echo "  Installed to ~/.local/bin/"
+# rm-then-copy gives the new binary a fresh inode. Copying OVER the existing
+# file invalidates its code signature while any process (e.g. `minutes watch`)
+# is still executing from it, and the kernel then SIGKILLs every new launch
+# of that path (exit 137) until reinstall.
+rm -f ~/.local/bin/minutes
+cp target/release/minutes ~/.local/bin/minutes && echo "  Installed to ~/.local/bin/"
 
 echo ""
 

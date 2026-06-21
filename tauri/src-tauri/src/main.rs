@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{
     menu::{Menu, MenuItem, SubmenuBuilder},
     tray::TrayIconBuilder,
-    Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
+    Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 
 #[cfg(feature = "parakeet")]
@@ -32,6 +32,9 @@ mod text_insertion;
 const MINUTES_WEBSITE_URL: &str = "https://useminutes.app";
 const MINUTES_CHANGELOG_URL: &str = "https://github.com/silverstein/minutes/releases";
 const MINUTES_DISCUSSIONS_URL: &str = "https://github.com/silverstein/minutes/discussions";
+const MAIN_WINDOW_TRANSPARENT: bool = false;
+#[cfg(target_os = "macos")]
+const MAIN_WINDOW_APPLY_VIBRANCY: bool = false;
 
 static CLEAN_EXIT_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -243,10 +246,17 @@ fn maybe_run_process_queue_worker() -> Option<i32> {
     }
 }
 
-fn show_main_window(app: &tauri::AppHandle) {
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        win.show().ok();
-        win.set_focus().ok();
+        if !win.is_visible().ok().unwrap_or(false) {
+            win.show().ok();
+        }
+        if win.is_minimized().ok().unwrap_or(false) {
+            win.unminimize().ok();
+        }
+        if !win.is_focused().ok().unwrap_or(false) {
+            win.set_focus().ok();
+        }
         return;
     }
     let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
@@ -255,7 +265,13 @@ fn show_main_window(app: &tauri::AppHandle) {
         .title("")
         .inner_size(560.0, 700.0)
         .min_inner_size(460.0, 520.0)
-        .transparent(true)
+        // The main window is hidden, shown, and resized while the app lives in
+        // the tray. On macOS 26, keeping that long-lived WebView transparent
+        // and backed by vibrancy can trip a WebKit frame-update PAC trap when
+        // the hidden window is re-framed. The UI already paints solid app
+        // surfaces, so keep this WebView opaque and reserve transparency for
+        // short-lived overlays that need it.
+        .transparent(MAIN_WINDOW_TRANSPARENT)
         .content_protected(Config::load().privacy.hide_from_screen_share)
         .focused(true);
 
@@ -271,7 +287,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 
     if let Ok(win) = builder.build() {
         #[cfg(target_os = "macos")]
-        {
+        if MAIN_WINDOW_APPLY_VIBRANCY {
             use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
             apply_vibrancy(&win, NSVisualEffectMaterial::Sidebar, None, None).ok();
         }
@@ -289,6 +305,81 @@ fn show_main_window(app: &tauri::AppHandle) {
             }
         }
     }
+}
+
+#[tauri::command]
+fn cmd_show_main_window(app: tauri::AppHandle) {
+    show_main_window(&app);
+}
+
+#[tauri::command]
+fn cmd_apply_recall_window_layout(
+    app: tauri::AppHandle,
+    width: f64,
+    height: f64,
+    avoid_right_edge: bool,
+) -> Result<(), String> {
+    const MIN_WIDTH: f64 = 460.0;
+    const MAX_WIDTH: f64 = 1400.0;
+    const MIN_HEIGHT: f64 = 520.0;
+    const MAX_HEIGHT: f64 = 1000.0;
+    const FRAME_EPSILON: f64 = 1.0;
+
+    if !width.is_finite() || !height.is_finite() {
+        return Err("invalid recall window layout size".into());
+    }
+
+    let Some(win) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    if !win.is_visible().ok().unwrap_or(false) {
+        return Ok(());
+    }
+    if win.is_fullscreen().ok().unwrap_or(false) {
+        return Ok(());
+    }
+
+    let width = width.clamp(MIN_WIDTH, MAX_WIDTH);
+    let height = height.clamp(MIN_HEIGHT, MAX_HEIGHT);
+    let monitor = win.current_monitor().ok().flatten();
+    let scale = monitor.as_ref().map(|monitor| monitor.scale_factor());
+
+    if avoid_right_edge {
+        if let (Some(monitor), Some(scale)) = (monitor.as_ref(), scale) {
+            let position = win.outer_position().map_err(|e| e.to_string())?;
+            let logical_x = position.x as f64 / scale;
+            let logical_y = position.y as f64 / scale;
+            let work_area = monitor.work_area();
+            let work_x = work_area.position.x as f64 / scale;
+            let work_width = work_area.size.width as f64 / scale;
+            let work_right = work_x + work_width;
+            let new_right = logical_x + width;
+            if new_right - work_right > FRAME_EPSILON {
+                let shift_x = (logical_x - (new_right - work_right)).max(work_x);
+                if (shift_x - logical_x).abs() > FRAME_EPSILON {
+                    win.set_position(LogicalPosition::new(shift_x, logical_y))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+
+    let size_needs_update = match (win.outer_size(), scale) {
+        (Ok(size), Some(scale)) => {
+            let logical_width = size.width as f64 / scale;
+            let logical_height = size.height as f64 / scale;
+            (logical_width - width).abs() > FRAME_EPSILON
+                || (logical_height - height).abs() > FRAME_EPSILON
+        }
+        _ => true,
+    };
+
+    if size_needs_update {
+        win.set_size(LogicalSize::new(width, height))
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 fn show_note_window(app: &tauri::AppHandle) {
@@ -923,7 +1014,7 @@ fn show_meeting_prompt(app: &tauri::AppHandle, event: &minutes_core::calendar::C
 
     // Close any existing prompt window
     if let Some(win) = app.get_webview_window("meeting-prompt") {
-        win.close().ok();
+        win.destroy().ok();
     }
 
     // Stage the payload keyed by a monotonic token. The overlay reads its
@@ -1038,6 +1129,22 @@ fn refresh_calendar_items(
 
     // Query upcoming events
     let all_events = minutes_core::calendar::upcoming_events(CALENDAR_LOOKAHEAD_MINUTES);
+    // When reads are blocked (Add-Only/denied), an empty menu is a lie:
+    // say so, with a clickable line that opens the Calendars privacy pane
+    // (#300).
+    if all_events.is_empty() && !minutes_core::calendar::calendar_access_status().can_read() {
+        if let Ok(item) = MenuItem::with_id(
+            app,
+            "calendar-access-warning",
+            "Calendar access limited — reminders off (click to fix)",
+            true,
+            None::<&str>,
+        ) {
+            if menu.append(&item).is_ok() {
+                state.items.push(item);
+            }
+        }
+    }
     eprintln!(
         "[calendar] queried {} upcoming events ({}min lookahead)",
         all_events.len(),
@@ -1257,10 +1364,15 @@ fn main() {
     let processing_stage = Arc::new(Mutex::new(None));
     let latest_output = Arc::new(Mutex::new(None));
     let activation_progress = commands::load_activation_progress(&startup_config_snapshot);
-    let completion_notifications_enabled = Arc::new(AtomicBool::new(true));
-    let global_hotkey_enabled = Arc::new(AtomicBool::new(false));
-    let global_hotkey_shortcut =
-        Arc::new(Mutex::new(commands::default_hotkey_shortcut().to_string()));
+    let completion_notifications_enabled = Arc::new(AtomicBool::new(
+        startup_config_snapshot.notifications.completion_enabled,
+    ));
+    let global_hotkey_enabled = Arc::new(AtomicBool::new(
+        startup_config_snapshot.global_hotkey.shortcut_enabled,
+    ));
+    let global_hotkey_shortcut = Arc::new(Mutex::new(
+        startup_config_snapshot.global_hotkey.shortcut.clone(),
+    ));
     let dictation_shortcut_enabled = Arc::new(AtomicBool::new(false));
     let dictation_shortcut = Arc::new(Mutex::new(
         startup_config_snapshot.dictation.shortcut.clone(),
@@ -1305,6 +1417,13 @@ fn main() {
                 show_main_window(app);
                 let _ = app.emit("minutes://show-whats-new", ());
             }
+            "calendar-access-warning" => {
+                let _ = std::process::Command::new("open")
+                    .arg(
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars",
+                    )
+                    .spawn();
+            }
             "app-open-settings" => {
                 show_main_window(app);
                 let _ = app.emit("minutes://show-settings", ());
@@ -1348,12 +1467,13 @@ fn main() {
                 windows
                     .sort_by_key(|window| (window.label() != "main", window.label().to_string()));
                 for window in &windows {
+                    if window.label() == "main" {
+                        continue;
+                    }
                     let _ = window.unminimize();
                     let _ = window.show();
                 }
-                if let Some(main) = app.get_webview_window("main") {
-                    let _ = main.set_focus();
-                }
+                show_main_window(app);
             }
             "app-quit" => {
                 request_clean_exit(app, 0);
@@ -1761,6 +1881,9 @@ fn main() {
                 None::<&str>,
             )?;
             let quick_thought_item_ref = quick_thought_item.clone();
+            let sensitive_item =
+                MenuItem::with_id(app, "sensitive", "Sensitive Meeting", true, None::<&str>)?;
+            let sensitive_item_ref = sensitive_item.clone();
             let stop_item = MenuItem::with_id(
                 app,
                 "stop",
@@ -1833,6 +1956,7 @@ fn main() {
                 &sep0,
                 &record_item,
                 &quick_thought_item,
+                &sensitive_item,
                 &stop_item,
                 &mic_mute_item,
                 &sep,
@@ -1858,6 +1982,7 @@ fn main() {
                     let stop = stop_clone.clone();
                     let rec_item = record_item_ref.clone();
                     let quick_item = quick_thought_item_ref.clone();
+                    let sensitive_item_ref = sensitive_item_ref.clone();
                     let stp_item = stop_item_ref.clone();
                     let screen_share_hidden = screen_share_hidden.clone();
                     let screen_share_item_ref = screen_share_item_ref.clone();
@@ -1880,39 +2005,9 @@ fn main() {
                             {
                                 return;
                             }
-                            // Transitional text only — enabled-state flips
-                            // flow through sync_tray_state so they cannot
-                            // race against external (non-tray) state changes
-                            // (issue #223 / codex race-condition catch).
-                            rec_item.set_text("Starting...").ok();
-                            let app_handle = app.clone();
-                            let ri = rec_item.clone();
-                            std::thread::spawn(move || {
-                                let app_for_launch = app_handle.clone();
-                                let state = app_handle.state::<commands::AppState>();
-                                let _ = commands::launch_recording(
-                                    app_for_launch,
-                                    &state,
-                                    minutes_core::CaptureMode::Meeting,
-                                    None,
-                                    false,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                );
-                                // Reset transitional text only. Do NOT call
-                                // sync_tray_state here — `launch_recording`
-                                // is non-blocking; it spawns the actual
-                                // recorder thread which fires its own
-                                // sync_tray_state calls through the
-                                // recording lifecycle. Calling sync here
-                                // would race against the inner recorder's
-                                // sync and could leave the menu showing
-                                // record-enabled mid-recording (codex
-                                // diff-review attack #1).
-                                ri.set_text("Start Recording").ok();
-                            });
+                            show_main_window(app);
+                            app.emit("recording:start-requested", serde_json::json!({}))
+                                .ok();
                         }
                         "quick-thought" => {
                             let app_state = app.state::<commands::AppState>();
@@ -2026,6 +2121,49 @@ fn main() {
                             };
                             mic_mute_item_ref.set_text(label).ok();
                         }
+                        "sensitive" => {
+                            if minutes_core::sensitive::is_active() {
+                                let app_handle = app.clone();
+                                let state = app.state::<commands::AppState>();
+                                match commands::cmd_sensitive_stop(app_handle, state) {
+                                    Ok(result) => {
+                                        sensitive_item_ref.set_text("Sensitive Meeting").ok();
+                                        commands::show_user_notification(
+                                            app,
+                                            "Sensitive meeting saved",
+                                            result
+                                                .get("path")
+                                                .and_then(|value| value.as_str())
+                                                .unwrap_or("Saved."),
+                                        );
+                                    }
+                                    Err(err) => commands::show_user_notification(
+                                        app,
+                                        "Sensitive meeting",
+                                        &err,
+                                    ),
+                                }
+                            } else {
+                                match commands::cmd_sensitive_start(None) {
+                                    Ok(result) => {
+                                        sensitive_item_ref.set_text("Stop Sensitive Meeting").ok();
+                                        commands::show_user_notification(
+                                            app,
+                                            "Sensitive meeting started",
+                                            result
+                                                .get("title")
+                                                .and_then(|value| value.as_str())
+                                                .unwrap_or("Sensitive meeting"),
+                                        );
+                                    }
+                                    Err(err) => commands::show_user_notification(
+                                        app,
+                                        "Sensitive meeting",
+                                        &err,
+                                    ),
+                                }
+                            }
+                        }
                         "note" => {
                             show_note_window(app);
                         }
@@ -2131,25 +2269,9 @@ fn main() {
                             {
                                 return;
                             }
-                            rec_item.set_text("Starting...").ok();
-                            let app_handle = app.clone();
-                            let ri = rec_item.clone();
-                            std::thread::spawn(move || {
-                                let app_for_launch = app_handle.clone();
-                                let state = app_handle.state::<commands::AppState>();
-                                let _ = commands::launch_recording(
-                                    app_for_launch,
-                                    &state,
-                                    minutes_core::CaptureMode::Meeting,
-                                    None,
-                                    false,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                );
-                                ri.set_text("Start Recording").ok();
-                            });
+                            show_main_window(app);
+                            app.emit("recording:start-requested", serde_json::json!({}))
+                                .ok();
                         }
                         _ => {}
                     }
@@ -2331,6 +2453,10 @@ fn main() {
             commands::cmd_list_meetings,
             commands::cmd_search,
             commands::cmd_add_note,
+            commands::cmd_sensitive_start,
+            commands::cmd_sensitive_stop,
+            commands::cmd_run_meeting_debrief,
+            commands::cmd_toggle_palette,
             commands::cmd_start_recording,
             commands::cmd_stop_recording,
             commands::cmd_cancel_call_end_countdown,
@@ -2376,6 +2502,8 @@ fn main() {
             commands::cmd_needs_setup,
             commands::cmd_download_model,
             commands::cmd_mark_activation_nudge_shown,
+            cmd_show_main_window,
+            cmd_apply_recall_window_layout,
             commands::cmd_upcoming_meetings,
             commands::cmd_spawn_terminal,
             commands::cmd_pty_input,
@@ -2398,6 +2526,7 @@ fn main() {
             commands::cmd_vault_unlink,
             commands::cmd_open_meeting_url,
             commands::cmd_get_meeting_prompt,
+            commands::cmd_close_meeting_prompt,
             commands::cmd_start_dictation,
             commands::cmd_stop_dictation,
             commands::cmd_dismiss_dictation_overlay,
@@ -2458,7 +2587,10 @@ fn main() {
 
 #[cfg(test)]
 mod tray_activity_tests {
-    use super::{derive_tray_activity, TrayActivity, TrayAppearance, TrayStateSnapshot};
+    use super::{
+        derive_tray_activity, TrayActivity, TrayAppearance, TrayStateSnapshot,
+        MAIN_WINDOW_TRANSPARENT,
+    };
 
     fn snap(recording: bool, live: bool, dictation: bool) -> TrayStateSnapshot {
         TrayStateSnapshot {
@@ -2466,6 +2598,136 @@ mod tray_activity_tests {
             live,
             dictation,
         }
+    }
+
+    #[test]
+    fn main_window_uses_opaque_webview_for_hidden_tray_lifecycle() {
+        const {
+            assert!(
+                !MAIN_WINDOW_TRANSPARENT,
+                "the long-lived main WebView is hidden/shown from the tray; keep it opaque"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        const {
+            assert!(
+                !super::MAIN_WINDOW_APPLY_VIBRANCY,
+                "macOS vibrancy on the hidden main WebView can crash WebKit during frame updates"
+            );
+        }
+    }
+
+    #[test]
+    fn show_main_window_restores_minimized_window_before_focus() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let main_rs =
+            std::fs::read_to_string(format!("{}/src/main.rs", manifest)).expect("read main.rs");
+        let restore_idx = main_rs
+            .find("win.unminimize().ok()")
+            .expect("main-window reveal should restore minimized windows");
+        let focus_idx = main_rs
+            .find("win.set_focus().ok()")
+            .expect("main-window reveal should focus the window");
+
+        assert!(
+            restore_idx < focus_idx,
+            "main-window reveal should unminimize before requesting focus"
+        );
+    }
+
+    #[test]
+    fn meeting_prompt_dismiss_uses_native_destroy_path() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let main_rs = std::fs::read_to_string(format!("{}/src/main.rs", manifest))
+            .expect("failed to read main.rs");
+        let prompt_html =
+            std::fs::read_to_string(format!("{}/../src/meeting-prompt.html", manifest))
+                .expect("failed to read meeting-prompt.html");
+
+        assert!(
+            main_rs.contains("commands::cmd_close_meeting_prompt"),
+            "meeting prompt close command must be registered with Tauri"
+        );
+        assert!(
+            main_rs.contains("win.destroy().ok()"),
+            "replacing an existing meeting prompt should destroy, not close, the old WebView"
+        );
+        assert!(
+            prompt_html.contains("cmd_close_meeting_prompt"),
+            "meeting prompt dismiss must route through native destroy"
+        );
+        assert!(
+            !prompt_html.contains("getCurrentWebviewWindow().close()"),
+            "direct JS WebView close can crash WebKit during prompt frame updates"
+        );
+    }
+
+    #[test]
+    fn recall_layout_uses_native_guarded_command() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let main_rs = std::fs::read_to_string(format!("{}/src/main.rs", manifest))
+            .expect("failed to read main.rs");
+        let index_html = std::fs::read_to_string(format!("{}/../src/index.html", manifest))
+            .expect("failed to read index.html");
+        let capabilities =
+            std::fs::read_to_string(format!("{}/capabilities/default.json", manifest))
+                .expect("failed to read default capability");
+
+        assert!(
+            main_rs.contains("cmd_apply_recall_window_layout"),
+            "Recall window layout changes should route through a native command"
+        );
+        assert!(
+            main_rs.contains("FRAME_EPSILON") && main_rs.contains("win.outer_size()"),
+            "Recall native layout should skip no-op frame size updates"
+        );
+        assert!(
+            main_rs.contains("(shift_x - logical_x).abs() > FRAME_EPSILON"),
+            "Recall native layout should skip no-op frame position updates"
+        );
+        assert!(
+            index_html.contains("cmd_apply_recall_window_layout"),
+            "Recall frontend should call the guarded native layout command"
+        );
+        assert!(
+            !index_html.contains("currentWindow.setSize("),
+            "direct JS setSize on the long-lived main WebView can crash WebKit during frame updates"
+        );
+        assert!(
+            !index_html.contains("currentWindow.setPosition("),
+            "direct JS setPosition on the long-lived main WebView can crash WebKit during frame updates"
+        );
+        for permission in [
+            "core:window:allow-set-focus",
+            "core:window:allow-set-size",
+            "core:window:allow-set-position",
+            "core:window:allow-outer-position",
+            "core:window:allow-outer-size",
+        ] {
+            assert!(
+                !capabilities.contains(permission),
+                "frontend windows should not have {} while native commands own main-window frame updates",
+                permission
+            );
+        }
+    }
+
+    #[test]
+    fn dictation_overlay_lifecycle_uses_destroy_for_same_label_rebuilds() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let commands_rs = std::fs::read_to_string(format!("{}/src/commands.rs", manifest))
+            .expect("failed to read commands.rs");
+
+        assert!(
+            commands_rs.contains("get_webview_window(\"dictation-overlay\")")
+                && commands_rs.contains("win.destroy().ok()"),
+            "replacing an existing dictation overlay should destroy, not close, the old WebView"
+        );
+        assert!(
+            !commands_rs.contains("window.close()"),
+            "dictation overlay lifecycle should not queue async WebView close during teardown"
+        );
     }
 
     #[test]

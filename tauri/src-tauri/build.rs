@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    compile_mic_check_helper();
     compile_system_audio_helper();
     compile_calendar_helper();
     stage_minutes_cli_sidecar();
@@ -10,15 +11,24 @@ fn main() {
     tauri_build::build()
 }
 
+/// Below this size the staged sidecar cannot be a real CLI binary (the real
+/// one is tens of MB; the placeholder is ~52 bytes).
+const MIN_REAL_CLI_SIDECAR_BYTES: u64 = 1_000_000;
+
 /// Ensure `bin/minutes-<target>` exists so Tauri's `externalBin` resolution
 /// succeeds during plain `cargo check` / `cargo clippy` runs that don't go
 /// through `scripts/build.sh`.
 ///
 /// If the release CLI has been built (`target/release/minutes`), copy it. If
 /// not, write a non-empty placeholder. The placeholder is enough to satisfy
-/// Tauri's existence check at compile time; the real bundling step
-/// (`cargo tauri build --bundles app`) is preceded by `scripts/build.sh`'s
-/// CLI build + copy, which overwrites this with the actual binary.
+/// Tauri's existence check at compile time for check/clippy runs.
+///
+/// Distributable bundles must never contain the placeholder. Release builds
+/// set `MINUTES_REQUIRE_REAL_CLI_SIDECAR=1`, which makes this step hard-fail
+/// instead of writing a placeholder, and re-stage over a stale placeholder
+/// left by an earlier check/clippy run (issue #324: the release workflow
+/// called `cargo tauri build` without building the CLI first, and every
+/// CI-built macOS bundle since v0.16.2 shipped the stub).
 fn stage_minutes_cli_sidecar() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "macos" {
@@ -33,9 +43,20 @@ fn stage_minutes_cli_sidecar() {
     let staged = bin_dir.join(format!("minutes-{}", target));
 
     println!("cargo:rerun-if-changed={}", staged.display());
+    println!("cargo:rerun-if-env-changed=MINUTES_REQUIRE_REAL_CLI_SIDECAR");
+
+    let require_real = std::env::var("MINUTES_REQUIRE_REAL_CLI_SIDECAR")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
 
     if staged.exists() {
-        return;
+        let staged_len = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
+        if !require_real || staged_len >= MIN_REAL_CLI_SIDECAR_BYTES {
+            return;
+        }
+        // Required mode found a stale placeholder from an earlier
+        // check/clippy run: drop it and stage the real binary below.
+        fs::remove_file(&staged).expect("failed to remove stale placeholder sidecar");
     }
 
     fs::create_dir_all(&bin_dir).expect("failed to create sidecar bin dir");
@@ -57,7 +78,17 @@ fn stage_minutes_cli_sidecar() {
         }
     }
 
-    // Placeholder — `cargo tauri build` will overwrite this from `scripts/build.sh`.
+    if require_real {
+        panic!(
+            "MINUTES_REQUIRE_REAL_CLI_SIDECAR is set but no release CLI binary was found \
+             (looked at {:?}). Run `cargo build --release -p minutes-cli` before \
+             `cargo tauri build` so the bundle ships a working CLI instead of a placeholder.",
+            candidate_paths
+        );
+    }
+
+    // Placeholder for check/clippy only. Distributable builds set
+    // MINUTES_REQUIRE_REAL_CLI_SIDECAR and hard-fail above instead.
     println!(
         "cargo:warning=No minutes CLI release binary found; writing placeholder sidecar at {}. Run `cargo build --release -p minutes-cli` (or `scripts/build.sh`) before `cargo tauri build`.",
         staged.display()
@@ -76,6 +107,42 @@ fn stage_minutes_cli_sidecar() {
         perm.set_mode(0o755);
         fs::set_permissions(&staged, perm).expect("chmod placeholder sidecar");
     }
+}
+
+fn compile_mic_check_helper() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "macos" {
+        return;
+    }
+
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set"),
+    );
+    let source = manifest_dir.join("src/mic_check.swift");
+    let bin_dir = manifest_dir.join("bin");
+    let binary = bin_dir.join("mic_check");
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".into());
+    let target_binary = bin_dir.join(format!("mic_check-{}", target));
+
+    println!("cargo:rerun-if-changed={}", source.display());
+    std::fs::create_dir_all(&bin_dir).expect("failed to create helper bin dir");
+
+    let output = Command::new("swiftc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("failed to run swiftc for mic_check");
+
+    if !output.status.success() {
+        panic!(
+            "failed to compile mic_check.swift: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    std::fs::copy(&binary, &target_binary)
+        .expect("failed to copy target-specific mic_check helper");
 }
 
 fn compile_system_audio_helper() {

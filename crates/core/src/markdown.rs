@@ -8,6 +8,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 // ──────────────────────────────────────────────────────────────
 // Meeting/memo markdown output.
@@ -35,6 +36,82 @@ pub enum OutputStatus {
     /// fell back to empty output (e.g. agent timeout, empty summary).
     /// Per-step failures are recorded in [`Frontmatter::processing_warnings`].
     Degraded,
+}
+
+/// Attested basis for capturing a conversation.
+///
+/// This is privacy metadata only, not a determination about requirements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentBasis {
+    VerbalAllParties,
+    NoticeInInvite,
+    RecordedDisclosed,
+    #[serde(rename = "na")]
+    NotApplicable,
+    Unattested,
+}
+
+impl ConsentBasis {
+    /// Stable serialized string used in frontmatter and CLI flags.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VerbalAllParties => "verbal_all_parties",
+            Self::NoticeInInvite => "notice_in_invite",
+            Self::RecordedDisclosed => "recorded_disclosed",
+            Self::NotApplicable => "na",
+            Self::Unattested => "unattested",
+        }
+    }
+}
+
+impl FromStr for ConsentBasis {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim() {
+            "verbal_all_parties" => Ok(Self::VerbalAllParties),
+            "notice_in_invite" => Ok(Self::NoticeInInvite),
+            "recorded_disclosed" => Ok(Self::RecordedDisclosed),
+            "na" => Ok(Self::NotApplicable),
+            "unattested" => Ok(Self::Unattested),
+            other => Err(format!(
+                "unknown consent basis: {other}. Use verbal_all_parties, notice_in_invite, recorded_disclosed, na, or unattested."
+            )),
+        }
+    }
+}
+
+/// How a meeting artifact was captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CapturePolicy {
+    /// No audio was captured for this meeting artifact.
+    None,
+}
+
+/// Sensitivity designation for agent-facing policy layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Sensitivity {
+    /// Standard meeting artifact.
+    Normal,
+    /// Restricted artifact; agent surfaces enforce this in a later wave.
+    Restricted,
+}
+
+/// Human debrief state for no-capture meeting artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum DebriefStatus {
+    /// The meeting was stopped without an interactive debrief.
+    Pending,
+    /// A human supplied the debrief (at stop time or later via the
+    /// assistant flow); the artifact is the finished record.
+    Complete,
+    /// The human marked the debrief unnecessary (test run, accidental
+    /// trigger); nothing further is expected.
+    NotApplicable,
 }
 
 /// A non-fatal failure of a post-transcript pipeline step.
@@ -185,6 +262,24 @@ pub struct Frontmatter {
     pub intents: Vec<Intent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recorded_by: Option<String>,
+    /// Capture mode for the artifact. Absent means a normal captured meeting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CapturePolicy>,
+    /// Sensitivity designation. Absent means the normal sensitivity policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<Sensitivity>,
+    /// Debrief completion state for no-capture meetings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debrief: Option<DebriefStatus>,
+    /// How consent to capture was obtained, if attested.
+    ///
+    /// Privacy metadata only, not a determination about requirements. See
+    /// [`crate::config::ConsentConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent: Option<ConsentBasis>,
+    /// The exact disclosure the user gave or used, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_notice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<Visibility>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -998,6 +1093,11 @@ mod tests {
             decisions: vec![],
             intents: vec![],
             recorded_by: None,
+            capture: None,
+            sensitivity: None,
+            debrief: None,
+            consent: None,
+            consent_notice: None,
             visibility: None,
             speaker_map: vec![],
             recording_health: None,
@@ -1018,6 +1118,67 @@ mod tests {
         assert_eq!(parsed.date.month(), 5);
         assert_eq!(parsed.date.day(), 14);
         assert_eq!(parsed.duration, "0s");
+    }
+
+    #[test]
+    fn consent_basis_serializes_expected_strings() {
+        assert_eq!(
+            serde_yaml::to_string(&ConsentBasis::VerbalAllParties).unwrap(),
+            "verbal_all_parties\n"
+        );
+        assert_eq!(
+            ConsentBasis::RecordedDisclosed.as_str(),
+            "recorded_disclosed"
+        );
+        assert_eq!(
+            "na".parse::<ConsentBasis>().unwrap(),
+            ConsentBasis::NotApplicable
+        );
+        assert!("mystery".parse::<ConsentBasis>().is_err());
+    }
+
+    #[test]
+    fn frontmatter_consent_fields_are_optional_and_serialize_when_present() {
+        let legacy: Frontmatter =
+            serde_yaml::from_str("title: Test\ntype: meeting\ndate: 2026-06-04T10:00:00-07:00\n")
+                .unwrap();
+        assert_eq!(legacy.consent, None);
+        assert_eq!(legacy.consent_notice, None);
+
+        let mut fm = test_frontmatter();
+        let without_consent = serde_yaml::to_string(&fm).unwrap();
+        assert!(!without_consent.contains("consent:"));
+        assert!(!without_consent.contains("consent_notice:"));
+
+        fm.consent = Some(ConsentBasis::NoticeInInvite);
+        fm.consent_notice = Some("Shared in the calendar invite.".into());
+        let with_consent = serde_yaml::to_string(&fm).unwrap();
+        assert!(with_consent.contains("consent: notice_in_invite"));
+        assert!(with_consent.contains("consent_notice: Shared in the calendar invite."));
+    }
+
+    #[test]
+    fn frontmatter_sensitive_fields_are_optional_and_serialize_when_present() {
+        let legacy: Frontmatter =
+            serde_yaml::from_str("title: Test\ntype: meeting\ndate: 2026-06-10T10:00:00-07:00\n")
+                .unwrap();
+        assert_eq!(legacy.capture, None);
+        assert_eq!(legacy.sensitivity, None);
+        assert_eq!(legacy.debrief, None);
+
+        let mut fm = test_frontmatter();
+        let without_sensitive = serde_yaml::to_string(&fm).unwrap();
+        assert!(!without_sensitive.contains("capture:"));
+        assert!(!without_sensitive.contains("sensitivity:"));
+        assert!(!without_sensitive.contains("debrief:"));
+
+        fm.capture = Some(CapturePolicy::None);
+        fm.sensitivity = Some(Sensitivity::Restricted);
+        fm.debrief = Some(DebriefStatus::Pending);
+        let with_sensitive = serde_yaml::to_string(&fm).unwrap();
+        assert!(with_sensitive.contains("capture: none"));
+        assert!(with_sensitive.contains("sensitivity: restricted"));
+        assert!(with_sensitive.contains("debrief: pending"));
     }
 
     #[test]
@@ -1611,23 +1772,28 @@ mod tests {
     #[test]
     fn rename_meeting_resolves_slug_collision() {
         let dir = TempDir::new().unwrap();
+        let frontmatter =
+            "title: \"Call\"\ntype: meeting\ndate: 2026-04-07T10:00:00-07:00\nduration: 0\n";
         let path = write_meeting(
             &dir,
             "2026-04-07-call.md",
-            "title: \"Call\"\ntype: meeting\ndate: 2026-04-07T10:00:00-07:00\nduration: 0\n",
+            frontmatter,
             "## Transcript\n\nHi\n",
         );
         // Pre-create a sibling that the new slug would collide with.
+        let parsed: Frontmatter = serde_yaml::from_str(frontmatter).unwrap();
+        let collision_slug = generate_slug("Pricing Review", parsed.date, None);
         std::fs::write(
-            dir.path().join("2026-04-07-pricing-review.md"),
+            dir.path().join(&collision_slug),
             "---\ntitle: existing\ntype: meeting\ndate: 2026-04-07T10:00:00-07:00\nduration: 0\n---\n",
         )
         .unwrap();
 
         let new_path = rename_meeting(&path, "Pricing Review").unwrap();
         let name = new_path.file_name().unwrap().to_str().unwrap();
+        let collision_stem = collision_slug.trim_end_matches(".md");
         assert!(
-            name.starts_with("2026-04-07-pricing-review-") && name.ends_with(".md"),
+            name.starts_with(&format!("{collision_stem}-")) && name.ends_with(".md"),
             "expected collision-resolved slug, got {}",
             name
         );

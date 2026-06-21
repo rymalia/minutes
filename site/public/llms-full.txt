@@ -2,13 +2,56 @@
 
 > Generated file. Do not edit by hand.
 > Source: manifest.json + crates/mcp/src/index.ts + site/lib/skills-catalog.json
-> Last generated: 2026-06-08
+> Last generated: 2026-06-19
 
 ## Product
 
 Minutes is an open-source meeting corpus you own. Record, transcribe, search, and query every meeting and voice memo on your own disk. No cloud, no vendor to outlive. Output is structured markdown in `~/meetings/` that Claude Desktop, Claude Code, Codex, Gemini CLI, Cursor, OpenCode, Pi, and any MCP-compatible client read from the same folder, without a proprietary SDK or API key. Ten years from now, `grep` still works on your corpus.
 
 31 tools • 7 resources • Interactive MCP App dashboard • Prompt templates
+
+**What's new in 0.18.14:**
+• **The macOS window-lifecycle crash is closed.** The desktop app could crash on WebKit/AppKit frame reconciliation when the main window was revealed, resized, or rebuilt. All window frame mutations now run through Rust-owned, visibility-guarded paths, the reveal helper is idempotent and unminimizes correctly, the frontend's window-mutation capabilities are removed, and the Recall layout no longer fires no-op frame changes. Thanks to Caleb Chong.
+• **Zoom call detection handles vanity meeting URLs.** Calendar detection now recognizes Zoom links on vanity subdomains (company.zoom.us / .zoom.com), personal-link and dashed-host forms, and unwraps Google Calendar redirect wrappers. Thanks to Caleb Chong.
+• **App settings persist reliably.** Several Settings toggles (global hotkey, completion notifications) could appear to change in the app but not write to config.toml or revert on restart. The settings round-trip was audited and hardened with a guard test.
+
+**What's new in 0.18.13:**
+• **Recordings warn before they capture silence.** If macOS has not granted microphone permission (for example after an app update re-signed Minutes), recording now warns or blocks at the start with the exact fix, instead of producing a silent file you discover after the meeting. A call that can still capture the other side warns and proceeds; a mic-only recording blocks. Covers meetings, memos, dictation, and live transcript.
+• **Zoom call detection works with non-default input devices.** macOS native call detection could miss an active Zoom call when Zoom used an input route other than the system default. Detection now attributes active microphone input to the call app's process, so it no longer misses the call (and no longer false-positives when a dictation tool is the active mic consumer). Thanks to Caleb Chong for the fix and Quinn for confirming the related Windows menu rendering fix.
+
+**What's new in 0.18.12:**
+• **No more WebKit crash on tray hide/show.** The main window kept a transparent, vibrancy-backed WebView alive while it was hidden and re-shown from the tray, which could trip a WebKit frame-update crash on macOS 26. The window is now opaque (no visible change, the UI already paints solid surfaces) and the crash is gone.
+• **Dismissing the meeting prompt no longer crashes the app.** Every dismissal path (Dismiss, X, Escape, auto-close, the 60s timeout) now closes the prompt window through a native destroy deferred out of the JS frame, instead of a self-close that could crash WebKit. Thanks to Caleb Chong for both fixes.
+
+**What's new in 0.18.11:**
+• **The macOS app bundle ships a real CLI.** Since 0.16.2, CI-built bundles contained a placeholder script instead of the CLI binary, so the in-app Set up CLI flow produced a CLI that printed an error and exited. The release pipeline now builds the CLI before bundling, hard-fails if a placeholder would ever ship again, and verifies the bundled binary after the build. If you used Set up CLI before: update the app, then run Set up CLI again.
+
+**What's new in 0.18.10:**
+• **The desktop app can find ffmpeg now.** Dock-launched macOS apps get a minimal PATH, so every ffmpeg call inside the desktop app silently failed and audio decoding fell back to the slower pure-Rust path. A shared resolver checks the MINUTES_FFMPEG override, then PATH, then standard Homebrew and system locations, and `minutes health` reports which ffmpeg it resolved.
+• **The whisper model loads once per file, not once per silence gap.** Voice-activity detection splits long recordings into chunks and each chunk paid a full model load: a 49-minute meeting loaded the model 227 times. One context now loads per file and is shared across chunks, with per-chunk decode state unchanged.
+• **Dev builds pass Gatekeeper's seal check.** Build scripts now sign inside-out (nested binaries first, then the bundle), so quarantined copies no longer report as "damaged".
+• **Homebrew tap trust, documented.** If brew warns "Skipping silverstein/tap because it is not trusted", run `brew trust silverstein/tap` once; the README and site now say so.
+• **Granola import, clarified.** The README and CLI error message now explain that the export directory must be populated by a separate tool first, and point to the API-based granola-to-minutes route.
+
+**What's new in 0.18.9:**
+• **Sensitive meetings: a first-class no-capture mode.** Designate a meeting sensitive and Minutes records nothing; you still get a real meeting file built from your typed markers and a guided debrief, marked `capture: none` so future agent-policy layers can respect it. Start and stop from the palette, tray, or `minutes sensitive start/stop`.
+• **Require mode now truly gates desktop recording.** With consent mode set to require, every recording entry point (button, palette, tray, hotkey, automation) shows the same blocking confirmation before capture starts; Cancel leaves nothing behind.
+• **Calendar permission status tells the truth.** macOS can silently downgrade calendar access to Add-Only, which kills meeting reminders while everything claims healthy (it bit us for weeks). Readiness and the tray now report the observed access state with the exact fix path.
+• **In-window Cmd+K.** Plain Cmd+K opens the command palette when the Minutes window has focus; the global binding stays Cmd+Shift+K.
+• **Sensitive meeting cards are useful.** The detail view shows a purposeful no-capture card with a one-click Run debrief that hands the meeting to your assistant.
+• **Fixes.** CLI version parsing respects semver prerelease/build suffixes; repo install docs use rm-then-copy so a rebuilt binary can never invalidate its own signature under a running process; a new Using Minutes user guide is live on the site.
+
+**What's new in 0.18.8:**
+• **Live Parakeet transcription is fast by default.** The warm sidecar that keeps the model resident between utterances now enables itself whenever Parakeet is your engine and the `example-server` binary is present; no hidden setting to discover. Status surfaces report the real state (warm server, or cold per-utterance with the fix linked) instead of a misleading 'Warm: yes'. A legacy `parakeet_sidecar_enabled = false` that earlier versions wrote into every config is recognized as a serializer artifact and treated as auto; forcing the sidecar off is now "off" in config.toml.
+• **`minutes setup --parakeet` checks the live-sidecar binary.** If `example-server` is missing it says so and prints the build recipe, instead of letting live mode silently run slow.
+• **Dead settings removed.** Desktop-context domain allow/deny lists were accepted by settings and documented but enforced nowhere; they are gone until real enforcement exists.
+
+**What's new in 0.18.7:**
+• **Recording consent, built in.** A new consent layer stamps every recording's consent basis into the meeting frontmatter, with an optional disclosure reminder before each meeting recording and a Require mode that blocks CLI recording until confirmed (the desktop app reminds for now; a blocking confirmation is coming). Configure it in Settings or under `[consent]` in config.toml. It is a disclosure aid, not legal advice: make sure everyone present has agreed where required.
+• **Live transcripts no longer go silent mid-meeting.** A slow or wedged transcription call could starve live mode's audio pipeline, freezing the live transcript while the recording itself stayed healthy. Transcription now runs on a dedicated worker with a bounded queue, the first seconds of a meeting are no longer lost to model loading, and stuck engine calls time out and retry on CPU.
+• **pi and opencode summaries no longer hang.** Agents that take their prompt as a file argument blocked forever on an unused stdin pipe and timed out on every summarization. Fixed across all three agent spawn paths. Thanks to Geert Theys (@gtheys) for the diagnosis and the fix.
+• **Stale Retry cards no longer appear at launch.** The startup notice for a failed recording could promise a retry after its raw capture had already been cleaned up, and Retry then failed with "audio file missing." The notice now verifies the capture still exists before offering it.
+• **Desktop call capture docs corrected.** The desktop app records calls natively via ScreenCaptureKit: no BlackHole needed. The audio guide now leads with that and reserves BlackHole for the CLI path. Thanks to @dean815 for pushing on this.
 
 **What's new in 0.18.6:**
 • **USB conference speakerphones no longer lose native call recordings.** A quiet mic stem (a far-field mic plus the device's own echo cancellation) was misread as empty, so the whole call was discarded as unrecoverable. Minutes now scans the full mic stem for audio instead of only the opening seconds, so a call that starts with the far end speaking is captured correctly. Thanks to @jmh1313 for the detailed report.

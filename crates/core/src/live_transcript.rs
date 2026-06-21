@@ -13,8 +13,8 @@ use serde_json::json;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // ──────────────────────────────────────────────────────────────
@@ -265,6 +265,8 @@ struct LiveTranscriptWriter {
     jsonl_path: PathBuf,
     jsonl_failed: bool,
     wav_failed: bool,
+    pending_utterances: u64,
+    dropped_utterances: u64,
     last_status_write: Instant,
 }
 
@@ -291,6 +293,14 @@ pub struct LiveStatus {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+    /// Finalized utterances queued for transcription but not yet written.
+    /// Only present (recording sidecar) when the backlog is non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_utterances: Option<u64>,
+    /// Utterances whose audio was discarded because the transcription worker
+    /// could not keep up. Only present when non-zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_utterances: Option<u64>,
 }
 
 const SIDECAR_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
@@ -350,6 +360,8 @@ impl LiveTranscriptWriter {
             jsonl_path,
             jsonl_failed: false,
             wav_failed: false,
+            pending_utterances: 0,
+            dropped_utterances: 0,
             last_status_write: Instant::now()
                 .checked_sub(SIDECAR_HEARTBEAT_INTERVAL)
                 .unwrap_or_else(Instant::now),
@@ -365,6 +377,12 @@ impl LiveTranscriptWriter {
         last_duration_ms: u64,
         diagnostic: Option<&str>,
     ) {
+        let backlog_diagnostic = (self.dropped_utterances > 0).then(|| {
+            format!(
+                "transcription backlog: {} utterance(s) dropped",
+                self.dropped_utterances
+            )
+        });
         let status = LiveStatus {
             start_time: self.start_wall,
             updated_at: Local::now(),
@@ -373,10 +391,18 @@ impl LiveTranscriptWriter {
             last_offset_ms: self.start_time.elapsed().as_millis() as u64,
             last_duration_ms,
             session_id: self.session_id.clone(),
-            diagnostic: diagnostic.map(str::to_string),
+            diagnostic: diagnostic.map(str::to_string).or(backlog_diagnostic),
+            pending_utterances: (self.pending_utterances > 0).then_some(self.pending_utterances),
+            dropped_utterances: (self.dropped_utterances > 0).then_some(self.dropped_utterances),
         };
         write_live_status(&status);
         self.last_status_write = Instant::now();
+    }
+
+    /// Update transcription-backlog counters surfaced in the status file.
+    fn set_backlog_stats(&mut self, pending: u64, dropped: u64) {
+        self.pending_utterances = pending;
+        self.dropped_utterances = dropped;
     }
 
     fn mark_healthy(&mut self) {
@@ -642,6 +668,14 @@ fn run_inner(
 
     // Start audio stream FIRST — validate mic access before truncating any files
     let device_override = config.recording.device.as_deref();
+    let permission_preflight = crate::capture::preflight_microphone_only();
+    if let Some(reason) = permission_preflight.blocking_reason {
+        return Err(LiveTranscriptError::PermissionBlocked(reason).into());
+    }
+    for warning in permission_preflight.warnings {
+        tracing::warn!(warning = %warning, "live transcript microphone permission preflight warning");
+    }
+
     let mut stream = AudioStream::start(device_override)?;
     tracing::info!(device = %stream.device_name, "live transcript audio stream started");
 
@@ -680,7 +714,7 @@ fn run_inner(
     // Parakeet engine dispatch — mirrors run_sidecar_inner_mpsc. When the user
     // configures `engine = "parakeet"` and the parakeet feature is compiled in,
     // utterance samples are accumulated and routed through the parakeet path
-    // (warm sidecar socket when `parakeet_sidecar_enabled = true`, subprocess
+    // (warm sidecar socket when the effective sidecar decision is on, subprocess
     // otherwise) at VAD-end. On failure the session transparently falls back
     // to whisper for the remainder. See RFC 0002.
     #[cfg(feature = "parakeet")]
@@ -714,9 +748,9 @@ fn run_inner(
     // Warm the parakeet sidecar at session start so the first utterance doesn't
     // pay subprocess-spawn + model-load latency. We only warm the sidecar lane
     // because:
-    //   - `parakeet_sidecar_enabled = true` → warmup leaves a hot example-server
+    //   - sidecar effective-on (auto or explicit) → warmup leaves a hot example-server
     //     child + loaded model, making subsequent utterances fast.
-    //   - `parakeet_sidecar_enabled = false` → warmup would just be a throwaway
+    //   - sidecar effective-off → warmup would just be a throwaway
     //     subprocess on a silent WAV; it wouldn't leave a hot backend behind,
     //     so the first real utterance still pays full spawn/model-load cost.
     //     Skipping the no-op warmup avoids a 4-5s startup stall for nothing.
@@ -727,7 +761,7 @@ fn run_inner(
     // whisper here would be strictly worse than what the per-utterance code
     // already does.
     #[cfg(feature = "parakeet")]
-    if parakeet_live_enabled && config.transcription.parakeet_sidecar_enabled {
+    if parakeet_live_enabled && crate::parakeet_sidecar::sidecar_enabled_effective(config) {
         eprintln!("[minutes] Warming parakeet sidecar... (first-run cold start can take 10-30s)");
         let started = std::time::Instant::now();
         match crate::transcription_coordinator::warmup_active_backend(config) {
@@ -1468,7 +1502,10 @@ fn trim_front(buffer: &mut Vec<f32>, max_len: usize) {
     }
 }
 
-#[cfg(all(feature = "whisper", any(feature = "parakeet", target_os = "macos")))]
+// Gated on `whisper` alone: its only caller (`transcribe_utterance_for_sidecar`)
+// is cfg(feature = "whisper"), and a narrower gate breaks Linux default-feature
+// builds (whisper on, parakeet off, not macOS).
+#[cfg(feature = "whisper")]
 fn transcribe_with_whisper_for_live_sidecar(
     samples: &[f32],
     whisper_ctx: &whisper_rs::WhisperContext,
@@ -1493,6 +1530,110 @@ fn transcribe_with_whisper_for_live_sidecar(
     streaming
         .finalize(whisper_ctx)
         .map(|result| (result.text, result.duration_secs))
+}
+
+/// Cap on finalized utterances awaiting transcription in the recording
+/// sidecar. Past this the engine is not keeping up with the meeting; holding
+/// more audio only grows latency without ever catching up, so overflow drops
+/// the newest utterance and is surfaced via `LiveStatus::dropped_utterances`.
+#[cfg(feature = "whisper")]
+const SIDECAR_UTTERANCE_QUEUE_CAP: usize = 3;
+
+/// A poisoned writer mutex means a thread panicked mid-write; the writer's
+/// own failure latches (`jsonl_failed`) already cover torn state, and losing
+/// the remaining transcript over a poison flag would be strictly worse.
+#[cfg(feature = "whisper")]
+fn lock_ignore_poison<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(feature = "whisper")]
+fn enqueue_sidecar_utterance(
+    job_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
+    samples: Vec<f32>,
+    pending: &AtomicU64,
+    dropped: &AtomicU64,
+) {
+    if samples.is_empty() {
+        return;
+    }
+    match job_tx.try_send(samples) {
+        Ok(()) => {
+            pending.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            let total = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                dropped_utterances = total,
+                "live sidecar transcription backlog full — dropping utterance audio"
+            );
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+    }
+}
+
+/// Engine dispatch for one finalized utterance on the sidecar's transcription
+/// worker. A parakeet failure permanently switches the session to whisper
+/// (loaded lazily, then kept warm) so a broken engine costs one utterance,
+/// not every subsequent one.
+#[cfg(feature = "whisper")]
+fn transcribe_utterance_for_sidecar(
+    samples: &[f32],
+    config: &Config,
+    whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
+    parakeet_enabled: &mut bool,
+) -> Option<(String, f64)> {
+    #[cfg(feature = "parakeet")]
+    if *parakeet_enabled {
+        match transcribe_with_parakeet_for_live_sidecar(samples, config) {
+            Ok(result) => return result,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "live recording-sidecar parakeet path failed — switching this session to whisper"
+                );
+                *parakeet_enabled = false;
+                emit_live_engine_fallback_warning("recording-sidecar", &error.to_string());
+            }
+        }
+    }
+    #[cfg(not(feature = "parakeet"))]
+    {
+        let _ = &parakeet_enabled;
+    }
+    let ctx = match whisper_ctx {
+        Some(ctx) => ctx,
+        None => match load_sidecar_whisper_ctx(config) {
+            Ok(ctx) => whisper_ctx.insert(ctx),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "whisper model unavailable for live sidecar — skipping utterance"
+                );
+                return None;
+            }
+        },
+    };
+    transcribe_with_whisper_for_live_sidecar(samples, ctx, config.transcription.language.clone())
+}
+
+#[cfg(feature = "whisper")]
+fn load_sidecar_whisper_ctx(config: &Config) -> Result<whisper_rs::WhisperContext, MinutesError> {
+    let model_path = if config.live_transcript.model.is_empty() {
+        crate::transcribe::resolve_model_path_for_dictation(config)?
+    } else {
+        crate::transcribe::resolve_model_path_by_name(&config.live_transcript.model, config)?
+    };
+    tracing::info!(model = %model_path.display(), "loading whisper model for recording sidecar");
+    Ok(whisper_rs::WhisperContext::new_with_params(
+        model_path
+            .to_str()
+            .ok_or_else(|| TranscribeError::ModelLoadError("invalid path".into()))?,
+        crate::transcribe::whisper_context_params(),
+    )
+    .map_err(|e| TranscribeError::ModelLoadError(format!("{}", e)))?)
 }
 
 /// Minimum utterance length for the parakeet path — mirrors
@@ -2004,41 +2145,21 @@ fn run_sidecar_inner_mpsc(
 
     write_live_status_transition(LiveStatusState::Starting, None);
 
-    let whisper_ctx = {
-        let model_path = if config.live_transcript.model.is_empty() {
-            crate::transcribe::resolve_model_path_for_dictation(config)?
-        } else {
-            crate::transcribe::resolve_model_path_by_name(&config.live_transcript.model, config)?
-        };
-        tracing::info!(model = %model_path.display(), "loading whisper model for recording sidecar");
-        whisper_rs::WhisperContext::new_with_params(
-            model_path
-                .to_str()
-                .ok_or_else(|| TranscribeError::ModelLoadError("invalid path".into()))?,
-            crate::transcribe::whisper_context_params(),
-        )
-        .map_err(|e| TranscribeError::ModelLoadError(format!("{}", e)))?
-    };
-
     let mut sidecar_config = config.clone();
     sidecar_config.live_transcript.save_wav = false;
-    let mut writer =
-        LiveTranscriptWriter::new(&sidecar_config, None, TranscriptSource::RecordingSidecar)?;
-    writer.mark_healthy();
+    let writer = Arc::new(Mutex::new(Some(LiveTranscriptWriter::new(
+        &sidecar_config,
+        None,
+        TranscriptSource::RecordingSidecar,
+    )?)));
+    if let Some(w) = lock_ignore_poison(&writer).as_mut() {
+        w.mark_healthy();
+    }
 
     let mut vad = RecordingSidecarVad::new(config);
-    let mut streaming = StreamingWhisper::with_partial_max_secs(
-        config.transcription.language.clone(),
-        config.transcription.partial_max_secs,
-    );
-    #[cfg(feature = "parakeet")]
-    let mut parakeet_utterance_samples: Vec<f32> = Vec::new();
-    #[cfg(feature = "parakeet")]
-    let mut parakeet_live_enabled = live_supports_parakeet(&config.transcription.engine);
-    #[cfg(not(feature = "parakeet"))]
-    let parakeet_live_enabled = false;
+    let parakeet_live_enabled = live_supports_parakeet(&config.transcription.engine);
     let mut was_speaking = false;
-    let mut utterance_samples: usize = 0;
+    let mut utterance: Vec<f32> = Vec::new();
     let mut gating_stats = SidecarGatingStats::default();
     let max_utterance_secs = config.live_transcript.max_utterance_secs.max(5);
     let max_utterance_samples = (max_utterance_secs as usize).saturating_mul(16000);
@@ -2059,44 +2180,87 @@ fn run_sidecar_inner_mpsc(
         );
     }
 
+    // ── Transcription worker ─────────────────────────────────────
+    // Inference must never run on this (consumer) thread: a single slow or
+    // wedged engine call starves the bounded capture channel (audio drops →
+    // garbled lines), freezes the status heartbeat, and defers stop handling
+    // for the duration of the call. The consumer below only does VAD and
+    // buffering; finalized utterances are handed to this worker over a small
+    // bounded queue, and a backlogged engine costs us utterances (counted in
+    // the status file) instead of the whole session.
+    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(SIDECAR_UTTERANCE_QUEUE_CAP);
+    let pending_utterances = Arc::new(AtomicU64::new(0));
+    let dropped_utterances = Arc::new(AtomicU64::new(0));
+    let worker = {
+        let writer = Arc::clone(&writer);
+        let config = config.clone();
+        let pending = Arc::clone(&pending_utterances);
+        let stop_flag = Arc::clone(&stop_flag);
+        std::thread::Builder::new()
+            .name("live-sidecar-transcribe".into())
+            .spawn(move || {
+                let mut parakeet_enabled = parakeet_live_enabled;
+                // Loaded lazily on first whisper-path utterance: the load can
+                // take >10s for larger models, and doing it eagerly (worse, on
+                // the consumer thread, as before) dropped the first ~13s of
+                // every meeting. Parakeet sessions never pay it at all.
+                let mut whisper_ctx: Option<whisper_rs::WhisperContext> = None;
+                while let Ok(samples) = job_rx.recv() {
+                    // After stop, the recording's batch transcription
+                    // supersedes the live transcript; drain instead of
+                    // transcribing so stop stays responsive.
+                    if stop_flag.load(Ordering::Relaxed) {
+                        pending.fetch_sub(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let result = transcribe_utterance_for_sidecar(
+                        &samples,
+                        &config,
+                        &mut whisper_ctx,
+                        &mut parakeet_enabled,
+                    );
+                    pending.fetch_sub(1, Ordering::Relaxed);
+                    if let Some((text, duration_secs)) = result {
+                        if let Some(w) = lock_ignore_poison(&writer).as_mut() {
+                            w.write_utterance(&text, duration_secs);
+                        }
+                    }
+                }
+            })
+            .map_err(|e| MinutesError::from(TranscribeError::Io(e)))?
+    };
+
     tracing::info!("live sidecar started (recording mode)");
 
     loop {
-        writer.maybe_write_heartbeat();
-        if stop_flag.load(Ordering::Relaxed) {
-            if utterance_samples > 0 {
-                if parakeet_live_enabled {
-                    #[cfg(feature = "parakeet")]
-                    {
-                        match transcribe_with_parakeet_for_live_sidecar(
-                            &parakeet_utterance_samples,
-                            config,
-                        ) {
-                            Ok(Some((text, duration_secs))) => {
-                                writer.write_utterance(&text, duration_secs);
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                tracing::warn!(
-                                    error = %error,
-                                    "live recording-sidecar parakeet path failed at shutdown — falling back to whisper"
-                                );
-                                if let Some((text, duration_secs)) =
-                                    transcribe_with_whisper_for_live_sidecar(
-                                        &parakeet_utterance_samples,
-                                        &whisper_ctx,
-                                        config.transcription.language.clone(),
-                                    )
-                                {
-                                    writer.write_utterance(&text, duration_secs);
-                                }
-                            }
-                        }
-                    }
-                } else if let Some(sr) = streaming.finalize(&whisper_ctx) {
-                    writer.write_utterance(&sr.text, sr.duration_secs);
+        // The heartbeat must never block behind the worker (which holds the
+        // lock across file IO in write_utterance). Skipping a contended tick
+        // is fine: the heartbeat interval is 1s and the staleness threshold
+        // 3s, and a write in progress is itself proof of liveness.
+        match writer.try_lock() {
+            Ok(mut guard) => {
+                if let Some(w) = guard.as_mut() {
+                    w.set_backlog_stats(
+                        pending_utterances.load(Ordering::Relaxed),
+                        dropped_utterances.load(Ordering::Relaxed),
+                    );
+                    w.maybe_write_heartbeat();
                 }
             }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                if let Some(w) = poisoned.into_inner().as_mut() {
+                    w.maybe_write_heartbeat();
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if stop_flag.load(Ordering::Relaxed) {
+            enqueue_sidecar_utterance(
+                &job_tx,
+                std::mem::take(&mut utterance),
+                &pending_utterances,
+                &dropped_utterances,
+            );
             break;
         }
 
@@ -2104,39 +2268,12 @@ fn run_sidecar_inner_mpsc(
             Ok(s) => s,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                if utterance_samples > 0 {
-                    if parakeet_live_enabled {
-                        #[cfg(feature = "parakeet")]
-                        {
-                            match transcribe_with_parakeet_for_live_sidecar(
-                                &parakeet_utterance_samples,
-                                config,
-                            ) {
-                                Ok(Some((text, duration_secs))) => {
-                                    writer.write_utterance(&text, duration_secs);
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    tracing::warn!(
-                                        error = %error,
-                                        "live recording-sidecar parakeet path failed during channel disconnect — falling back to whisper"
-                                    );
-                                    if let Some((text, duration_secs)) =
-                                        transcribe_with_whisper_for_live_sidecar(
-                                            &parakeet_utterance_samples,
-                                            &whisper_ctx,
-                                            config.transcription.language.clone(),
-                                        )
-                                    {
-                                        writer.write_utterance(&text, duration_secs);
-                                    }
-                                }
-                            }
-                        }
-                    } else if let Some(sr) = streaming.finalize(&whisper_ctx) {
-                        writer.write_utterance(&sr.text, sr.duration_secs);
-                    }
-                }
+                enqueue_sidecar_utterance(
+                    &job_tx,
+                    std::mem::take(&mut utterance),
+                    &pending_utterances,
+                    &dropped_utterances,
+                );
                 break;
             }
         };
@@ -2153,106 +2290,39 @@ fn run_sidecar_inner_mpsc(
 
         if vad_result.speaking {
             was_speaking = true;
-            utterance_samples += samples.len();
+            utterance.extend_from_slice(&samples);
 
-            if parakeet_live_enabled {
-                #[cfg(feature = "parakeet")]
-                {
-                    parakeet_utterance_samples.extend_from_slice(&samples);
-                }
-            } else if let Some(_sr) = streaming.feed(&samples, &whisper_ctx) {
-                // Intentionally not emitted in event-bus v0. Partial
-                // revisions are high-volume and need a gated v1 contract.
-            }
-
-            if utterance_samples >= max_utterance_samples {
+            if utterance.len() >= max_utterance_samples {
                 tracing::info!("sidecar: max utterance duration, force-finalizing");
-                if parakeet_live_enabled {
-                    #[cfg(feature = "parakeet")]
-                    {
-                        match transcribe_with_parakeet_for_live_sidecar(
-                            &parakeet_utterance_samples,
-                            config,
-                        ) {
-                            Ok(Some((text, duration_secs))) => {
-                                writer.write_utterance(&text, duration_secs);
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                tracing::warn!(
-                                    error = %error,
-                                    "live recording-sidecar parakeet path failed — switching this session to whisper"
-                                );
-                                parakeet_live_enabled = false;
-                                emit_live_engine_fallback_warning(
-                                    "recording-sidecar",
-                                    &error.to_string(),
-                                );
-                                if let Some((text, duration_secs)) =
-                                    transcribe_with_whisper_for_live_sidecar(
-                                        &parakeet_utterance_samples,
-                                        &whisper_ctx,
-                                        config.transcription.language.clone(),
-                                    )
-                                {
-                                    writer.write_utterance(&text, duration_secs);
-                                }
-                            }
-                        }
-                        parakeet_utterance_samples.clear();
-                    }
-                } else if let Some(sr) = streaming.finalize(&whisper_ctx) {
-                    writer.write_utterance(&sr.text, sr.duration_secs);
-                }
-                streaming.reset();
-                utterance_samples = 0;
+                enqueue_sidecar_utterance(
+                    &job_tx,
+                    std::mem::take(&mut utterance),
+                    &pending_utterances,
+                    &dropped_utterances,
+                );
                 was_speaking = false;
             }
-        } else if was_speaking && utterance_samples > 0 {
-            if parakeet_live_enabled {
-                #[cfg(feature = "parakeet")]
-                {
-                    match transcribe_with_parakeet_for_live_sidecar(
-                        &parakeet_utterance_samples,
-                        config,
-                    ) {
-                        Ok(Some((text, duration_secs))) => {
-                            writer.write_utterance(&text, duration_secs);
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!(
-                                error = %error,
-                                "live recording-sidecar parakeet path failed — switching this session to whisper"
-                            );
-                            parakeet_live_enabled = false;
-                            emit_live_engine_fallback_warning(
-                                "recording-sidecar",
-                                &error.to_string(),
-                            );
-                            if let Some((text, duration_secs)) =
-                                transcribe_with_whisper_for_live_sidecar(
-                                    &parakeet_utterance_samples,
-                                    &whisper_ctx,
-                                    config.transcription.language.clone(),
-                                )
-                            {
-                                writer.write_utterance(&text, duration_secs);
-                            }
-                        }
-                    }
-                    parakeet_utterance_samples.clear();
-                }
-            } else if let Some(sr) = streaming.finalize(&whisper_ctx) {
-                writer.write_utterance(&sr.text, sr.duration_secs);
-            }
-            streaming.reset();
-            utterance_samples = 0;
+        } else if was_speaking && !utterance.is_empty() {
+            enqueue_sidecar_utterance(
+                &job_tx,
+                std::mem::take(&mut utterance),
+                &pending_utterances,
+                &dropped_utterances,
+            );
             was_speaking = false;
         }
     }
 
-    let (lines, duration, _path) = writer.finalize();
+    // Let the worker drain its queue (post-stop jobs are skipped, and a single
+    // in-flight engine call is bounded by the parakeet subprocess timeout),
+    // then finalize.
+    drop(job_tx);
+    let _ = worker.join();
+
+    let (lines, duration, _path) = match lock_ignore_poison(&writer).take() {
+        Some(w) => w.finalize(),
+        None => (0, 0.0, PathBuf::new()),
+    };
     // Clean up status file so session_status() doesn't report stale data
     clear_status_file();
     tracing::info!(
@@ -2457,6 +2527,8 @@ fn write_live_status_transition(state: LiveStatusState, diagnostic: Option<&str>
         last_duration_ms: existing.as_ref().map(|s| s.last_duration_ms).unwrap_or(0),
         session_id: existing.as_ref().and_then(|s| s.session_id.clone()),
         diagnostic: diagnostic.map(str::to_string),
+        pending_utterances: existing.as_ref().and_then(|s| s.pending_utterances),
+        dropped_utterances: existing.as_ref().and_then(|s| s.dropped_utterances),
     };
     write_live_status(&status);
 }
@@ -2609,6 +2681,8 @@ mod tests {
             last_duration_ms: 400,
             session_id: None,
             diagnostic: None,
+            pending_utterances: None,
+            dropped_utterances: None,
         }
     }
 
@@ -2668,6 +2742,66 @@ mod tests {
         // May or may not be active depending on test environment
         // but should not panic
         assert!(status.duration_secs >= 0.0);
+    }
+
+    #[test]
+    fn sidecar_utterance_queue_drops_newest_when_full_and_counts() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+        let pending = AtomicU64::new(0);
+        let dropped = AtomicU64::new(0);
+
+        enqueue_sidecar_utterance(&tx, vec![0.1; 1600], &pending, &dropped);
+        enqueue_sidecar_utterance(&tx, vec![0.1; 1600], &pending, &dropped);
+        // Queue full — this one must be dropped, not block the caller.
+        enqueue_sidecar_utterance(&tx, vec![0.1; 1600], &pending, &dropped);
+        // Empty utterances are a no-op either way.
+        enqueue_sidecar_utterance(&tx, Vec::new(), &pending, &dropped);
+
+        assert_eq!(pending.load(Ordering::Relaxed), 2);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sidecar_utterance_queue_disconnected_worker_is_silent() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+        drop(rx);
+        let pending = AtomicU64::new(0);
+        let dropped = AtomicU64::new(0);
+
+        enqueue_sidecar_utterance(&tx, vec![0.1; 1600], &pending, &dropped);
+
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn status_file_surfaces_transcription_backlog() {
+        with_temp_home(|| {
+            let config = Config::default();
+            let mut writer =
+                LiveTranscriptWriter::new(&config, None, TranscriptSource::RecordingSidecar)
+                    .unwrap();
+
+            writer.set_backlog_stats(2, 3);
+            writer.mark_healthy();
+
+            let status = read_live_status(&pid::live_transcript_status_path()).unwrap();
+            assert_eq!(status.pending_utterances, Some(2));
+            assert_eq!(status.dropped_utterances, Some(3));
+            assert!(status
+                .diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("3 utterance(s) dropped"));
+
+            // Counters at zero serialize as absent — backward compatible.
+            writer.set_backlog_stats(0, 0);
+            writer.mark_healthy();
+            let status = read_live_status(&pid::live_transcript_status_path()).unwrap();
+            assert_eq!(status.pending_utterances, None);
+            assert_eq!(status.dropped_utterances, None);
+            assert_eq!(status.diagnostic, None);
+        });
     }
 
     #[test]

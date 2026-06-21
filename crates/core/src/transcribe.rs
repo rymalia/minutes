@@ -420,6 +420,17 @@ fn transcribe_chunk_ranges(
     config: &Config,
     hints: &DecodeHints,
 ) -> Result<Option<TranscribeResult>, TranscribeError> {
+    #[cfg(feature = "whisper")]
+    if chunk_transcription_strategy(config) == ChunkTranscriptionStrategy::SharedWhisperContext {
+        return transcribe_whisper_chunk_ranges(
+            samples,
+            chunk_ranges,
+            audio_duration_secs,
+            config,
+            hints,
+        );
+    }
+
     let mut all_lines = Vec::new();
     let mut aggregate = FilterStats {
         audio_duration_secs,
@@ -456,6 +467,98 @@ fn transcribe_chunk_ranges(
         let offset_lines =
             offset_timestamped_lines(chunk_result.text.lines(), chunk_offset_secs, chunk_index);
         let _ = std::fs::remove_file(&tmp_wav);
+
+        aggregate.samples_after_silence_strip += chunk_result.stats.samples_after_silence_strip;
+        aggregate.raw_segments += chunk_result.stats.raw_segments;
+        aggregate.skipped_no_speech += chunk_result.stats.skipped_no_speech;
+        aggregate.after_no_speech_filter += chunk_result.stats.after_no_speech_filter;
+        aggregate.rescued_no_speech += chunk_result.stats.rescued_no_speech;
+        all_lines.extend(offset_lines);
+    }
+
+    if all_lines.is_empty() {
+        return Ok(None);
+    }
+
+    let cleanup = run_transcript_cleanup_pipeline(all_lines);
+    aggregate.after_dedup = cleanup.after(TranscriptCleanupStage::DedupSegments);
+    aggregate.after_interleaved = cleanup.after(TranscriptCleanupStage::DedupInterleaved);
+    aggregate.after_script_filter = cleanup.after(TranscriptCleanupStage::StripForeignScript);
+    aggregate.after_noise_markers = cleanup.after(TranscriptCleanupStage::CollapseNoiseMarkers);
+    aggregate.after_trailing_trim = cleanup.after(TranscriptCleanupStage::TrimTrailingNoise);
+
+    let text = if cleanup.lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", cleanup.lines.join("\n"))
+    };
+    aggregate.final_words = text.split_whitespace().count();
+
+    Ok(Some(TranscribeResult {
+        text,
+        stats: aggregate,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
+enum ChunkTranscriptionStrategy {
+    SharedWhisperContext,
+    DispatchPerChunk,
+}
+
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
+fn chunk_transcription_strategy(config: &Config) -> ChunkTranscriptionStrategy {
+    if cfg!(feature = "whisper") && config.transcription.engine == "whisper" {
+        ChunkTranscriptionStrategy::SharedWhisperContext
+    } else {
+        ChunkTranscriptionStrategy::DispatchPerChunk
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn transcribe_whisper_chunk_ranges(
+    samples: &[f32],
+    chunk_ranges: &[(usize, usize)],
+    audio_duration_secs: f64,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<Option<TranscribeResult>, TranscribeError> {
+    let ctx = load_whisper_context(config)?;
+    let mut all_lines = Vec::new();
+    let mut aggregate = FilterStats {
+        audio_duration_secs,
+        ..Default::default()
+    };
+
+    for (chunk_index, (start_sample, end_sample)) in chunk_ranges.iter().enumerate() {
+        let chunk_samples = &samples[*start_sample..*end_sample];
+        if chunk_samples.is_empty() {
+            continue;
+        }
+
+        let chunk_result = match transcribe_whisper_samples(
+            &ctx,
+            chunk_samples,
+            Path::new("<vad-chunk>"),
+            config,
+            hints,
+        ) {
+            Ok(result) => result,
+            Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => {
+                tracing::debug!(
+                    chunk_index,
+                    start_sample,
+                    end_sample,
+                    "skipping empty VAD chunk"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let chunk_offset_secs = *start_sample as f64 / 16000.0;
+        let offset_lines =
+            offset_timestamped_lines(chunk_result.text.lines(), chunk_offset_secs, chunk_index);
 
         aggregate.samples_after_silence_strip += chunk_result.stats.samples_after_silence_strip;
         aggregate.raw_segments += chunk_result.stats.raw_segments;
@@ -534,90 +637,20 @@ fn transcribe_whisper_dispatch(
     config: &Config,
     hints: &DecodeHints,
 ) -> Result<TranscribeResult, TranscribeError> {
-    let mut stats = FilterStats::default();
-
     // Step 1: Load audio as 16kHz mono f32 PCM samples
     let samples = load_audio_samples(audio_path)?;
-    stats.audio_duration_secs = samples.len() as f64 / 16000.0;
-
-    if samples.is_empty() {
-        return Err(TranscribeError::EmptyAudio);
-    }
-
-    // Step 1b: Noise reduction (requires denoise feature + config enabled)
-    #[cfg(feature = "denoise")]
-    let samples = if config.transcription.noise_reduction {
-        denoise_audio(&samples, 16000)
-    } else {
-        samples
-    };
-
-    // Step 2: Silence handling.
-    // If Silero VAD model is available, whisper handles silence internally via
-    // integrated VAD (set in default_whisper_params). Otherwise, fall back to
-    // energy-based silence stripping to prevent hallucination loops (issue #21).
-    #[cfg(feature = "whisper")]
-    let use_integrated_vad = resolve_vad_model_path(config).is_some();
-    #[cfg(not(feature = "whisper"))]
-    let use_integrated_vad = false;
-
-    let samples = if use_integrated_vad {
-        tracing::debug!("Silero VAD available — skipping energy-based silence stripping");
-        samples
-    } else {
-        strip_silence(&samples, 16000)
-    };
-    stats.samples_after_silence_strip = samples.len();
-
-    if samples.is_empty() {
-        tracing::warn!(
-            audio_duration_secs = stats.audio_duration_secs,
-            "silence stripping removed all audio — entire recording was below energy threshold"
-        );
-        return Err(TranscribeError::EmptyAudio);
-    }
 
     // Step 3: Transcribe
     #[cfg(feature = "whisper")]
     {
-        let result = transcribe_with_whisper(&samples, audio_path, config, stats, false, hints)?;
-
-        // Step 4: Auto-retry without VAD if the first attempt blanked on long audio.
-        // Silero VAD can be too aggressive on certain acoustic profiles or non-English
-        // audio, causing whisper to see almost no speech segments. Retrying with
-        // energy-based silence stripping gives whisper the full audio.
-        if result.stats.final_words == 0
-            && use_integrated_vad
-            && result.stats.audio_duration_secs > 60.0
-        {
-            tracing::warn!(
-                audio_secs = format!("{:.0}", result.stats.audio_duration_secs),
-                raw_segments = result.stats.raw_segments,
-                "blank transcript from long audio with VAD — retrying without VAD"
-            );
-            let mut retry_stats = FilterStats {
-                audio_duration_secs: result.stats.audio_duration_secs,
-                ..Default::default()
-            };
-            let stripped = strip_silence(&samples, 16000);
-            retry_stats.samples_after_silence_strip = stripped.len();
-            if !stripped.is_empty() {
-                return transcribe_with_whisper(
-                    &stripped,
-                    audio_path,
-                    config,
-                    retry_stats,
-                    true,
-                    hints,
-                );
-            }
-        }
-
-        Ok(result)
+        let ctx = load_whisper_context(config)?;
+        transcribe_whisper_samples(&ctx, &samples, audio_path, config, hints)
     }
 
     #[cfg(not(feature = "whisper"))]
     {
+        let mut stats = FilterStats::default();
+        stats.audio_duration_secs = samples.len() as f64 / 16000.0;
         let _ = config; // suppress unused warning
         let _ = hints; // only used when the whisper feature is enabled
         let duration_secs = samples.len() as f64 / 16000.0;
@@ -732,12 +765,112 @@ pub(crate) fn whisper_context_params() -> whisper_rs::WhisperContextParameters<'
     params
 }
 
+#[cfg(feature = "whisper")]
+fn load_whisper_context(config: &Config) -> Result<whisper_rs::WhisperContext, TranscribeError> {
+    let model_path = resolve_model_path(config)?;
+    tracing::info!(model = %model_path.display(), "loading whisper model");
+
+    whisper_rs::WhisperContext::new_with_params(
+        model_path
+            .to_str()
+            .ok_or_else(|| TranscribeError::ModelLoadError("invalid model path encoding".into()))?,
+        whisper_context_params(),
+    )
+    .map_err(|e| TranscribeError::ModelLoadError(format!("{}", e)))
+}
+
+#[cfg(feature = "whisper")]
+fn transcribe_whisper_samples(
+    ctx: &whisper_rs::WhisperContext,
+    samples: &[f32],
+    audio_path: &Path,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    let mut stats = FilterStats {
+        audio_duration_secs: samples.len() as f64 / 16000.0,
+        ..Default::default()
+    };
+
+    if samples.is_empty() {
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    // Noise reduction (requires denoise feature + config enabled).
+    #[cfg(feature = "denoise")]
+    let samples = if config.transcription.noise_reduction {
+        denoise_audio(samples, 16000)
+    } else {
+        samples.to_vec()
+    };
+    #[cfg(not(feature = "denoise"))]
+    let samples = samples.to_vec();
+
+    // If Silero VAD model is available, whisper handles silence internally via
+    // integrated VAD (set in default_whisper_params). Otherwise, fall back to
+    // energy-based silence stripping to prevent hallucination loops (issue #21).
+    let use_integrated_vad = resolve_vad_model_path(config).is_some();
+
+    let samples = if use_integrated_vad {
+        tracing::debug!("Silero VAD available — skipping energy-based silence stripping");
+        samples
+    } else {
+        strip_silence(&samples, 16000)
+    };
+    stats.samples_after_silence_strip = samples.len();
+
+    if samples.is_empty() {
+        tracing::warn!(
+            audio_duration_secs = stats.audio_duration_secs,
+            "silence stripping removed all audio — entire recording was below energy threshold"
+        );
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    let result = transcribe_with_whisper(ctx, &samples, audio_path, config, stats, false, hints)?;
+
+    // Auto-retry without VAD if the first attempt blanked on long audio.
+    // Silero VAD can be too aggressive on certain acoustic profiles or non-English
+    // audio, causing whisper to see almost no speech segments. Retrying with
+    // energy-based silence stripping gives whisper the full audio.
+    if result.stats.final_words == 0
+        && use_integrated_vad
+        && result.stats.audio_duration_secs > 60.0
+    {
+        tracing::warn!(
+            audio_secs = format!("{:.0}", result.stats.audio_duration_secs),
+            raw_segments = result.stats.raw_segments,
+            "blank transcript from long audio with VAD — retrying without VAD"
+        );
+        let mut retry_stats = FilterStats {
+            audio_duration_secs: result.stats.audio_duration_secs,
+            ..Default::default()
+        };
+        let stripped = strip_silence(&samples, 16000);
+        retry_stats.samples_after_silence_strip = stripped.len();
+        if !stripped.is_empty() {
+            return transcribe_with_whisper(
+                ctx,
+                &stripped,
+                audio_path,
+                config,
+                retry_stats,
+                true,
+                hints,
+            );
+        }
+    }
+
+    Ok(result)
+}
+
 /// Real transcription using whisper.cpp via whisper-rs.
 ///
 /// When `force_disable_vad` is true, Silero VAD is not passed to whisper even if
 /// the model exists. Used for retry after VAD-enabled transcription produced a blank.
 #[cfg(feature = "whisper")]
 fn transcribe_with_whisper(
+    ctx: &whisper_rs::WhisperContext,
     samples: &[f32],
     _audio_path: &Path,
     config: &Config,
@@ -745,21 +878,10 @@ fn transcribe_with_whisper(
     force_disable_vad: bool,
     hints: &DecodeHints,
 ) -> Result<TranscribeResult, TranscribeError> {
-    // Load whisper model
-    let model_path = resolve_model_path(config)?;
-    tracing::info!(model = %model_path.display(), vad_disabled = force_disable_vad, "loading whisper model");
-
-    let ctx = whisper_rs::WhisperContext::new_with_params(
-        model_path
-            .to_str()
-            .ok_or_else(|| TranscribeError::ModelLoadError("invalid model path encoding".into()))?,
-        whisper_context_params(),
-    )
-    .map_err(|e| TranscribeError::ModelLoadError(format!("{}", e)))?;
-
     tracing::info!(
         samples = samples.len(),
         duration_secs = samples.len() as f64 / 16000.0,
+        vad_disabled = force_disable_vad,
         "starting whisper transcription"
     );
 
@@ -1041,8 +1163,6 @@ fn load_wav(path: &Path) -> Result<Vec<f32>, TranscribeError> {
 /// Returns an error if ffmpeg is not installed or the conversion fails,
 /// allowing the caller to fall back to symphonia.
 fn decode_with_ffmpeg(path: &Path) -> Result<Vec<f32>, TranscribeError> {
-    use std::process::Command;
-
     let tmp_dir = std::env::temp_dir();
     let tmp_wav = tmp_dir.join(format!("minutes-ffmpeg-{}.wav", std::process::id()));
 
@@ -1057,7 +1177,9 @@ fn decode_with_ffmpeg(path: &Path) -> Result<Vec<f32>, TranscribeError> {
         }
     }
 
-    let output = Command::new("ffmpeg")
+    let ffmpeg = crate::ffmpeg::resolve_ffmpeg()
+        .map_err(|e| TranscribeError::TranscriptionFailed(format!("ffmpeg not available: {e}")))?;
+    let output = std::process::Command::new(&ffmpeg)
         .args([
             "-i",
             path.to_str().unwrap_or(""),
@@ -1075,7 +1197,11 @@ fn decode_with_ffmpeg(path: &Path) -> Result<Vec<f32>, TranscribeError> {
         .stderr(std::process::Stdio::piped())
         .output()
         .map_err(|e| {
-            TranscribeError::TranscriptionFailed(format!("ffmpeg not available: {}", e))
+            TranscribeError::TranscriptionFailed(format!(
+                "ffmpeg not available at {}: {}",
+                ffmpeg.display(),
+                e
+            ))
         })?;
 
     if !output.status.success() {
@@ -1738,7 +1864,7 @@ fn transcribe_with_parakeet(
         TranscribeError::ParakeetFailed("resolved parakeet binary path is not valid UTF-8".into())
     })?;
 
-    if config.transcription.parakeet_sidecar_enabled {
+    if crate::parakeet_sidecar::sidecar_enabled_effective(config) {
         match crate::parakeet_sidecar::transcribe_via_global_sidecar(
             config,
             &model_path,
@@ -2144,6 +2270,118 @@ fn build_parakeet_command(
     command
 }
 
+/// Hard ceiling on a single parakeet subprocess invocation. Scaled to 3× the
+/// audio duration so batch jobs on long recordings never trip it, with a floor
+/// generous enough to absorb a cold model load. Without this, a wedged
+/// subprocess blocks its caller forever — the live recording sidecar froze for
+/// 27 minutes mid-meeting on exactly this path (2026-06-10).
+#[cfg(feature = "parakeet")]
+const PARAKEET_SUBPROCESS_TIMEOUT_FLOOR_SECS: u64 = 90;
+#[cfg(feature = "parakeet")]
+const PARAKEET_SUBPROCESS_TIMEOUT_CEIL_SECS: u64 = 1800;
+
+#[cfg(feature = "parakeet")]
+fn parakeet_subprocess_timeout(audio_args: &[&str]) -> std::time::Duration {
+    let audio_secs = audio_args
+        .iter()
+        .filter_map(|arg| estimate_wav_secs(Path::new(arg)))
+        .fold(0.0_f64, f64::max);
+    if audio_secs == 0.0 {
+        // Duration unknown (non-WAV input or unreadable header). Killing a
+        // legitimate long job is worse than waiting longer to declare a wedge,
+        // so fall to the ceiling, not the floor.
+        return std::time::Duration::from_secs(PARAKEET_SUBPROCESS_TIMEOUT_CEIL_SECS);
+    }
+    let scaled = (audio_secs * 3.0).ceil() as u64;
+    std::time::Duration::from_secs(scaled.clamp(
+        PARAKEET_SUBPROCESS_TIMEOUT_FLOOR_SECS,
+        PARAKEET_SUBPROCESS_TIMEOUT_CEIL_SECS,
+    ))
+}
+
+#[cfg(feature = "parakeet")]
+fn estimate_wav_secs(path: &Path) -> Option<f64> {
+    let reader = hound::WavReader::open(path).ok()?;
+    let spec = reader.spec();
+    if spec.sample_rate == 0 {
+        return None;
+    }
+    Some(reader.duration() as f64 / spec.sample_rate as f64)
+}
+
+/// Run a command to completion like `Command::output()`, but kill the child
+/// if it exceeds `timeout`. Pipes are drained on dedicated threads so a child
+/// that fills stdout/stderr can't deadlock against the wait loop. Returns the
+/// output plus whether the child was killed by the timeout.
+#[cfg(feature = "parakeet")]
+fn output_with_timeout(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<(std::process::Output, bool)> {
+    use std::io::Read;
+
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let mut stdout_pipe = child.stdout.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let mut stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let status = child.wait()?;
+                    // Don't join the drain threads here: if the child spawned
+                    // helpers that inherited the pipe fds, read_to_end won't
+                    // see EOF until they exit. The caller discards output on
+                    // timeout anyway; let the drains finish detached.
+                    drop(stdout_handle);
+                    drop(stderr_handle);
+                    return Ok((
+                        std::process::Output {
+                            status,
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                        },
+                        true,
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    Ok((
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        false,
+    ))
+}
+
 #[cfg(feature = "parakeet")]
 #[allow(clippy::too_many_arguments)]
 fn run_parakeet_command_with_cpu_fallback(
@@ -2160,8 +2398,9 @@ fn run_parakeet_command_with_cpu_fallback(
     hints: &DecodeHints,
 ) -> Result<(std::process::Output, bool), TranscribeError> {
     let mut attempted_gpu = use_gpu;
+    let timeout = parakeet_subprocess_timeout(audio_args);
     loop {
-        let output = build_parakeet_command(
+        let command = build_parakeet_command(
             binary,
             model_str,
             audio_args,
@@ -2173,17 +2412,34 @@ fn run_parakeet_command_with_cpu_fallback(
             vad_threshold,
             config,
             hints,
-        )
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| {
+        );
+        let (output, timed_out) = output_with_timeout(command, timeout).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 TranscribeError::ParakeetNotFound
             } else {
                 TranscribeError::ParakeetFailed(format!("spawn error: {}", e))
             }
         })?;
+
+        if timed_out {
+            tracing::error!(
+                timeout_secs = timeout.as_secs(),
+                gpu = attempted_gpu,
+                "parakeet subprocess exceeded timeout and was killed"
+            );
+            // A wedged GPU run gets the same one-shot CPU retry a crashed GPU
+            // run gets — a Metal hang shouldn't be a harder failure than a
+            // Metal crash.
+            if attempted_gpu {
+                tracing::warn!("parakeet GPU run timed out; retrying once on CPU");
+                attempted_gpu = false;
+                continue;
+            }
+            return Err(TranscribeError::ParakeetFailed(format!(
+                "parakeet subprocess exceeded {}s timeout and was killed",
+                timeout.as_secs()
+            )));
+        }
 
         if output.status.success() {
             return Ok((output, attempted_gpu));
@@ -2915,6 +3171,28 @@ mod tests {
         assert!(
             expected_whisper_model_size_bytes("medium").unwrap()
                 > expected_whisper_model_size_bytes("small").unwrap()
+        );
+    }
+
+    #[test]
+    fn chunk_strategy_reuses_context_only_for_whisper_builds() {
+        let mut config = Config::default();
+        config.transcription.engine = "whisper".into();
+        let expected = if cfg!(feature = "whisper") {
+            ChunkTranscriptionStrategy::SharedWhisperContext
+        } else {
+            ChunkTranscriptionStrategy::DispatchPerChunk
+        };
+        assert_eq!(chunk_transcription_strategy(&config), expected);
+    }
+
+    #[test]
+    fn chunk_strategy_keeps_non_whisper_backends_on_dispatch_path() {
+        let mut config = Config::default();
+        config.transcription.engine = "parakeet".into();
+        assert_eq!(
+            chunk_transcription_strategy(&config),
+            ChunkTranscriptionStrategy::DispatchPerChunk
         );
     }
 

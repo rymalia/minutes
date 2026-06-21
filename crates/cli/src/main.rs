@@ -9,14 +9,15 @@ use minutes_core::autoresearch::{
     DecodeHintEvalComparisonRequest, DecodeHintEvalOptions, DecodeHintEvalRequest,
 };
 use minutes_core::capture::RecordingIntent;
-use minutes_core::config::VALID_PARAKEET_MODELS;
+use minutes_core::config::{ConsentMode, VALID_PARAKEET_MODELS};
+use minutes_core::markdown::ConsentBasis;
 use minutes_core::parakeet;
 use minutes_core::{CaptureMode, Config, ContentType};
 use serde::Serialize;
 
 mod dashboard;
 mod demo_data;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -166,6 +167,102 @@ fn install_parakeet_panic_hook() {
     }));
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordingConsent {
+    basis: ConsentBasis,
+    notice: Option<String>,
+    reminder: Option<String>,
+    warning: Option<String>,
+}
+
+fn parse_recording_consent_basis(raw: &str) -> Result<ConsentBasis> {
+    raw.parse::<ConsentBasis>()
+        .map_err(|error| anyhow::anyhow!("{}", error))
+}
+
+fn default_recording_consent_basis(config: &Config) -> Result<Option<ConsentBasis>> {
+    config
+        .consent
+        .default_basis
+        .as_deref()
+        .map(parse_recording_consent_basis)
+        .transpose()
+}
+
+fn prepare_recording_consent(
+    config: &Config,
+    consent_arg: Option<&str>,
+    consent_notice: Option<&str>,
+    stdin_is_tty: bool,
+    prompt_for_consent: impl FnOnce() -> Result<bool>,
+) -> Result<RecordingConsent> {
+    let resolved_basis = if let Some(raw_basis) = consent_arg {
+        Some(parse_recording_consent_basis(raw_basis)?)
+    } else {
+        default_recording_consent_basis(config)?
+    };
+    let explicit_notice = consent_notice
+        .map(str::trim)
+        .filter(|notice| !notice.is_empty())
+        .map(str::to_string);
+
+    match config.consent.mode {
+        ConsentMode::Off => Ok(RecordingConsent {
+            basis: resolved_basis.unwrap_or(ConsentBasis::Unattested),
+            notice: explicit_notice,
+            reminder: None,
+            warning: None,
+        }),
+        ConsentMode::Remind => Ok(RecordingConsent {
+            basis: resolved_basis.unwrap_or(ConsentBasis::Unattested),
+            notice: explicit_notice,
+            reminder: Some(config.consent.disclosure_script.clone()),
+            warning: None,
+        }),
+        ConsentMode::Require if !stdin_is_tty => Ok(RecordingConsent {
+            basis: resolved_basis.unwrap_or(ConsentBasis::Unattested),
+            notice: explicit_notice,
+            reminder: Some(config.consent.disclosure_script.clone()),
+            warning: Some(
+                "consent gate skipped: non-interactive session; recording as unattested".into(),
+            ),
+        }),
+        ConsentMode::Require => {
+            if let Some(basis) = resolved_basis {
+                return Ok(RecordingConsent {
+                    basis,
+                    notice: explicit_notice,
+                    reminder: None,
+                    warning: None,
+                });
+            }
+            if prompt_for_consent()? {
+                Ok(RecordingConsent {
+                    basis: ConsentBasis::VerbalAllParties,
+                    notice: explicit_notice,
+                    reminder: None,
+                    warning: None,
+                })
+            } else {
+                anyhow::bail!(
+                    "Recording not started. Pass --consent <basis> or set [consent] mode = \"remind\" to use a reminder instead."
+                );
+            }
+        }
+    }
+}
+
+fn prompt_for_recording_consent() -> Result<bool> {
+    eprint!("Has everyone present been notified and do they consent? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 /// minutes — conversation memory for AI assistants.
 /// Every meeting, every idea, every voice note — searchable by your AI.
 #[derive(Parser)]
@@ -218,6 +315,15 @@ enum Commands {
         /// reason, which is written into recording_health.
         #[arg(long, value_name = "REASON")]
         skip_audio_probe: Option<String>,
+
+        /// Consent basis to stamp into meeting frontmatter.
+        /// Values: verbal_all_parties, notice_in_invite, recorded_disclosed, na, unattested.
+        #[arg(long, value_name = "BASIS")]
+        consent: Option<String>,
+
+        /// Exact disclosure text to stamp into meeting frontmatter.
+        #[arg(long, value_name = "TEXT")]
+        consent_notice: Option<String>,
 
         /// Transcription language (e.g. "en", "ur", "es"). Overrides config.toml setting.
         #[arg(short, long)]
@@ -275,6 +381,12 @@ enum Commands {
 
     /// Stop recording and process the audio
     Stop,
+
+    /// Start or stop a no-capture sensitive meeting
+    Sensitive {
+        #[command(subcommand)]
+        action: SensitiveAction,
+    },
 
     /// Keep a recording alive (reset auto-stop timers)
     Extend,
@@ -994,6 +1106,18 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum SensitiveAction {
+    /// Start a no-capture sensitive meeting
+    Start {
+        /// Title for the sensitive meeting artifact
+        #[arg(short, long)]
+        title: Option<String>,
+    },
+    /// Stop the active sensitive meeting and write its artifact
+    Stop,
+}
+
+#[derive(Subcommand)]
 enum VocabularyAction {
     /// List local vocabulary entries
     List {
@@ -1270,6 +1394,8 @@ fn main() -> Result<()> {
             intent,
             allow_degraded,
             skip_audio_probe,
+            consent,
+            consent_notice,
             language,
             device,
             source,
@@ -1336,6 +1462,8 @@ fn main() -> Result<()> {
                     effective_intent,
                     allow_degraded,
                     skip_audio_probe.as_deref(),
+                    consent.as_deref(),
+                    consent_notice.as_deref(),
                     template,
                     &config,
                 )
@@ -1343,6 +1471,7 @@ fn main() -> Result<()> {
         }
         Commands::Note { text, meeting } => cmd_note(&text, meeting.as_deref(), &config),
         Commands::Stop => cmd_stop(&config),
+        Commands::Sensitive { action } => cmd_sensitive(action, &config),
         Commands::Extend => {
             if !minutes_core::pid::status().recording {
                 eprintln!("No active recording to extend.");
@@ -1738,6 +1867,79 @@ fn cmd_note(text: &str, meeting: Option<&Path>, config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn cmd_sensitive(action: SensitiveAction, config: &Config) -> Result<()> {
+    match action {
+        SensitiveAction::Start { title } => {
+            let session = minutes_core::sensitive::start(title.as_deref())
+                .map_err(|error| anyhow::anyhow!("{}", error))?;
+            eprintln!(
+                "Sensitive meeting started: {}. Add markers with `minutes note \"...\"`.",
+                session.title
+            );
+            Ok(())
+        }
+        SensitiveAction::Stop => {
+            let debrief = if std::io::stdin().is_terminal() {
+                Some(prompt_sensitive_debrief()?)
+            } else {
+                None
+            };
+            let result = minutes_core::sensitive::stop(debrief, config)
+                .map_err(|error| anyhow::anyhow!("{}", error))?;
+            eprintln!("Sensitive meeting saved: {}", result.path.display());
+            if result.path.exists() && !std::io::stdin().is_terminal() {
+                eprintln!(
+                    "[minutes] Debrief pending. Run `/minutes-debrief` from your assistant when ready."
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn prompt_sensitive_debrief() -> Result<minutes_core::sensitive::SensitiveDebrief> {
+    eprintln!("Sensitive meeting debrief. Leave a prompt blank to skip it.");
+    let summary = prompt_optional_line("Summary: ")?;
+    let decisions = prompt_repeated_lines("Decision");
+    let action_items = prompt_repeated_lines("Action item");
+    Ok(minutes_core::sensitive::SensitiveDebrief {
+        summary,
+        decisions,
+        action_items,
+    })
+}
+
+fn prompt_optional_line(prompt: &str) -> Result<Option<String>> {
+    eprint!("{}", prompt);
+    std::io::stderr().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
+fn prompt_repeated_lines(label: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    loop {
+        eprint!("{} (blank when done): ", label);
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            break;
+        }
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        values.push(trimmed.to_string());
+    }
+    values
+}
+
 fn capture_mode_from_str(mode: &str) -> Result<CaptureMode> {
     match mode {
         "meeting" => Ok(CaptureMode::Meeting),
@@ -1961,6 +2163,8 @@ fn cmd_record(
     intent: &str,
     allow_degraded: bool,
     skip_audio_probe: Option<&str>,
+    consent: Option<&str>,
+    consent_notice: Option<&str>,
     template_slug: Option<String>,
     config: &Config,
 ) -> Result<()> {
@@ -1994,10 +2198,43 @@ fn cmd_record(
     if minutes_core::pid::inspect_pid_file(&lt_pid).is_active() {
         anyhow::bail!("live transcript in progress — run `minutes stop` first");
     }
+    minutes_core::sensitive::ensure_inactive_for_recording()
+        .map_err(|error| anyhow::anyhow!("{}", error))?;
+
+    let recording_consent = if capture_mode == CaptureMode::Meeting {
+        eprintln!("Recording + transcribing locally — audio stays on your device.");
+        let resolved = prepare_recording_consent(
+            config,
+            consent,
+            consent_notice,
+            std::io::stdin().is_terminal(),
+            prompt_for_recording_consent,
+        )?;
+        if let Some(warning) = resolved.warning.as_deref() {
+            eprintln!("[minutes] {}", warning);
+        }
+        if let Some(script) = resolved.reminder.as_deref() {
+            eprintln!("[minutes] Reminder: ensure everyone present consents where required.");
+            eprintln!("[minutes] Disclosure script: {}", script);
+        }
+        Some(resolved)
+    } else {
+        None
+    };
 
     // Check if already recording
     let recording_started_at = Local::now();
     minutes_core::pid::create().map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Re-check sensitive-session exclusivity now that the recording PID (the
+    // atomic flock anchor) is held: a sensitive session may have started in
+    // the window between the early check above and pid::create. With the PID
+    // held, a concurrent sensitive start is blocked by its own recording
+    // check, so this re-check closes the interleaving in both directions
+    // (review F3). On conflict, release the PID and bail.
+    if let Err(error) = minutes_core::sensitive::ensure_inactive_for_recording() {
+        let _ = minutes_core::pid::remove();
+        anyhow::bail!("{}", error);
+    }
     let context_session_id = minutes_core::desktop_context::maybe_start_capture_session(
         &config.desktop_context,
         capture_mode,
@@ -2025,6 +2262,13 @@ fn cmd_record(
 
     // Save recording start time (for timestamping notes)
     minutes_core::notes::save_recording_start()?;
+    minutes_core::notes::clear_consent();
+    if let Some(recording_consent) = recording_consent.as_ref() {
+        minutes_core::notes::save_consent(
+            Some(recording_consent.basis),
+            recording_consent.notice.as_deref(),
+        )?;
+    }
 
     // Save pre-meeting context if provided
     if let Some(ref ctx) = context {
@@ -2088,6 +2332,11 @@ fn cmd_record(
     let recording_finished_at = Local::now();
     let user_notes = minutes_core::notes::read_notes();
     let pre_context = minutes_core::notes::read_context();
+    let (consent, consent_notice) = if capture_mode == CaptureMode::Meeting {
+        minutes_core::notes::load_consent()
+    } else {
+        (None, None)
+    };
     // Don't block the stop path with a calendar query (can take 10s if Calendar.app hangs).
     // The pipeline already falls back to events_overlapping_now() during background processing.
     let calendar_event = None;
@@ -2103,6 +2352,8 @@ fn cmd_record(
             context_session_id.clone(),
             calendar_event,
             template_slug.clone(),
+            consent,
+            consent_notice,
             startup_recording_health.clone(),
         )?;
 
@@ -5393,6 +5644,27 @@ fn cmd_setup_parakeet(model: &str) -> Result<()> {
         }
     }
 
+    // Verify the warm-sidecar binary (#295). Without it, live transcription
+    // pays a full model load per utterance and will lag badly on real meetings.
+    match minutes_core::parakeet_sidecar::resolve_server_binary("parakeet") {
+        Some(path) => {
+            eprintln!(
+                "Resolved example-server (warm live sidecar): {}",
+                path.display()
+            );
+            eprintln!("Live transcription will auto-use the warm sidecar.");
+        }
+        None => {
+            eprintln!("Note: `example-server` (warm live sidecar) was not found.");
+            eprintln!("Live transcription will fall back to slow cold per-utterance runs.");
+            eprintln!(
+                "To build it, configure parakeet.cpp with -DPARAKEET_BUILD_SERVER_EXAMPLE=ON"
+            );
+            eprintln!("and copy build/**/example-server next to your parakeet binary.");
+            eprintln!("Details: https://github.com/silverstein/minutes/blob/main/docs/PARAKEET.md");
+        }
+    }
+
     eprintln!();
     eprintln!("To use parakeet, add to ~/.config/minutes/config.toml:");
     eprintln!("  [transcription]");
@@ -6233,6 +6505,119 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).ok();
         result
+    }
+
+    #[test]
+    fn recording_consent_explicit_basis_still_reminds_in_remind_mode() {
+        let config = Config::default();
+
+        let resolved = prepare_recording_consent(
+            &config,
+            Some("verbal_all_parties"),
+            Some("Read aloud."),
+            false,
+            || panic!("prompt should not run for explicit basis"),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.basis, ConsentBasis::VerbalAllParties);
+        assert_eq!(resolved.notice.as_deref(), Some("Read aloud."));
+        assert_eq!(
+            resolved.reminder.as_deref(),
+            Some(config.consent.disclosure_script.as_str())
+        );
+        assert_eq!(resolved.warning, None);
+    }
+
+    #[test]
+    fn recording_consent_does_not_fabricate_notice_from_disclosure_script() {
+        let config = Config::default();
+
+        let resolved = prepare_recording_consent(&config, Some("na"), None, false, || {
+            panic!("prompt should not run for explicit basis")
+        })
+        .unwrap();
+
+        assert_eq!(resolved.basis, ConsentBasis::NotApplicable);
+        assert_eq!(resolved.notice, None);
+        assert!(resolved.reminder.is_some());
+        assert_eq!(resolved.warning, None);
+    }
+
+    #[test]
+    fn recording_consent_require_non_tty_does_not_prompt() {
+        let mut config = Config::default();
+        config.consent.mode = ConsentMode::Require;
+        let prompt_calls = AtomicUsize::new(0);
+
+        let resolved = prepare_recording_consent(&config, None, None, false, || {
+            prompt_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        })
+        .unwrap();
+
+        assert_eq!(resolved.basis, ConsentBasis::Unattested);
+        assert!(resolved.warning.is_some());
+        assert!(resolved.reminder.is_some());
+        assert_eq!(prompt_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn recording_consent_rejects_unknown_basis() {
+        let err =
+            parse_recording_consent_basis("made_up_basis").expect_err("unknown basis should error");
+
+        assert!(err.to_string().contains("unknown consent basis"));
+    }
+
+    #[test]
+    fn recording_consent_sidecar_round_trip_from_cli_resolution() {
+        with_temp_home(|_| {
+            let config = Config::default();
+            let resolved = prepare_recording_consent(
+                &config,
+                Some("notice_in_invite"),
+                Some("Included in the invite."),
+                false,
+                || panic!("prompt should not run for explicit basis"),
+            )
+            .unwrap();
+
+            minutes_core::notes::save_consent(Some(resolved.basis), resolved.notice.as_deref())
+                .unwrap();
+            let (basis, notice) = minutes_core::notes::load_consent();
+
+            assert_eq!(basis, Some(ConsentBasis::NoticeInInvite));
+            assert_eq!(notice.as_deref(), Some("Included in the invite."));
+        });
+    }
+
+    #[test]
+    fn sensitive_cli_start_stop_non_tty_marks_debrief_pending() {
+        with_temp_home(|home| {
+            let config = Config {
+                output_dir: home.join("meetings"),
+                ..Config::default()
+            };
+            cmd_sensitive(
+                SensitiveAction::Start {
+                    title: Some("Board sync".into()),
+                },
+                &config,
+            )
+            .unwrap();
+            cmd_sensitive(SensitiveAction::Stop, &config).unwrap();
+
+            let meeting = std::fs::read_dir(&config.output_dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+                .expect("sensitive meeting markdown");
+            let content = std::fs::read_to_string(meeting).unwrap();
+            assert!(content.contains("capture: none"));
+            assert!(content.contains("sensitivity: restricted"));
+            assert!(content.contains("debrief: pending"));
+        });
     }
 
     fn sample_decode_hint_eval_report_with_allowed_failures() -> DecodeHintEvalReport {
@@ -7619,7 +8004,8 @@ fn import_granola(dir: Option<&Path>, dry_run: bool, config: &Config) -> Result<
     if !source_dir.exists() {
         anyhow::bail!(
             "Granola export directory not found: {}\n\
-             Export your Granola meetings first, or specify a directory with --dir",
+             Export your Granola meetings into it first (see \"Switching from Granola?\" in \
+             the README for the granola-cli route), or pass an existing export dir with --dir",
             source_dir.display()
         );
     }
@@ -8201,6 +8587,14 @@ fn cmd_dictate(stdout: bool, note_only: bool, config: &Config) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
+    let permission_preflight = minutes_core::capture::preflight_microphone_only();
+    if let Some(reason) = &permission_preflight.blocking_reason {
+        anyhow::bail!("{}", reason);
+    }
+    for warning in &permission_preflight.warnings {
+        eprintln!("[minutes] {}", warning);
+    }
+
     eprintln!("[minutes] Starting dictation (Ctrl-C to stop)...");
     if config.dictation.accumulate {
         eprintln!(
@@ -8772,6 +9166,14 @@ fn cmd_confirm(
 fn cmd_live(config: &Config) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    let permission_preflight = minutes_core::capture::preflight_microphone_only();
+    if let Some(reason) = &permission_preflight.blocking_reason {
+        anyhow::bail!("{}", reason);
+    }
+    for warning in &permission_preflight.warnings {
+        eprintln!("[minutes] {}", warning);
+    }
 
     eprintln!("Starting live transcript session...");
     if config.transcription.engine == "apple-speech" {

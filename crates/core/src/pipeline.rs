@@ -751,7 +751,18 @@ fn prepare_transcription_input(
         }
     })?;
 
-    let output = std::process::Command::new("ffmpeg")
+    let ffmpeg = crate::ffmpeg::resolve_ffmpeg().map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
+            reason: format!(
+                "ffmpeg could not be resolved for stem mix of {}: {}",
+                canonical.display(),
+                error
+            ),
+        }
+    })?;
+
+    let output = std::process::Command::new(&ffmpeg)
         .args([
             "-y",
             "-i",
@@ -776,8 +787,9 @@ fn prepare_transcription_input(
             let _ = std::fs::remove_file(&tmp);
             crate::error::TranscribeError::NativeCaptureStemMixUnavailable {
                 reason: format!(
-                    "ffmpeg could not be invoked for stem mix of {}: {}. Install ffmpeg (brew install ffmpeg).",
+                    "ffmpeg could not be invoked for stem mix of {} via {}: {}. Install ffmpeg (brew install ffmpeg) or set MINUTES_FFMPEG.",
                     canonical.display(),
+                    ffmpeg.display(),
                     e
                 ),
             }
@@ -1240,6 +1252,10 @@ pub struct BackgroundPipelineContext {
     pub sidecar: Option<SidecarMetadata>,
     pub user_notes: Option<String>,
     pub pre_context: Option<String>,
+    /// Consent basis loaded from the record-start sidecar, if any.
+    pub consent: Option<crate::markdown::ConsentBasis>,
+    /// Exact disclosure text loaded from the record-start sidecar, if any.
+    pub consent_notice: Option<String>,
     pub calendar_event: Option<crate::calendar::CalendarEvent>,
     pub recorded_at: Option<DateTime<Local>>,
     pub requested_title: Option<String>,
@@ -1585,6 +1601,11 @@ pub fn write_transcript_artifact(
         decisions: vec![],
         intents: vec![],
         recorded_by: config.identity.name.clone(),
+        capture: None,
+        sensitivity: None,
+        debrief: None,
+        consent: context.consent,
+        consent_notice: context.consent_notice.clone(),
         visibility: None,
         speaker_map: vec![],
         recording_health: context.recording_health.clone(),
@@ -2552,6 +2573,11 @@ where
         decisions: structured_decisions,
         intents: structured_intents,
         recorded_by: config.identity.name.clone(),
+        capture: None,
+        sensitivity: None,
+        debrief: None,
+        consent: None,
+        consent_notice: None,
         visibility: None,
         speaker_map,
         recording_health,
@@ -4857,6 +4883,11 @@ mod tests {
             decisions: vec![],
             intents: vec![],
             recorded_by: Some("Mat".into()),
+            capture: None,
+            sensitivity: None,
+            debrief: None,
+            consent: None,
+            consent_notice: None,
             visibility: None,
             speaker_map: vec![],
             recording_health: None,
@@ -6163,6 +6194,44 @@ mod tests {
     }
 
     #[test]
+    fn write_transcript_artifact_writes_consent_frontmatter() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio_path = dir.path().join("consent.wav");
+        std::fs::write(&audio_path, vec![0u8; 64_044]).unwrap();
+
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let context = BackgroundPipelineContext {
+            consent: Some(crate::markdown::ConsentBasis::RecordedDisclosed),
+            consent_notice: Some("Announced before recording.".into()),
+            ..BackgroundPipelineContext::default()
+        };
+
+        let artifact = write_transcript_artifact(
+            &audio_path,
+            ContentType::Meeting,
+            None,
+            &config,
+            &context,
+            None,
+            "[SPEAKER_1 0:00] We discussed the roadmap.\n".into(),
+            crate::transcribe::FilterStats::default(),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            artifact.frontmatter.consent,
+            Some(crate::markdown::ConsentBasis::RecordedDisclosed)
+        );
+        let written = std::fs::read_to_string(&artifact.write_result.path).unwrap();
+        assert!(written.contains("consent: recorded_disclosed"));
+        assert!(written.contains("consent_notice: Announced before recording."));
+    }
+
+    #[test]
     fn is_task_like_project_candidate_requires_more_than_a_verb_like_start() {
         assert!(!is_task_like_project_candidate(
             "review board",
@@ -6277,6 +6346,11 @@ mod tests {
             decisions: vec![],
             intents,
             recorded_by: Some("Mat".into()),
+            capture: None,
+            sensitivity: None,
+            debrief: None,
+            consent: None,
+            consent_notice: None,
             visibility: None,
             speaker_map: vec![diarize::SpeakerAttribution {
                 speaker_label: "SPEAKER_1".into(),
@@ -6485,7 +6559,10 @@ mod prepare_transcription_input_tests {
     }
 
     fn ffmpeg_available() -> bool {
-        std::process::Command::new("ffmpeg")
+        let Ok(ffmpeg) = crate::ffmpeg::resolve_ffmpeg() else {
+            return false;
+        };
+        std::process::Command::new(ffmpeg)
             .arg("-version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

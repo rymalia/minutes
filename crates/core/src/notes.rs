@@ -1,4 +1,6 @@
 use crate::config::Config;
+use crate::markdown::ConsentBasis;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -32,9 +34,22 @@ pub fn context_path() -> PathBuf {
     Config::minutes_dir().join("current-context.txt")
 }
 
+/// Path to the current recording's consent sidecar (`~/.minutes/current-consent.json`).
+pub fn consent_path() -> PathBuf {
+    Config::minutes_dir().join("current-consent.json")
+}
+
 /// Path to the recording start timestamp file (`~/.minutes/recording-start.txt`).
 pub fn recording_start_path() -> PathBuf {
     Config::minutes_dir().join("recording-start.txt")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsentSidecar {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    basis: Option<ConsentBasis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notice: Option<String>,
 }
 
 /// Save the recording start timestamp (epoch seconds).
@@ -74,10 +89,16 @@ fn elapsed_timestamp() -> Option<String> {
 /// Add a note to the current recording.
 /// Returns the timestamped note line that was appended.
 pub fn add_note(text: &str) -> Result<String, String> {
+    if crate::sensitive::is_active() {
+        return crate::sensitive::add_marker(text).map_err(|error| error.to_string());
+    }
+
     // Check recording is in progress
     let pid_path = crate::pid::pid_path();
     if !pid_path.exists() {
-        return Err("No recording in progress. Start one with: minutes record".into());
+        return Err(
+            "No recording or sensitive meeting in progress. Start one with: minutes record or minutes sensitive start".into(),
+        );
     }
 
     let timestamp = elapsed_timestamp().unwrap_or_else(|| "?:??".into());
@@ -110,6 +131,29 @@ pub fn save_context(text: &str) -> std::io::Result<()> {
     fs::write(&path, text.trim())
 }
 
+/// Save consent metadata for the current recording.
+pub fn save_consent(basis: Option<ConsentBasis>, notice: Option<&str>) -> std::io::Result<()> {
+    let path = consent_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let sidecar = ConsentSidecar {
+        basis,
+        notice: notice
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    };
+    let json = serde_json::to_string_pretty(&sidecar)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    fs::write(&path, json)
+}
+
+/// Clear consent metadata for the current recording, if any.
+pub fn clear_consent() {
+    let _ = fs::remove_file(consent_path());
+}
+
 /// Read current notes (if any). Returns None if no notes file exists.
 pub fn read_notes() -> Option<String> {
     let path = notes_path();
@@ -134,10 +178,32 @@ pub fn read_context() -> Option<String> {
     }
 }
 
+/// Load consent metadata for the current recording.
+pub fn load_consent() -> (Option<ConsentBasis>, Option<String>) {
+    let path = consent_path();
+    if !path.exists() {
+        return (None, None);
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ConsentSidecar>(&raw).ok())
+        .map(|sidecar| {
+            (
+                sidecar.basis,
+                sidecar
+                    .notice
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            )
+        })
+        .unwrap_or((None, None))
+}
+
 /// Clean up notes and context files after recording completes.
 pub fn cleanup() {
     let _ = fs::remove_file(notes_path());
     let _ = fs::remove_file(context_path());
+    clear_consent();
     let _ = fs::remove_file(recording_start_path());
 }
 
@@ -242,12 +308,44 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn with_temp_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let _guard = crate::test_home_env_lock();
+        let dir = TempDir::new().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir.path());
+        let result = f(dir.path());
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        result
+    }
+
     #[test]
     fn elapsed_timestamp_returns_none_without_recording() {
         // No recording-start.txt should exist in test environment
         // (unless a recording is actually happening on this machine)
         // This test is environment-dependent, so just verify the function doesn't panic
         let _ = elapsed_timestamp();
+    }
+
+    #[test]
+    fn consent_sidecar_saves_loads_and_cleans_up() {
+        with_temp_home(|_| {
+            save_consent(
+                Some(ConsentBasis::VerbalAllParties),
+                Some("Read the configured disclosure."),
+            )
+            .unwrap();
+
+            let (basis, notice) = load_consent();
+            assert_eq!(basis, Some(ConsentBasis::VerbalAllParties));
+            assert_eq!(notice.as_deref(), Some("Read the configured disclosure."));
+
+            cleanup();
+            assert_eq!(load_consent(), (None, None));
+        });
     }
 
     #[test]

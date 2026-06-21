@@ -16,6 +16,12 @@ const docsSections = [
     label: "Start",
     links: [
       {
+        title: "Using Minutes",
+        href: "/docs/using-minutes",
+        blurb:
+          "The desktop app guide for humans: recording, the command palette and its global shortcut, dictation, voice memos, names, consent, and health.",
+      },
+      {
         title: "For agents",
         href: "/for-agents",
         blurb:

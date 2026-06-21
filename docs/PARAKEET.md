@@ -28,7 +28,7 @@ Today, `engine = "parakeet"` is wired for these paths:
 - standalone live transcription (`minutes live` and desktop Live Mode) — see RFC 0002
 
 Both live paths route each VAD-gated utterance through the Parakeet path. If
-`parakeet_sidecar_enabled = true`, they reuse the warm `example-server` socket;
+the sidecar is effective (auto-on when `example-server` resolves, or forced with `parakeet_sidecar_enabled = true`), they reuse the warm `example-server` socket;
 otherwise they fall back to the Parakeet subprocess path for each utterance.
 The standalone live path additionally warms the sidecar at session start so the
 first utterance does not pay the subprocess-spawn + model-load cost.
@@ -41,7 +41,7 @@ still configured separately and remains standalone-live-only; this note is just
 about the fallback order behind that path. See [`docs/APPLE_SPEECH.md`](APPLE_SPEECH.md)
 for the current Apple Speech scope and desktop-settings limitation.
 
-Strongly recommended for live use: set `parakeet_sidecar_enabled = true` and
+Strongly recommended for live use: install `example-server` (the sidecar then auto-enables; `parakeet_sidecar_enabled = true` forces it) and
 ensure `example-server` is discoverable (either on `PATH` or via
 `MINUTES_PARAKEET_SERVER_BINARY`). Without the warm sidecar, every live
 utterance incurs full subprocess startup, which makes live mode visibly slow.
@@ -75,7 +75,7 @@ feature, so this only matters for unusual build configurations.
 If you want the shortest path from "I have a Mac" to "Minutes is using
 Parakeet locally on Metal," do this. Steps 1–3 are shell commands; step 4
 is a manual download + conversion (the CLI prints these instructions but
-does not run them in v0.18.0); step 5 writes a config file — do not paste
+does not run them automatically); step 5 writes a config file — do not paste
 the TOML block into the shell.
 
 Prerequisites first (see [Prerequisites](#prerequisites) for details):
@@ -132,7 +132,7 @@ otool -L ~/.local/bin/parakeet | grep -E 'Metal|Accelerate'
 cd <path/to/your/minutes/checkout>     # e.g. ~/Sites/minutes
 cargo build --release -p minutes-cli --features parakeet
 mkdir -p ~/.local/bin
-cp target/release/minutes ~/.local/bin/minutes
+rm -f ~/.local/bin/minutes && cp target/release/minutes ~/.local/bin/minutes
 # Make sure ~/.local/bin is on PATH (add to ~/.zshrc if it isn't):
 #   export PATH="$HOME/.local/bin:$PATH"
 
@@ -146,21 +146,25 @@ minutes setup --parakeet
 ```
 
 4. Download and convert the multilingual `tdt-600m` model. This is the
-   manual step the CLI prints instructions for. Conversion needs a small
-   Python venv; the only non-obvious dep is `packaging`, which `safetensors`
-   requires but does not auto-pull — without it, `convert_nemo.py` crashes
-   at import time.
+   manual step the CLI prints instructions for. The `.nemo` file is publicly
+   curl-able from HuggingFace — no `huggingface_hub` dependency needed — and
+   conversion needs a small Python venv with `torch`, `safetensors`,
+   `packaging`, and `numpy`. (`packaging` is a transitive dep `safetensors`
+   doesn't pull on its own; without it `convert_nemo.py` crashes at import
+   time.)
 
 ```bash
-# 4a. Python venv for the conversion script. The `packaging` package is the
-#     transitive that safetensors does not auto-install.
-python3 -m venv ~/.local/venvs/parakeet-convert
+# 4a. Python venv for the conversion script (uv is fastest; python -m venv
+#     works too)
+uv venv ~/.local/venvs/parakeet-convert --python 3.13
+uv pip install --python ~/.local/venvs/parakeet-convert/bin/python \
+  torch safetensors packaging numpy
 source ~/.local/venvs/parakeet-convert/bin/activate
-pip install torch torchaudio safetensors huggingface_hub packaging
 
-# 4b. Download the .nemo (2.4 GB) into a scratch dir
+# 4b. Download the .nemo (2.4 GB). HF transparently redirects to the xet-hub
+#     CDN; no auth required.
 mkdir -p /tmp/parakeet-dl && cd /tmp/parakeet-dl
-hf download nvidia/parakeet-tdt-0.6b-v3 parakeet-tdt-0.6b-v3.nemo --local-dir .
+curl -L -O https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/parakeet-tdt-0.6b-v3.nemo
 
 # 4c. Convert to safetensors (2.3 GB output, 627M params)
 mkdir -p ~/.minutes/models/parakeet/tdt-600m
@@ -190,9 +194,9 @@ engine = "parakeet"
 parakeet_model = "tdt-600m"
 parakeet_binary = "/Users/<you>/.local/bin/parakeet"
 parakeet_vocab = "tdt-600m.tokenizer.vocab"
-# Reuse the warm example-server socket for live mode instead of spawning
-# a fresh subprocess per utterance. Requires step 1's example-server copy.
-parakeet_sidecar_enabled = true
+# The warm example-server sidecar auto-enables when step 1's example-server
+# copy resolves. No key needed; set parakeet_sidecar_enabled = true/false
+# only to force it on or off.
 parakeet_fp16 = true
 ```
 
@@ -421,22 +425,29 @@ warning, but the VAD weights and binary check still complete.
 ### Step 2 — Python environment for the conversion script
 
 `convert_nemo.py` needs PyTorch and `safetensors`. `safetensors` has a
-transitive `packaging` dependency it does not auto-pull — without it the
-script crashes at import time. Add it to the install list:
+transitive `packaging` dependency it does not auto-pull, and torch emits a
+warning on first tensor op without `numpy` — install both explicitly.
+`torchaudio` and `huggingface_hub` are **not** required and add hundreds of
+MB.
 
 ```bash
-python3 -m venv ~/.local/venvs/parakeet-convert
+# uv is fastest; `python -m venv` + `pip install` works equivalently
+uv venv ~/.local/venvs/parakeet-convert --python 3.13
+uv pip install --python ~/.local/venvs/parakeet-convert/bin/python \
+  torch safetensors packaging numpy
 source ~/.local/venvs/parakeet-convert/bin/activate
-pip install torch torchaudio safetensors huggingface_hub packaging
 ```
 
 ### Step 3 — Download the .nemo
 
+HuggingFace transparently redirects this public URL to its xet-hub CDN; no
+auth and no `huggingface_hub` Python package required.
+
 ```bash
 mkdir -p /tmp/parakeet-dl && cd /tmp/parakeet-dl
-hf download nvidia/parakeet-tdt-0.6b-v3 parakeet-tdt-0.6b-v3.nemo --local-dir .
+curl -L -O https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/parakeet-tdt-0.6b-v3.nemo
 # For the English-only compact model, swap the repo:
-#   hf download nvidia/parakeet-tdt_ctc-110m parakeet-tdt_ctc-110m.nemo --local-dir .
+#   https://huggingface.co/nvidia/parakeet-tdt_ctc-110m/resolve/main/parakeet-tdt_ctc-110m.nemo
 ```
 
 ### Step 4 — Convert to safetensors
@@ -489,7 +500,7 @@ Edit `~/.config/minutes/config.toml`:
 engine = "parakeet"              # "whisper" (default) or "parakeet"
 parakeet_model = "tdt-600m"      # "tdt-ctc-110m" (English) or "tdt-600m" (multilingual v3)
 parakeet_binary = "/Users/you/.local/bin/parakeet"  # Prefer an absolute path for desktop app launches
-parakeet_sidecar_enabled = true  # Reuse warm example-server socket for live mode (requires example-server copied above)
+# parakeet_sidecar_enabled auto-enables when example-server (copied above) resolves; set true/false to force
 parakeet_boost_limit = 25        # Experimental: top graph-derived boost phrases (0 disables)
 parakeet_boost_score = 2.0       # Experimental tuning for parakeet.cpp --boost-score
 parakeet_fp16 = true             # Default on macOS Apple Silicon: ~35% faster transcription with lower GPU memory (see docs/designs/parakeet-perf-2026-04-14.md)

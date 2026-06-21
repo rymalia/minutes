@@ -103,52 +103,177 @@ pub struct CalendarEvent {
 /// Extract a meeting URL (Zoom, Google Meet, Teams, Webex) from text.
 /// Searches for common video conferencing URL patterns and returns the first match.
 pub fn extract_meeting_url(text: &str) -> Option<String> {
-    let patterns = [
-        "https://zoom.us/j/",
-        "https://us02web.zoom.us/j/",
-        "https://us04web.zoom.us/j/",
-        "https://us05web.zoom.us/j/",
-        "https://us06web.zoom.us/j/",
-        "https://meet.google.com/",
-        "https://teams.microsoft.com/l/meetup-join/",
-        "https://teams.live.com/meet/",
-        "https://webex.com/meet/",
-        "https://facetime.apple.com/",
-    ];
+    let mut remaining = text;
+    while let Some(start) = remaining.find("https://") {
+        let url_text = &remaining[start..];
+        let end = url_text
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | ')' | ']'))
+            .unwrap_or(url_text.len());
+        let url = url_text[..end].trim_end_matches(['.', ',', ';', '\'']);
 
-    for pattern in &patterns {
-        if let Some(start) = text.find(pattern) {
-            let url_text = &text[start..];
-            let end = url_text
-                .find(|c: char| c.is_whitespace() || c == '>' || c == '"' || c == ')')
-                .unwrap_or(url_text.len());
-            let url = &url_text[..end];
-            if url.len() > pattern.len() {
-                return Some(url.to_string());
+        if let Some(redirect_url) = extract_google_redirect_url(url) {
+            if is_meeting_url(&redirect_url) {
+                return Some(redirect_url);
             }
         }
-    }
 
-    // Fallback: look for any https:// URL containing common meeting keywords
-    for keyword in &[
-        "zoom.us",
-        "meet.google",
-        "teams.microsoft",
-        "webex.com",
-        "facetime.apple",
-    ] {
-        if let Some(https_pos) = text.find("https://") {
-            let url_text = &text[https_pos..];
-            if url_text.contains(keyword) {
-                let end = url_text
-                    .find(|c: char| c.is_whitespace() || c == '>' || c == '"' || c == ')')
-                    .unwrap_or(url_text.len());
-                return Some(url_text[..end].to_string());
-            }
+        if is_meeting_url(url) {
+            return Some(url.to_string());
         }
+
+        remaining = &url_text[end..];
     }
 
     None
+}
+
+fn is_meeting_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let rest_lower = rest.to_ascii_lowercase();
+    let (host, path) = match rest_lower.find('/') {
+        Some(slash) => (&rest_lower[..slash], &rest_lower[slash..]),
+        None => (rest_lower.as_str(), ""),
+    };
+
+    if matches_domain(host, "zoom.us") || matches_domain(host, "zoom.com") {
+        return path.starts_with("/j/")
+            || path.starts_with("/my/")
+            || path.starts_with("/s/")
+            || path.starts_with("/wc/join/")
+            || path.starts_with("/join")
+            || path.starts_with("/meeting/register/")
+            || path.starts_with("/webinar/register/");
+    }
+
+    (host == "meet.google.com" && path.len() > 1)
+        || (host == "teams.microsoft.com" && path.starts_with("/l/meetup-join/"))
+        || (host == "teams.live.com" && path.starts_with("/meet/"))
+        || (matches_domain(host, "webex.com") && path.starts_with("/meet/"))
+        || (host == "facetime.apple.com" && path.len() > 1)
+}
+
+fn matches_domain(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn extract_google_redirect_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let rest_lower = rest.to_ascii_lowercase();
+    let slash = rest_lower.find('/')?;
+    let host = &rest_lower[..slash];
+    if host != "google.com" && host != "www.google.com" {
+        return None;
+    }
+    let path_and_query = &rest[slash..];
+    if !path_and_query.starts_with("/url?") {
+        return None;
+    }
+    let query = path_and_query.split_once('?')?.1;
+    query.split('&').find_map(|param| {
+        let (key, value) = param.split_once('=')?;
+        if key == "q" || key == "url" {
+            Some(percent_decode(value))
+        } else {
+            None
+        }
+    })
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                decoded.push((high << 4) | low);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Calendar authorization state as reported by the EventKit helper's
+/// non-prompting `--status` probe (#300).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarAccess {
+    /// Full read access: meeting reminders and suggestions work.
+    FullAccess,
+    /// Write-only / add-only: reads return nothing, reminders are dead.
+    WriteOnly,
+    /// Explicitly denied.
+    Denied,
+    /// Restricted by policy (MDM, parental controls).
+    Restricted,
+    /// Never asked yet: the next feature use will prompt.
+    NotDetermined,
+    /// Helper missing, non-macOS, or unparseable output.
+    Unknown,
+}
+
+impl CalendarAccess {
+    /// True when reads work and reminders can function.
+    pub fn can_read(self) -> bool {
+        matches!(self, CalendarAccess::FullAccess)
+    }
+}
+
+/// Probe calendar authorization WITHOUT prompting (safe from Settings and
+/// readiness surfaces). Uses the helper's `--status` mode; never triggers a
+/// permission dialog (#300).
+pub fn calendar_access_status() -> CalendarAccess {
+    #[cfg(not(target_os = "macos"))]
+    {
+        CalendarAccess::Unknown
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(helper) = find_calendar_helper() else {
+            return CalendarAccess::Unknown;
+        };
+        let mut cmd = Command::new(&helper);
+        cmd.arg("--status");
+        let Some(output) = output_with_timeout(cmd, SUBPROCESS_TIMEOUT) else {
+            return CalendarAccess::Unknown;
+        };
+        if !output.status.success() {
+            return CalendarAccess::Unknown;
+        }
+        parse_calendar_access(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
+/// Parse the helper's `--status` JSON line into a [`CalendarAccess`].
+fn parse_calendar_access(raw: &str) -> CalendarAccess {
+    let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+        Ok(value) => value,
+        Err(_) => return CalendarAccess::Unknown,
+    };
+    match value.get("calendar_access").and_then(|v| v.as_str()) {
+        Some("full-access") => CalendarAccess::FullAccess,
+        Some("write-only") => CalendarAccess::WriteOnly,
+        Some("denied") => CalendarAccess::Denied,
+        Some("restricted") => CalendarAccess::Restricted,
+        Some("not-determined") => CalendarAccess::NotDetermined,
+        _ => CalendarAccess::Unknown,
+    }
 }
 
 /// Query upcoming calendar events within the next `lookahead_minutes`.
@@ -420,6 +545,13 @@ fn query_via_eventkit(lookahead_minutes: u32) -> Option<Vec<CalendarEvent>> {
     let output = output_with_timeout(cmd, SUBPROCESS_TIMEOUT)?;
 
     if !output.status.success() {
+        if output.status.code() == Some(2) {
+            // Helper signals access-not-granted distinctly so dead reminders
+            // are observable instead of reading as "no events" (#300).
+            tracing::warn!(
+                "calendar read access not granted (write-only or denied); meeting reminders are off"
+            );
+        }
         return None;
     }
 
@@ -664,12 +796,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extract_zoom_vanity_url() {
+        let text = "https://airwallex.zoom.com/j/93507198550";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://airwallex.zoom.com/j/93507198550".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_zoom_us_vanity_url_with_dash() {
+        let text = "Join from calendar: https://hooli-it.zoom.us/j/93507198550?pwd=abc";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://hooli-it.zoom.us/j/93507198550?pwd=abc".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_zoom_vanity_personal_link() {
+        let text = "Personal room: https://mycompany.zoom.us/my/grant";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://mycompany.zoom.us/my/grant".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_zoom_vanity_url_from_google_calendar_redirect() {
+        let text = "https://www.google.com/url?q=https://airwallex.zoom.com/j/93507198550?jst%3D2&sa=D&source=calendar";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://airwallex.zoom.com/j/93507198550?jst=2".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_visible_zoom_vanity_url_from_markdown_link() {
+        let text = "[https://airwallex.zoom.com/j/93507198550](https://www.google.com/url?q=https://airwallex.zoom.com/j/93507198550?jst%3D2&sa=D&source=calendar)";
+        assert_eq!(
+            extract_meeting_url(text),
+            Some("https://airwallex.zoom.com/j/93507198550".to_string())
+        );
+    }
+
     // Tests that shell out to a POSIX helper script are unix-only. On
     // Windows there is no chmod +x equivalent and the fake helper below
     // wouldn't execute as a script. The behavior being tested
     // (argument-passing contract between Minutes and the EventKit
     // helper) is itself macOS-only anyway, so there's nothing to validate
     // on Windows.
+    /// Exec a just-written script with retries. Writing an executable and
+    /// exec'ing it immediately races with concurrent test forks inheriting
+    /// the short-lived write fd (ETXTBSY); the helper returns None on spawn
+    /// failure, so retry a few times before declaring the run failed.
+    #[cfg(unix)]
+    fn run_helper_with_etxtbsy_retry(
+        helper_path: &std::path::Path,
+        reference: Option<i64>,
+    ) -> Option<Vec<CalendarEvent>> {
+        for _ in 0..10 {
+            if let Some(events) = query_overlap_via_eventkit_with_helper(helper_path, reference) {
+                return Some(events);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
+    }
+
     #[cfg(unix)]
     #[test]
     fn query_overlap_via_eventkit_passes_reference_timestamp() {
@@ -685,7 +880,7 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&helper_path, permissions).unwrap();
 
-        let events = query_overlap_via_eventkit_with_helper(&helper_path, Some(1_700_000_000))
+        let events = run_helper_with_etxtbsy_retry(&helper_path, Some(1_700_000_000))
             .expect("helper should run");
         assert!(events.is_empty());
 
@@ -711,11 +906,63 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&helper_path, permissions).unwrap();
 
-        let events =
-            query_overlap_via_eventkit_with_helper(&helper_path, None).expect("helper should run");
+        let events = run_helper_with_etxtbsy_retry(&helper_path, None).expect("helper should run");
         assert!(events.is_empty());
 
         let args = std::fs::read_to_string(&args_path).unwrap();
         assert_eq!(args.lines().collect::<Vec<_>>(), ["120", "120"]);
+    }
+}
+
+#[cfg(test)]
+mod calendar_access_tests {
+    use super::*;
+
+    #[test]
+    fn parses_all_status_labels() {
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"full-access\"}"),
+            CalendarAccess::FullAccess
+        );
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"write-only\"}"),
+            CalendarAccess::WriteOnly
+        );
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"denied\"}"),
+            CalendarAccess::Denied
+        );
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"restricted\"}"),
+            CalendarAccess::Restricted
+        );
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"not-determined\"}"),
+            CalendarAccess::NotDetermined
+        );
+    }
+
+    #[test]
+    fn garbage_and_unexpected_labels_are_unknown() {
+        assert_eq!(parse_calendar_access("not json"), CalendarAccess::Unknown);
+        assert_eq!(
+            parse_calendar_access("{\"calendar_access\":\"sideways\"}"),
+            CalendarAccess::Unknown
+        );
+        assert_eq!(parse_calendar_access("{}"), CalendarAccess::Unknown);
+    }
+
+    #[test]
+    fn only_full_access_can_read() {
+        assert!(CalendarAccess::FullAccess.can_read());
+        for state in [
+            CalendarAccess::WriteOnly,
+            CalendarAccess::Denied,
+            CalendarAccess::Restricted,
+            CalendarAccess::NotDetermined,
+            CalendarAccess::Unknown,
+        ] {
+            assert!(!state.can_read());
+        }
     }
 }

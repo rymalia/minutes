@@ -26,6 +26,7 @@ pub struct Config {
     pub watch: WatchConfig,
     pub assistant: AssistantConfig,
     pub privacy: PrivacyConfig,
+    pub consent: ConsentConfig,
     pub screen_context: ScreenContextConfig,
     pub desktop_context: DesktopContextConfig,
     pub calendar: CalendarConfig,
@@ -40,6 +41,60 @@ pub struct Config {
     pub hooks: HooksConfig,
     pub knowledge: KnowledgeConfig,
     pub palette: PaletteConfig,
+    pub global_hotkey: GlobalHotkeyConfig,
+    pub notifications: NotificationsConfig,
+}
+
+/// Quick-Thought global hotkey configuration.
+///
+/// Mirrors the shortcut-bearing sections (`palette`, `live_transcript`):
+/// a `shortcut_enabled` bool plus a `shortcut` chord string. This is the
+/// config-file home for the Quick-Thought hotkey that `cmd_set_global_hotkey`
+/// and the `quick_thought` slot of `cmd_set_shortcut` write to. The AppState
+/// fields `global_hotkey_enabled` / `global_hotkey_shortcut` are seeded from
+/// here at startup (see `main.rs`).
+///
+/// Defaults match the historical startup defaults: disabled, with the first
+/// entry of `HOTKEY_CHOICES` (`CmdOrCtrl+Shift+M`) as the chord. `#[serde(default)]`
+/// keeps `Config::load()` working on older `config.toml` files that predate
+/// this section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GlobalHotkeyConfig {
+    /// Whether the Quick-Thought global hotkey is enabled.
+    pub shortcut_enabled: bool,
+    /// The hotkey chord string (e.g., "CmdOrCtrl+Shift+M").
+    pub shortcut: String,
+}
+
+impl Default for GlobalHotkeyConfig {
+    fn default() -> Self {
+        Self {
+            shortcut_enabled: false,
+            shortcut: "CmdOrCtrl+Shift+M".into(),
+        }
+    }
+}
+
+/// Notification preferences.
+///
+/// `completion_enabled` controls the system notification fired when a
+/// recording finishes processing. Defaults to `true` to preserve the
+/// historical behavior (AppState previously seeded `AtomicBool::new(true)`).
+/// `#[serde(default)]` keeps old `config.toml` files loading.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Whether the "processing complete" notification is shown.
+    pub completion_enabled: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            completion_enabled: true,
+        }
+    }
 }
 
 /// Command palette configuration.
@@ -169,10 +224,28 @@ pub struct TranscriptionConfig {
     /// runtime it can add noticeable cold-start latency because the model is
     /// cast to fp16 on each run.
     pub parakeet_fp16: bool,
-    /// Enable the warm Parakeet example-server sidecar path.
+    /// Warm Parakeet example-server sidecar: `None` (default) = auto.
     ///
-    /// This is beta and remains opt-in until more real-world validation lands.
-    pub parakeet_sidecar_enabled: bool,
+    /// Auto enables the sidecar when parakeet is the selected engine (batch or
+    /// live) AND the `example-server` binary resolves; otherwise the cold
+    /// per-utterance subprocess path is used. Explicit `true`/`false` in
+    /// config.toml overrides auto in either direction (#295). Use
+    /// `parakeet_sidecar::sidecar_enabled_effective()` to read the decision;
+    /// never branch on this raw field.
+    ///
+    /// On-disk forms: absent or `"auto"` = auto; `true`/`"on"` = forced on;
+    /// `"off"` = forced off. A legacy bool `false` is treated as auto, because
+    /// pre-0.18.8 full-struct saves wrote `= false` into every config file
+    /// while the key had no UI — it was a serializer artifact, never intent
+    /// (#295). Deliberate forced-off therefore serializes as the string
+    /// `"off"`, which the legacy serializer could never have written.
+    #[serde(
+        default,
+        deserialize_with = "de_sidecar_tristate",
+        serialize_with = "ser_sidecar_tristate",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub parakeet_sidecar_enabled: Option<bool>,
     /// Clear the persistent parakeet fp16 blacklist before the next sidecar start.
     ///
     /// This is useful after upgrading the parakeet binary to a version that may
@@ -298,14 +371,46 @@ pub struct DesktopContextConfig {
     pub capture_browser_context: bool,
     pub allowed_apps: Vec<String>,
     pub denied_apps: Vec<String>,
-    pub allowed_domains: Vec<String>,
-    pub denied_domains: Vec<String>,
+    // Domain allow/deny lists were removed in the #295-era drift sweep: the
+    // fields were parsed and settable but enforced nowhere (browser capture
+    // is window-title-only in v1; URLs and domains are never collected).
+    // Reintroduce together with actual enforcement if browser-context
+    // capture ever graduates.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrivacyConfig {
     pub hide_from_screen_share: bool,
+}
+
+/// Consent affordance for meeting capture.
+///
+/// Minutes records full local transcripts; some meeting contexts require
+/// participant notice before capture. This config controls the pre-record
+/// reminder/gate and the disclosure script. It is a privacy aid, not a
+/// determination about requirements.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsentConfig {
+    /// off | remind | require. Default `remind`.
+    pub mode: ConsentMode,
+    /// One-line script the user can read aloud or paste before recording.
+    pub disclosure_script: String,
+    /// Optional default basis stamped into frontmatter when the user does not
+    /// pass one, such as a team with notice baked into every calendar invite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_basis: Option<String>,
+}
+
+/// Pre-record consent prompt behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConsentMode {
+    Off,
+    #[default]
+    Remind,
+    Require,
 }
 
 /// Retention policy for raw audio artifacts.
@@ -360,6 +465,16 @@ impl Default for PrivacyConfig {
     }
 }
 
+impl Default for ConsentConfig {
+    fn default() -> Self {
+        Self {
+            mode: ConsentMode::Remind,
+            disclosure_script: "Heads up: I'm using Minutes to transcribe this conversation locally on my device for my own notes. Let me know if you'd prefer I didn't.".into(),
+            default_basis: None,
+        }
+    }
+}
+
 impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
@@ -381,8 +496,6 @@ impl Default for DesktopContextConfig {
             capture_browser_context: false,
             allowed_apps: vec![],
             denied_apps: vec![],
-            allowed_domains: vec![],
-            denied_domains: vec![],
         }
     }
 }
@@ -711,6 +824,49 @@ impl Default for CallDetectionConfig {
     }
 }
 
+/// Deserialize the sidecar tri-state: bool `true`/`"on"` => forced on,
+/// `"off"` => forced off, `"auto"` => auto, legacy bool `false` => auto (#295).
+fn de_sidecar_tristate<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Bool(bool),
+        Text(String),
+    }
+    match Option::<Raw>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Raw::Bool(true)) => Ok(Some(true)),
+        // Legacy serializer artifact: every pre-0.18.8 desktop save wrote
+        // `parakeet_sidecar_enabled = false` while the key had no UI.
+        Some(Raw::Bool(false)) => Ok(None),
+        Some(Raw::Text(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(None),
+            "on" | "true" => Ok(Some(true)),
+            "off" | "false" => Ok(Some(false)),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown parakeet_sidecar_enabled '{other}'. Valid: auto, on, off"
+            ))),
+        },
+    }
+}
+
+/// Serialize the sidecar tri-state: forced on as bool `true` (matches docs),
+/// forced off as the string `"off"` so it can never be mistaken for the
+/// legacy serializer artifact. `None` is skipped entirely.
+fn ser_sidecar_tristate<S>(value: &Option<bool>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(true) => serializer.serialize_bool(true),
+        Some(false) => serializer.serialize_str("off"),
+        None => serializer.serialize_none(),
+    }
+}
+
 // ── Defaults ─────────────────────────────────────────────────
 
 fn home_dir() -> PathBuf {
@@ -762,6 +918,7 @@ impl Default for Config {
             watch: WatchConfig::default(),
             assistant: AssistantConfig::default(),
             privacy: PrivacyConfig::default(),
+            consent: ConsentConfig::default(),
             screen_context: ScreenContextConfig::default(),
             desktop_context: DesktopContextConfig::default(),
             calendar: CalendarConfig::default(),
@@ -776,6 +933,8 @@ impl Default for Config {
             hooks: HooksConfig::default(),
             knowledge: KnowledgeConfig::default(),
             palette: PaletteConfig::default(),
+            global_hotkey: GlobalHotkeyConfig::default(),
+            notifications: NotificationsConfig::default(),
         }
     }
 }
@@ -796,7 +955,7 @@ impl Default for TranscriptionConfig {
             parakeet_boost_limit: 0,
             parakeet_boost_score: 2.0,
             parakeet_fp16: true,
-            parakeet_sidecar_enabled: false,
+            parakeet_sidecar_enabled: None,
             parakeet_fp16_blacklist_reset: false,
             parakeet_vocab: "tdt-600m.tokenizer.vocab".into(),
             partial_max_secs: 30,
@@ -1325,7 +1484,7 @@ mod tests {
         assert_eq!(config.transcription.parakeet_boost_limit, 0);
         assert_eq!(config.transcription.parakeet_boost_score, 2.0);
         assert!(config.transcription.parakeet_fp16);
-        assert!(!config.transcription.parakeet_sidecar_enabled);
+        assert!(config.transcription.parakeet_sidecar_enabled.is_none());
         assert_eq!(
             config.transcription.parakeet_vocab,
             "tdt-600m.tokenizer.vocab"
@@ -1342,6 +1501,40 @@ mod tests {
         assert!(!config.recording.auto_call_intent);
         assert!(!config.recording.allow_degraded_call_capture);
         assert_eq!(config.recording.capture_backend, "cpal");
+        assert_eq!(config.consent.mode, ConsentMode::Remind);
+        assert!(config.consent.default_basis.is_none());
+        assert!(config.consent.disclosure_script.contains("Minutes"));
+    }
+
+    #[test]
+    fn consent_config_deserializes_modes_and_defaults() {
+        let parsed: Config = toml::from_str(
+            r#"
+            [consent]
+            mode = "require"
+            disclosure_script = "Please acknowledge recording."
+            default_basis = "notice_in_invite"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.consent.mode, ConsentMode::Require);
+        assert_eq!(
+            parsed.consent.disclosure_script,
+            "Please acknowledge recording."
+        );
+        assert_eq!(
+            parsed.consent.default_basis.as_deref(),
+            Some("notice_in_invite")
+        );
+    }
+
+    #[test]
+    fn missing_consent_config_uses_defaults() {
+        let parsed: Config = toml::from_str("").unwrap();
+
+        assert_eq!(parsed.consent.mode, ConsentMode::Remind);
+        assert!(parsed.consent.default_basis.is_none());
     }
 
     #[test]
@@ -1471,7 +1664,7 @@ parakeet_binary = "/usr/local/bin/parakeet"
             config.transcription.parakeet_binary,
             "/usr/local/bin/parakeet"
         );
-        assert!(!config.transcription.parakeet_sidecar_enabled);
+        assert!(config.transcription.parakeet_sidecar_enabled.is_none());
         // Other fields should be defaults
         assert_eq!(config.transcription.model, "small");
         assert_eq!(config.transcription.min_words, 3);
@@ -1549,7 +1742,7 @@ parakeet_sidecar_enabled = true
         .unwrap();
 
         let config = Config::load_from(&config_path);
-        assert!(config.transcription.parakeet_sidecar_enabled);
+        assert_eq!(config.transcription.parakeet_sidecar_enabled, Some(true));
     }
 
     #[test]
@@ -1679,6 +1872,44 @@ enabled = true
         let config = Config::default();
         assert!(config.palette.shortcut_enabled);
         assert_eq!(config.palette.shortcut, "CmdOrCtrl+Shift+K");
+    }
+
+    #[test]
+    fn global_hotkey_and_notifications_defaults_match_legacy_startup() {
+        let config = Config::default();
+        // Quick-Thought hotkey: disabled, CmdOrCtrl+Shift+M (HOTKEY_CHOICES[0]).
+        assert!(!config.global_hotkey.shortcut_enabled);
+        assert_eq!(config.global_hotkey.shortcut, "CmdOrCtrl+Shift+M");
+        // Completion notifications default-on, preserving prior behavior.
+        assert!(config.notifications.completion_enabled);
+    }
+
+    #[test]
+    fn old_config_without_new_sections_still_loads() {
+        // An old config.toml that predates [global_hotkey] / [notifications]
+        // must still deserialize (backward compatibility), falling back to the
+        // section defaults via `#[serde(default)]`.
+        let parsed: Config = toml::from_str(
+            "[transcription]\nengine = \"whisper\"\n\n[palette]\nshortcut_enabled = false\nshortcut = \"CmdOrCtrl+Shift+K\"\n",
+        )
+        .expect("old config without new sections must load");
+        assert!(!parsed.global_hotkey.shortcut_enabled);
+        assert_eq!(parsed.global_hotkey.shortcut, "CmdOrCtrl+Shift+M");
+        assert!(parsed.notifications.completion_enabled);
+    }
+
+    #[test]
+    fn new_sections_round_trip_through_toml() {
+        let mut config = Config::default();
+        config.global_hotkey.shortcut_enabled = true;
+        config.global_hotkey.shortcut = "CmdOrCtrl+Shift+J".into();
+        config.notifications.completion_enabled = false;
+
+        let out = toml::to_string(&config).unwrap();
+        let parsed: Config = toml::from_str(&out).unwrap();
+        assert!(parsed.global_hotkey.shortcut_enabled);
+        assert_eq!(parsed.global_hotkey.shortcut, "CmdOrCtrl+Shift+J");
+        assert!(!parsed.notifications.completion_enabled);
     }
 
     #[test]
@@ -2041,5 +2272,104 @@ language = "fr"
 
         let config = Config::load_from(&config_path);
         assert_eq!(config.summarization.language, "fr");
+    }
+}
+
+#[cfg(test)]
+mod sidecar_tristate_tests {
+    use super::*;
+
+    fn parse(snippet: &str) -> Config {
+        toml::from_str(&format!("[transcription]\n{snippet}\n")).unwrap()
+    }
+
+    #[test]
+    fn absent_key_is_auto() {
+        assert_eq!(
+            parse("engine = \"parakeet\"")
+                .transcription
+                .parakeet_sidecar_enabled,
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_bool_false_is_treated_as_auto() {
+        // Pre-0.18.8 full-struct saves wrote `= false` into every config (#295).
+        assert_eq!(
+            parse("parakeet_sidecar_enabled = false")
+                .transcription
+                .parakeet_sidecar_enabled,
+            None
+        );
+    }
+
+    #[test]
+    fn bool_true_forces_on() {
+        assert_eq!(
+            parse("parakeet_sidecar_enabled = true")
+                .transcription
+                .parakeet_sidecar_enabled,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn string_off_forces_off_and_roundtrips() {
+        let config = parse("parakeet_sidecar_enabled = \"off\"");
+        assert_eq!(config.transcription.parakeet_sidecar_enabled, Some(false));
+        let out = toml::to_string_pretty(&config).unwrap();
+        assert!(out.contains("parakeet_sidecar_enabled = \"off\""));
+        // And the roundtrip survives a re-parse (deliberate off is durable).
+        let again: Config = toml::from_str(&out).unwrap();
+        assert_eq!(again.transcription.parakeet_sidecar_enabled, Some(false));
+    }
+
+    #[test]
+    fn auto_serializes_to_no_key() {
+        let config = Config::default();
+        let out = toml::to_string_pretty(&config).unwrap();
+        assert!(!out.contains("parakeet_sidecar_enabled"));
+    }
+
+    #[test]
+    fn string_auto_and_on_parse() {
+        assert_eq!(
+            parse("parakeet_sidecar_enabled = \"auto\"")
+                .transcription
+                .parakeet_sidecar_enabled,
+            None
+        );
+        assert_eq!(
+            parse("parakeet_sidecar_enabled = \"on\"")
+                .transcription
+                .parakeet_sidecar_enabled,
+            Some(true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sidecar_tristate_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn integer_value_is_rejected() {
+        let result = toml::from_str::<Config>("[transcription]\nparakeet_sidecar_enabled = 0\n");
+        assert!(result.is_err(), "integer must not silently coerce");
+    }
+
+    #[test]
+    fn datetime_value_is_rejected() {
+        let result =
+            toml::from_str::<Config>("[transcription]\nparakeet_sidecar_enabled = 2026-06-10\n");
+        assert!(result.is_err(), "datetime must not silently coerce");
+    }
+
+    #[test]
+    fn unknown_string_is_rejected() {
+        let result =
+            toml::from_str::<Config>("[transcription]\nparakeet_sidecar_enabled = \"sometimes\"\n");
+        assert!(result.is_err(), "unknown strings must error, not default");
     }
 }
