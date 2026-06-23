@@ -9,7 +9,17 @@ method: "learn-codebase deep dive — direct file reads + parallel survey agents
 companion_diagrams:
   - docs/diagrams/minutes-build-link-run.html
   - docs/diagrams/minutes-parakeet-fallback.html
-caveat: "Line numbers are approximate to the assessed version and drift over time — treat them as 'start reading here,' not gospel. Re-verify before relying on a specific line."
+caveat: |
+  Line numbers are approximate to the assessed version and drift over time — treat them as
+  "start reading here," not gospel. Re-verify before relying on a specific line.
+
+  Line-anchored claims verify *that the cited code still exists*, not *that the surrounding prose
+  still accurately summarizes the surrounding code*. A commit that changes architectural premises
+  without breaking any anchored line will pass anchor-checks silently. Re-read prose against code
+  on bundle/IPC/version-source changes; don't trust the anchors alone. (Concrete example: commit
+  `675f6b6` "feat(app): bundle CLI inside Minutes.app for auto-update" added a second Rust binary
+  to the macOS bundle and a third update channel, invalidating premises in §§2-4 without breaking
+  any line anchor in those sections.)
 ---
 
 # Minutes — Architecture Reference
@@ -90,9 +100,24 @@ Argument Parser, the Rust library that turns typed args into structured commands
 **The Tauri app** (`tauri/src-tauri/src/`) is a menu-bar app. `main.rs` (~2.8k lines) builds the
 tray, windows, plugins, and background loops; `commands.rs` (~15k lines) holds ~100 `#[tauri::command]`
 functions (`cmd_*`) that the WebView UI invokes. The overwhelming majority call `minutes_core::*`
-directly in-process. The **only** time the app executes the `minutes` binary is a 1-second
-`--version` probe in `cli_setup.rs`; the only subprocesses it *spawns* are **agent CLIs**
-(`claude`/`codex`) in a PTY for the Recall assistant (`pty.rs`) — never `minutes` for transcription.
+directly in-process. The subprocesses the app spawns:
+
+- **Agent CLIs** (`claude`/`codex`) in a PTY for the Recall assistant (`pty.rs`).
+- A 1-second `--version` probe of the `minutes` binary in `cli_setup.rs`.
+- The **bundled CLI as a Parakeet helper** — for hint-less Parakeet calls (cold batch processing
+  and the watcher memo path), Layer 2 of the fallback chain spawns `minutes parakeet-helper` for
+  crash isolation (`transcribe.rs:1925-1931`; see §9). The recording-sidecar Parakeet path passes
+  hints, so `helper_allowed` is false and the chain skips Layer 2 — meaning **live capture never
+  spawns `minutes`**, but batch transcription can.
+
+Which `minutes` binary gets spawned for Layer 2 is **not guaranteed to be the bundled sidecar**.
+`resolve_minutes_parakeet_helper` (`transcribe.rs:2462`) resolves in order: the
+`MINUTES_PARAKEET_HELPER` env var → `current_exe()` *only if its filename is `minutes`* (false for
+`minutes-app`, so it falls through) → `which("minutes")`, i.e. whatever `minutes` is first on
+`PATH`. That's the bundled sidecar (see §3) only when the user has run "Set up CLI" so
+`~/.local/bin/minutes` is the bundle symlink; a standalone `~/.cargo/bin/minutes` or Homebrew
+install earlier on `PATH` is spawned instead. If that resolved binary is whisper-only, Layer 2
+returns `EngineNotAvailable("parakeet")` and the chain falls through to Layer 3.
 
 ---
 
@@ -104,18 +129,30 @@ local **`path` dependency**. At **link** time the compiler copies core's compile
 binary (static linking) — so **each binary carries its own embedded copy of core**.
 
 ```
-SOURCE (one checkout @ 0.18.14)        COMPILE                 LINK (static)            INSTALL (separate channels)
-  crates/core/  (lib, no main) ───►  libminutes_core-*.rlib ─┬─► minutes      (~32 MB) ─► ~/.local/bin/minutes
-  crates/cli/   (bin "minutes") ─────────────────────────────┤                            ~/.cargo/bin/minutes
-  tauri/src-tauri/ (bin "minutes-app") ──────────────────────┴─► minutes-app  (~47 MB) ─► /Applications/Minutes.app/
+SOURCE (one checkout @ 0.18.14)        COMPILE                 LINK (static)            INSTALL (three channels on macOS)
+  crates/core/  (lib, no main) ───►  libminutes_core-*.rlib ─┬─► minutes      (~32 MB) ─┬─► ~/.local/bin/minutes      (brew, cargo, manual)
+  crates/cli/   (bin "minutes") ─────────────────────────────┤                          ├─► ~/.cargo/bin/minutes      (cargo install)
+                                                             │                          └─► /Applications/Minutes.app/
+                                                             │                              Contents/MacOS/minutes    (bundled CLI sidecar,
+                                                             │                                                         since 675f6b6)
+  tauri/src-tauri/ (bin "minutes-app") ──────────────────────┴─► minutes-app  (~47 MB) ───► /Applications/Minutes.app/
                                           (release: strip=true, lto=thin)                   Contents/MacOS/minutes-app
 ```
 
 **Single in source, replicated in the binaries.** There is exactly one `minutes-core` codebase, but
-its compiled code is baked into each binary independently. There is **no** shared `minutes-core` file
-loaded at runtime, and you will **never** see a `minutes-core` process — only `minutes` /
-`minutes-app` (and possibly `example-server`, `claude`). The `.rlib` files under
-`target/release/deps/libminutes_core-*.rlib` are build intermediates, never installed.
+its compiled code is baked into each binary independently. On macOS, since commit `675f6b6` (May 2026),
+the bundle ships **two** statically-linked-against-core Rust binaries — `minutes-app` (the desktop
+process) and `minutes` (the CLI, declared as a Tauri `externalBin` sidecar in
+`tauri/src-tauri/tauri.macos.conf.json:3-8` and staged from `target/release/minutes` by
+`tauri/src-tauri/build.rs:32`). So at the macOS install level, core is effectively *triplicated*:
+once in the standalone CLI release, once in `minutes-app`, once in the bundled sidecar `minutes`. The
+build CI guards the sidecar at `release-macos.yml:124-135` (must be Mach-O, ≥10 MB — the placeholder
+stub regression from issue #324).
+
+There is **no** shared `minutes-core` file loaded at runtime, and you will **never** see a
+`minutes-core` process — only `minutes` / `minutes-app` (and possibly `example-server`, `claude`).
+The `.rlib` files under `target/release/deps/libminutes_core-*.rlib` are build intermediates, never
+installed.
 
 This is the structural reason **compile-time features are per-binary** (see §13): each embedded copy
 of core was compiled with its own feature flags.
@@ -149,11 +186,19 @@ local source. The release checklist (`docs/RELEASE.md`) keeps the user-facing ve
 - **Within one checkout → No.** Both use a `path` dep on the *same* `crates/core/`, and core inherits
   the one workspace version. At a given commit there is exactly one core source, so both binaries
   embed an identical core. They cannot diverge from the same tree.
-- **Across install moments → Yes.** The installed CLI and app update through *separate channels* (the
-  app via its in-app updater/DMG; the CLI via `cp`/`cargo install`/`brew`), so the artifacts on disk
-  drift. Real example observed on a dev machine: two CLIs at `0.18.6` and `0.18.5`, plus an app
-  executable built on a third date. After an in-app update, re-sync the CLI separately
-  (e.g. `brew upgrade minutes`).
+- **Across install moments → Depends on which channel.** On macOS there are now **three** install
+  channels, and only one of them is auto-resynced by an app update:
+  - **Bundled CLI sidecar** (`/Applications/Minutes.app/Contents/MacOS/minutes`, exposed via the
+    `~/.local/bin/minutes → bundle` symlink that `cli_setup.rs` creates on user opt-in). The Tauri
+    updater swaps the whole `.app.tar.gz`, so the sidecar swaps with it. No re-sync needed.
+  - **Standalone CLI release** (`~/.cargo/bin/minutes`, `~/.local/bin/minutes` from cargo, or
+    `brew install silverstein/tap/minutes`). Updates independently of the app — must be re-synced
+    after an in-app update (e.g. `brew upgrade minutes`).
+  - **App itself** (`Contents/MacOS/minutes-app`). In-app updater / DMG.
+
+  Real example observed on a dev machine: two standalone CLIs at `0.18.6` and `0.18.5`, plus an
+  app executable built on a third date. That drift is specific to the standalone-CLI channel — a
+  user on the bundled-sidecar track via "Settings → Set up CLI" doesn't see it.
 
 ---
 
@@ -332,6 +377,16 @@ subprocess"` and continues. **Layer 2** runs only if `helper_allowed` (`hints.is
 `MINUTES_PARAKEET_FORCE_DIRECT`/`MINUTES_PARAKEET_HELPER_ACTIVE` env, `transcribe.rs:1927`) and the
 `minutes` binary resolves; a non-zero exit logs once and falls to **Layer 3**, the unconditional floor.
 
+**The chain effectively bifurcates by caller.** Live capture callers (recording-sidecar live
+transcription, standalone `minutes live`) pass decode hints — vocabulary priming, calendar-derived
+terms, attendee names — so `hints.is_empty()` is false and Layer 2 is skipped. Batch callers
+(`minutes process`, watcher memo path, cold reprocessing) pass empty hints. So in practice:
+- **Live**: `1 → 3` (warm sidecar, then direct subprocess on failure — no `minutes` spawn)
+- **Batch**: `1 → 2 → 3` (warm sidecar, then crash-isolated helper, then direct subprocess)
+
+This is why §2's claim that the app never spawns `minutes` for transcription is only true for live
+capture; batch transcription in the app can spawn `minutes parakeet-helper`.
+
 **What "sidecar" means here:** a long-lived companion *process* (`example-server`) that holds the
 model resident and answers requests over a Unix domain socket — borrowed from the microservices
 sidecar pattern. It exists because Layers 2/3 reload the multi-hundred-MB model on every call, which
@@ -417,7 +472,11 @@ third consumer but **does not link `minutes-core`** (it's TypeScript). It either
 
 - **shells out** to the CLI via `execFile` (`minutes search --json`, `minutes get`, `minutes
   capabilities`, …) — `findMinutesBinary()` (`index.ts:478`) probes `target/`, `~/.cargo/bin`,
-  `~/.local/bin`, Homebrew dirs, then PATH; or
+  `~/.local/bin`, Homebrew dirs, then PATH. Note the macOS bundle
+  (`/Applications/Minutes.app/Contents/MacOS/minutes`) is **not** probed directly — it's reached
+  only indirectly via the `~/.local/bin/minutes` symlink that "Set up CLI" writes (§4). Without
+  that opt-in, MCP has no path to the bundled CLI and will use a standalone install even if it's
+  whisper-only and the bundle is Parakeet-capable; or
 - **reads markdown directly** via `minutes-sdk`'s `reader.ts` (a parity-mirror of the Rust
   `minutes-reader`, down to `humanizeTranscript` only renaming `confidence: "high"` speakers).
 
@@ -457,7 +516,7 @@ targets after a core change.
 | Binary | Command / location | Read |
 |--------|--------------------|------|
 | **CLI** | `minutes capabilities --json` | `.features.parakeet` / `.features.diarize` (true/false) |
-| | `which minutes` first | there can be several `minutes` binaries; check the one on PATH |
+| | `readlink "$(which minutes)"` **first** | there can be several `minutes` binaries; if `which minutes` resolves into a `.app` bundle, `capabilities` reports the *app's* flags via the bundled sidecar — **not** a standalone CLI release's. A whisper-only `~/.cargo/bin/minutes` can coexist with a Parakeet bundle symlink; PATH order decides which one you're reading. |
 | **App** | open the app → **Settings → Transcription** | the `parakeet_compiled` field (`cmd_get_settings`, `commands.rs:8455`) |
 
 There is **no** `capabilities` subcommand on the `minutes-app` binary itself — it only recognizes
