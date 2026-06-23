@@ -1,7 +1,8 @@
 ---
 session_id: ef3ac783-bd37-4900-99ad-f8d5c665e88a
 date: 2026-06-23
-time: "1:45 AM PDT – 3:26 AM PDT"
+time: "1:45 AM PDT – 4:08 AM PDT"
+resumed: "3:52 AM PDT"
 project: minutes
 branch: dev
 ---
@@ -113,11 +114,28 @@ row — were already staged at session start and were validated, not re-authored
 - **CI feature-flag gap is still open**: the sidecar guard checks Mach-O + size but **not** features, so
   a Parakeet-flag regression would ship silently. Low-risk today (explicit YAML), un-gated nonetheless.
 
+## Post-commit addendum — third (Codex) parallel session reviewed
+
+After the initial commit (`05442ca`), a transcript from a **Codex** agent working the same questions
+in parallel was reviewed for additive material. Two genuinely new, source-verified items surfaced and
+were folded into `BINARIES-AND-PARAKEET.md`:
+
+| Addition | Detail |
+|----------|--------|
+| **§7 — app-internal install classifier** | Documented `detect_install_method` (`cli_setup.rs:276`) and its 7 outcomes (`none`/`cargo`/`bundled`/`brew`/`other`/`unknown`/`conflict`), plus the `cmd_cli_install_state` JSON (`adhoc_signed`, `translocated`, `in_sync`, `path_candidates`, …) and the `cmd_cli_*` command family. Codex found a 4-state version; the code has 7. This machine reports `conflict` + `in_sync: false`. |
+| **§9 — PARAKEET.md two-track recommendation** | Recorded (not applied) Codex's proposal to split PARAKEET.md so official-release users skip the CLI/Tauri rebuilds while still doing runtime setup. Verified the compile-vs-runtime split (`resolve_parakeet_binary/model/vocab`, `transcribe.rs:1858/2897/2933`). Added the **health-check gate** Codex omitted — its "skip rebuilds" advice is unsafe for installs like this machine's (#324 placeholder + cargo CLI). |
+
+Codex notes vs our findings: it correctly avoided junior `495d4d49`'s "no precompiled CLI" error
+(but also never discovered the artifact), and it **missed the #324 placeholder** entirely (never
+inspected the bundle), making its unconditional "skip rebuilds" guidance the one risk to correct.
+
 ## Unfinished Work
 
-- **Nothing committed** — per the repo's no-commit rule, all edits are staged for the user. A commit
-  message was drafted and provided in-session (covers ARCHITECTURE §§2/12/13 + the new reference doc).
-- The `docs/replay-*.md` transcript files are untracked; decide whether they belong in the repo or
-  should be git-ignored before committing.
+- **First commit already pushed.** `05442ca` is on `origin/dev`. These late additions (§7, §9, this
+  addendum) are uncommitted. Either land them as a **follow-up commit** (safe) or, only if `dev` is
+  not shared, `git reset --soft HEAD~1` + recommit + `git push --force-with-lease`.
+- The `docs/replay-*.md` transcript files (except the merged one, now committed) are untracked; decide
+  whether they belong in the repo or should be git-ignored.
+- **PARAKEET.md two-track split** (§9) is a recommendation only — not yet applied to `PARAKEET.md`.
 - §13's app-row claim (`cmd_get_settings`, `commands.rs:8455`) was carried over from the juniors but
   not re-verified this session — low priority.

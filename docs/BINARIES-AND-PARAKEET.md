@@ -216,6 +216,34 @@ ad-hoc/your identity ⇒ local). Then use the Caskroom receipt to split cask vs 
 Homebrew **formula** (CLI) and **cask** (app) collide on the name `minutes` — always pass `--cask`
 when probing the app.
 
+### The app already classifies this internally
+
+The desktop app doesn't leave provenance to guesswork — it computes it. `detect_install_method`
+(`cli_setup.rs:276`, cached, `brew` probed with a timeout) classifies the CLI on PATH into one of:
+
+| Value | Meaning | Condition |
+|---|---|---|
+| `none` | no `minutes` on PATH | `path_binary` is `None` (`:278`) |
+| `cargo` | hand-built `cargo install` | path contains `.cargo/bin` (`:293`) |
+| `bundled` | the app's own sidecar (via symlink) | path contains `/Minutes.app/` or `/Minutes Dev.app/` (`:295`) |
+| `brew` | Homebrew formula | `brew list silverstein/tap/minutes` succeeds (`:320`) |
+| `other` | none of the above | brew probe ran, no match (`:321`) |
+| `unknown` | indeterminate | brew probe **timed out** (`:322`) |
+| `conflict` | multiple `minutes` on PATH | overlaid by the caller when `path_candidates.len() > 1` (`:757`) |
+
+This is exposed to the WebView (and reproducible from the shell) via the Tauri command
+**`cmd_cli_install_state`** (`main.rs:2549`), one of a family: `cmd_cli_setup_run` (the "Set up CLI"
+action that writes the `~/.local/bin/minutes` symlink), `cmd_cli_recheck`, `cmd_cli_snooze`,
+`cmd_cli_clear_quarantine`. The command returns a rich JSON blob beyond just `install_method`:
+`app_version`, `path_version`, **`in_sync`** (PATH-CLI version == app version), **`adhoc_signed`**,
+**`translocated`** (Gatekeeper app-translocation), `path_candidates` (every `minutes` on PATH),
+`known_bundles`, and snooze state.
+
+> **On this machine**, two `minutes` binaries are on PATH (`~/.local/bin` + `~/.cargo/bin`), so
+> `cmd_cli_install_state` would report `install_method: "conflict"` and `in_sync: false` — the app's
+> own classifier confirms the [§5](#5-the-324-placeholder-regression) finding that this install is
+> *not* on the auto-updated bundled-sidecar track.
+
 ---
 
 ## 8. Claim ledger {#claim-ledger}
@@ -248,3 +276,48 @@ treated it as a mere convenience were sharpened to reflect that:
 - **§13 (verification table)** — the CLI row now tells you to run `readlink "$(which minutes)"`
   first: if it resolves into a `.app` bundle, `minutes capabilities --json` is reporting the
   *app's* flags via the sidecar, not a standalone CLI release's.
+
+---
+
+## 9. Recommendation (not yet applied): split `docs/PARAKEET.md` into two setup tracks
+
+This originated in a parallel **Codex** session on the same topic. The insight is sound and
+source-verified here; the concrete edit is **deferred**, recorded as a recommendation.
+
+**The problem.** `docs/PARAKEET.md` currently presents *"build the CLI with `--features parakeet`"*
+and *"build the Tauri app with `--features parakeet,metal`"* as **mandatory** steps for everyone
+(`PARAKEET.md:133,531,537`). For users on the official macOS release track that is redundant work:
+the release artifacts are already built with `parakeet,metal` (`release-macos.yml:109,122`), and the
+app bundles a matching CLI sidecar ([§1](#1-the-binaries-that-exist), [§3](#3-how-parakeet-reaches-each-channel)).
+
+**Why the rebuild is separable from the runtime setup.** The compile-time `parakeet` feature only
+makes the binary *able* to dispatch to Parakeet — it is **not** sufficient to run it. Even a
+fully-`parakeet`-compiled binary still resolves, at runtime: the `parakeet` binary
+(`resolve_parakeet_binary`, `transcribe.rs:1858/2995`), the model (`resolve_parakeet_model_path`,
+`:2897`), the vocab (`resolve_parakeet_vocab_path`, `:2933`), and config
+(`engine = "parakeet"` + `parakeet_binary = …`). Missing any of those → `EngineNotAvailable`
+(`transcribe.rs:726`). So the rebuild steps and the runtime steps are genuinely independent axes.
+
+**Proposed two-track structure:**
+
+- **Track A — official macOS release** (DMG / Homebrew cask / in-app updater): **skip** rebuilding
+  `minutes-cli` and `Minutes.app` (the feature is already compiled in). Still: build/install
+  `parakeet.cpp`, install + convert the model files, and set `[transcription] engine = "parakeet"` /
+  `parakeet_binary`.
+- **Track B — source / dev / bare `cargo install`**: build **both** CLI and app with
+  `--features parakeet,metal`, keep them on the same feature set, then do the same runtime setup.
+
+**Critical guard the Codex version omitted.** Codex never inspected the installed bundle, so its
+"skip the rebuilds" advice is unsafe as written for an install that *isn't* actually on a healthy
+bundled-sidecar track — e.g. **this machine**, whose v0.18.5 bundle shipped the
+[#324 placeholder stub](#5-the-324-placeholder-regression) and whose PATH CLI is a hand-built `cargo`
+binary (`install_method: "conflict"`, [§7](#the-app-already-classifies-this-internally)). The Track-A
+"skip" must therefore be **gated on a health check**, not assumed:
+
+```bash
+# Only skip the rebuilds if BOTH pass:
+file "$(readlink -f "$(which minutes)")" | grep -q "Mach-O"      # not the placeholder stub
+minutes capabilities --json | jq -e '.features.parakeet'        # feature actually compiled in
+```
+
+If either fails, the user is effectively on Track B regardless of how they installed the app.
