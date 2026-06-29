@@ -6,6 +6,7 @@ use crate::markdown::{
     self, ContentType, Frontmatter, OutputStatus, ProcessingWarning, WriteResult,
 };
 use crate::notes;
+use crate::person_identity::strip_role_suffix;
 use crate::summarize;
 use chrono::{DateTime, Local};
 use std::collections::{BTreeMap, BTreeSet};
@@ -4387,7 +4388,8 @@ fn add_person_entity(entities: &mut BTreeMap<String, (String, BTreeSet<String>)>
         return;
     }
 
-    let canonical = strip_email_domain(strip_name_disambiguation(&trimmed)).trim();
+    let name_part = strip_email_domain(strip_name_disambiguation(&trimmed)).trim();
+    let canonical = strip_role_suffix(name_part).trim();
     if canonical.is_empty() {
         return;
     }
@@ -5906,6 +5908,47 @@ mod tests {
             alex.aliases.iter().any(|a| a == "alex / alexander"),
             "original slash form preserved as alias: {:?}",
             alex.aliases
+        );
+    }
+
+    #[test]
+    fn add_person_entity_strips_role_suffix_before_slug() {
+        // Issue #370: "Junlei, tech lead" must produce slug "junlei", not "junlei-tech-lead".
+        // The fix lives in pipeline.rs (extraction point) so the contaminated slug never
+        // reaches the frontmatter file on disk.
+        let entities = build_entity_links(
+            "meeting",
+            None,
+            &[
+                "Junlei, tech lead".into(),
+                "Junrei (core team)".into(),
+                "Sam - engineering lead".into(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        );
+
+        let slugs: Vec<&str> = entities.people.iter().map(|e| e.slug.as_str()).collect();
+        assert!(slugs.contains(&"junlei"), "bare name present: {:?}", slugs);
+        assert!(slugs.contains(&"junrei"), "bare name present: {:?}", slugs);
+        assert!(slugs.contains(&"sam"), "bare name present: {:?}", slugs);
+        assert!(
+            !slugs.contains(&"junlei-tech-lead"),
+            "role suffix must not appear in slug: {:?}",
+            slugs
+        );
+        assert!(
+            !slugs.contains(&"junrei-core-team"),
+            "role suffix must not appear in slug: {:?}",
+            slugs
+        );
+        assert!(
+            !slugs.contains(&"sam-engineering-lead"),
+            "role suffix must not appear in slug: {:?}",
+            slugs
         );
     }
 

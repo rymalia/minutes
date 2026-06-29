@@ -2111,6 +2111,103 @@ attendees: [Sarah Miller]
     }
 
     #[test]
+    fn role_suffix_on_entity_does_not_create_spurious_graph_node() {
+        // Regression for issue #370: the LLM sometimes appends role context to
+        // entity labels and slugs ("Junlei, tech lead" → slug "junlei-tech-lead").
+        // After the fix, only the clean slug "junlei" should appear in the graph.
+        let tmp = TempDir::new().unwrap();
+        let meetings = tmp.path().join("meetings");
+        fs::create_dir_all(&meetings).unwrap();
+        let meeting = r#"---
+title: Architecture Review
+type: meeting
+date: 2026-03-20T14:00:00-07:00
+duration: 30m
+attendees: [Junlei, Junrei]
+entities:
+  people:
+    - slug: junlei-tech-lead
+      label: "Junlei, tech lead"
+      aliases: []
+    - slug: junrei-core-team
+      label: "Junrei (core team)"
+      aliases: []
+action_items:
+  - assignee: Junlei
+    task: Review the architecture doc
+    due: "2026-03-25"
+    status: open
+---
+
+## Transcript
+[JUNLEI 0:00] Let's review the design.
+[JUNREI 0:30] I agree with the approach.
+"#;
+        write_meeting(&meetings, "arch-review.md", meeting);
+        let config = test_config(&meetings);
+        let db = tmp.path().join("graph.db");
+        rebuild_index_at(&config, &db).unwrap();
+        let conn = open_db(&db).unwrap();
+
+        // Contaminated slugs must not appear in the people table
+        let contaminated_junlei: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM people WHERE slug = 'junlei-tech-lead'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            contaminated_junlei, 0,
+            "role-contaminated slug 'junlei-tech-lead' must not exist in the graph"
+        );
+        let contaminated_junrei: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM people WHERE slug = 'junrei-core-team'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            contaminated_junrei, 0,
+            "role-contaminated slug 'junrei-core-team' must not exist in the graph"
+        );
+
+        // Clean slugs must be present
+        let junlei: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM people WHERE slug = 'junlei'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(junlei, 1, "clean slug 'junlei' must exist in the graph");
+        let junrei: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM people WHERE slug = 'junrei'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(junrei, 1, "clean slug 'junrei' must exist in the graph");
+
+        // The action item assigned to "Junlei" must resolve to the clean slug
+        let commitment_person_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commitments c
+                 JOIN people p ON c.person_id = p.id
+                 WHERE c.commitment_type = 'action_item' AND p.slug = 'junlei'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            commitment_person_count, 1,
+            "action item must be linked to clean slug 'junlei'"
+        );
+    }
+
+    #[test]
     fn test_corrupted_db_auto_rebuild() {
         let tmp = TempDir::new().unwrap();
         let meetings = tmp.path().join("meetings");
