@@ -1512,7 +1512,12 @@ pub fn write_transcript_artifact(
         "transcribe",
         &audio_path.display().to_string(),
         transcribe_ms,
-        serde_json::json!({"words": word_count, "mode": "background", "diagnosis": filter_stats.diagnosis()}),
+        serde_json::json!({
+            "words": word_count,
+            "mode": "background",
+            "engine": filter_stats.engine,
+            "diagnosis": filter_stats.diagnosis(),
+        }),
     );
 
     let status =
@@ -2171,6 +2176,7 @@ where
     tracing::info!(
         step = "transcribe",
         words = word_count,
+        engine = %filter_stats.engine,
         diagnosis = filter_stats.diagnosis(),
         "transcription complete"
     );
@@ -2178,7 +2184,11 @@ where
         "transcribe",
         &audio_path.display().to_string(),
         transcribe_ms,
-        serde_json::json!({"words": word_count, "diagnosis": filter_stats.diagnosis()}),
+        serde_json::json!({
+            "words": word_count,
+            "engine": filter_stats.engine,
+            "diagnosis": filter_stats.diagnosis(),
+        }),
     );
 
     // Check minimum word threshold
@@ -2186,6 +2196,7 @@ where
         tracing::warn!(
             words = word_count,
             min = config.transcription.min_words,
+            engine = %filter_stats.engine,
             diagnosis = filter_stats.diagnosis(),
             "below minimum word threshold — marking as no-speech"
         );

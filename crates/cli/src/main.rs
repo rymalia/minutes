@@ -9267,6 +9267,12 @@ fn cmd_transcript(since: Option<&str>, status: bool, format: &str) -> Result<()>
             } else {
                 eprintln!("Live transcript: inactive");
             }
+            if let Some(ref engine) = s.engine {
+                match s.model.as_deref() {
+                    Some(model) => eprintln!("  Engine: {} ({})", engine, model),
+                    None => eprintln!("  Engine: {}", engine),
+                }
+            }
             eprintln!("  Lines: {}", s.line_count);
             eprintln!("  Duration: {:.0}s", s.duration_secs);
             if let Some(ref diagnostic) = s.diagnostic {

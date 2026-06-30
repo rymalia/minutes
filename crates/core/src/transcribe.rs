@@ -28,8 +28,12 @@ pub use whisper_guard::segments::{clean_transcript, CleanStats};
 /// Diagnostics from the transcription filtering pipeline.
 /// Tracks how many segments survived each anti-hallucination layer,
 /// so blank transcripts can be diagnosed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FilterStats {
+    /// Engine that produced the raw segments (e.g. "whisper", "parakeet").
+    /// Defaults to "whisper" to preserve the historical log wording; parakeet
+    /// paths override this when constructing the struct.
+    pub engine: String,
     /// Total audio duration in seconds (after loading)
     pub audio_duration_secs: f64,
     /// Samples after silence stripping (0 = all silence)
@@ -56,6 +60,26 @@ pub struct FilterStats {
     pub final_words: usize,
 }
 
+impl Default for FilterStats {
+    fn default() -> Self {
+        Self {
+            engine: "whisper".to_string(),
+            audio_duration_secs: 0.0,
+            samples_after_silence_strip: 0,
+            raw_segments: 0,
+            skipped_no_speech: 0,
+            after_no_speech_filter: 0,
+            after_dedup: 0,
+            after_interleaved: 0,
+            after_script_filter: 0,
+            after_noise_markers: 0,
+            after_trailing_trim: 0,
+            rescued_no_speech: 0,
+            final_words: 0,
+        }
+    }
+}
+
 impl FilterStats {
     /// Human-readable summary of what each layer removed.
     pub fn diagnosis(&self) -> String {
@@ -65,7 +89,7 @@ impl FilterStats {
             parts.push("silence strip removed ALL audio".into());
             return parts.join(", ");
         }
-        parts.push(format!("whisper produced {} segments", self.raw_segments));
+        parts.push(format!("{} produced {} segments", self.engine, self.raw_segments));
         if self.raw_segments == 0 {
             return parts.join(", ");
         }
@@ -322,6 +346,17 @@ pub fn transcribe_with_hints(
     transcribe_dispatch(audio_path, config, hints)
 }
 
+/// Short label identifying the configured transcription engine for log/diagnostic
+/// output. Mirrors the dispatch fallthrough in [`transcribe_dispatch`]: unknown
+/// values (and `apple-speech` in batch mode) report as `"whisper"` because that
+/// is the engine that actually runs.
+fn engine_label(config: &Config) -> &'static str {
+    match config.transcription.engine.as_str() {
+        "parakeet" => "parakeet",
+        _ => "whisper",
+    }
+}
+
 fn transcribe_dispatch(
     audio_path: &Path,
     config: &Config,
@@ -433,6 +468,7 @@ fn transcribe_chunk_ranges(
 
     let mut all_lines = Vec::new();
     let mut aggregate = FilterStats {
+        engine: engine_label(config).to_string(),
         audio_duration_secs,
         ..Default::default()
     };
@@ -649,8 +685,10 @@ fn transcribe_whisper_dispatch(
 
     #[cfg(not(feature = "whisper"))]
     {
-        let mut stats = FilterStats::default();
-        stats.audio_duration_secs = samples.len() as f64 / 16000.0;
+        let stats = FilterStats {
+            audio_duration_secs: samples.len() as f64 / 16000.0,
+            ..FilterStats::default()
+        };
         let _ = config; // suppress unused warning
         let _ = hints; // only used when the whisper feature is enabled
         let duration_secs = samples.len() as f64 / 16000.0;
@@ -1804,7 +1842,10 @@ fn transcribe_with_parakeet(
     config: &Config,
     hints: &DecodeHints,
 ) -> Result<TranscribeResult, TranscribeError> {
-    let mut stats = FilterStats::default();
+    let mut stats = FilterStats {
+        engine: "parakeet".to_string(),
+        ..FilterStats::default()
+    };
 
     // Validate model name before doing any work
     if !crate::parakeet::valid_model(&config.transcription.parakeet_model) {
@@ -3022,6 +3063,7 @@ pub fn transcribe_parakeet_batch(
         }
 
         let stats = FilterStats {
+            engine: "parakeet".to_string(),
             audio_duration_secs: samples.len() as f64 / 16000.0,
             samples_after_silence_strip: samples.len(),
             ..Default::default()
@@ -3952,6 +3994,7 @@ Hello there.
     #[test]
     fn diagnosis_shows_rescue_when_all_segments_would_be_filtered() {
         let stats = FilterStats {
+            engine: "whisper".to_string(),
             audio_duration_secs: 2585.0,
             samples_after_silence_strip: 16000 * 2585,
             raw_segments: 1,
@@ -3986,6 +4029,7 @@ Hello there.
     #[test]
     fn diagnosis_shows_normal_no_speech_filter_when_some_segments_survive() {
         let stats = FilterStats {
+            engine: "whisper".to_string(),
             audio_duration_secs: 300.0,
             samples_after_silence_strip: 16000 * 300,
             raw_segments: 50,
@@ -4006,6 +4050,41 @@ Hello there.
             d
         );
         assert!(!d.contains("rescue"), "should not mention rescue: {}", d);
+    }
+
+    #[test]
+    fn diagnosis_reports_configured_engine_label() {
+        let whisper_stats = FilterStats {
+            engine: "whisper".to_string(),
+            audio_duration_secs: 10.0,
+            samples_after_silence_strip: 16000 * 10,
+            raw_segments: 3,
+            ..Default::default()
+        };
+        assert!(
+            whisper_stats.diagnosis().contains("whisper produced 3 segments"),
+            "{}",
+            whisper_stats.diagnosis()
+        );
+
+        let parakeet_stats = FilterStats {
+            engine: "parakeet".to_string(),
+            audio_duration_secs: 10.0,
+            samples_after_silence_strip: 16000 * 10,
+            raw_segments: 7,
+            ..Default::default()
+        };
+        let d = parakeet_stats.diagnosis();
+        assert!(
+            d.contains("parakeet produced 7 segments"),
+            "parakeet engine must not be mislabeled as whisper: {}",
+            d
+        );
+        assert!(
+            !d.contains("whisper produced"),
+            "regression: hardcoded 'whisper produced' resurfaced: {}",
+            d
+        );
     }
 
     #[test]

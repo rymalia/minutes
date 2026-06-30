@@ -161,6 +161,30 @@ fn live_supports_apple_speech() -> bool {
     }
 }
 
+/// Model string to surface in the session header for a given engine. Returns
+/// the raw configured name (not a resolved filesystem path) so the header
+/// stays compact and stable across machines.
+fn live_effective_model(config: &Config, engine: &str) -> Option<String> {
+    match engine {
+        "parakeet" => {
+            let m = config.transcription.parakeet_model.trim();
+            (!m.is_empty()).then(|| m.to_string())
+        }
+        "apple-speech" => None,
+        // whisper (and any fallback): prefer the live-transcript model override,
+        // then the batch transcription model, otherwise leave it absent rather
+        // than guessing at the resolved default.
+        _ => {
+            let lt = config.live_transcript.model.trim();
+            if !lt.is_empty() {
+                return Some(lt.to_string());
+            }
+            let m = config.transcription.model.trim();
+            (!m.is_empty()).then(|| m.to_string())
+        }
+    }
+}
+
 /// Session-start warning: fires only when `engine = "parakeet"` was requested
 /// and the current build cannot honor it (parakeet feature not compiled in).
 /// Always visible on stderr so the user sees that their engine choice was
@@ -251,6 +275,37 @@ pub struct SessionStatus {
     /// Diagnostic detail when a transcript session is degraded or unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+    /// Engine actually running this session (resolved after runtime/compile-time
+    /// gates). Mirrors the JSONL session header. `None` when no session is
+    /// active or when the writer pre-dates the engine-tracking change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// Model the engine is using (e.g. `parakeet-tdt-0.6b-v3` or
+    /// `ggml-base.en.bin`). `None` for apple-speech (no user-selectable
+    /// model) or when not configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// First line of every JSONL file: identifies the engine and model actually
+/// running for this session, plus pid/started-at/source/version for forensics.
+/// Tagged with `"type":"session"` so transcript-line readers can distinguish
+/// it from utterance records.
+///
+/// Forward-compat note: older readers will fail to parse this line as a
+/// `TranscriptLine` and skip it (warn or silent depending on version). The
+/// in-tree reader skips it silently — see `read_since_line_from_path`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHeader {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub source: String,
+    pub pid: u32,
+    pub started_at: DateTime<Local>,
+    pub version: String,
 }
 
 /// Manages writing the JSONL and optional WAV file during a live session.
@@ -268,6 +323,9 @@ struct LiveTranscriptWriter {
     pending_utterances: u64,
     dropped_utterances: u64,
     last_status_write: Instant,
+    session_header_written: bool,
+    engine: Option<String>,
+    model: Option<String>,
 }
 
 /// Lightweight sidecar written atomically on each utterance.
@@ -301,6 +359,15 @@ pub struct LiveStatus {
     /// could not keep up. Only present when non-zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropped_utterances: Option<u64>,
+    /// Engine actually running this session (set once at session start;
+    /// kept on every heartbeat). Mirrors `SessionHeader.engine` so a status
+    /// reader can answer "what engine is running?" without parsing the JSONL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// Model identifier the engine is using. `None` for apple-speech or when
+    /// unset. Mirrors `SessionHeader.model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 const SIDECAR_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
@@ -365,9 +432,54 @@ impl LiveTranscriptWriter {
             last_status_write: Instant::now()
                 .checked_sub(SIDECAR_HEARTBEAT_INTERVAL)
                 .unwrap_or_else(Instant::now),
+            session_header_written: false,
+            engine: None,
+            model: None,
         };
 
         Ok(writer)
+    }
+
+    /// Write the one-shot `{"type":"session", ...}` header as the first JSONL
+    /// line. Idempotent — subsequent calls are no-ops. Must be invoked before
+    /// the first [`write_utterance`] call so the header lands at line 0; the
+    /// reader silently skips it.
+    ///
+    /// `engine` is the engine *actually running* (compile-time gates + runtime
+    /// probes resolved), not necessarily `config.transcription.engine`.
+    fn write_session_header(&mut self, engine: &str, model: Option<&str>) {
+        if self.jsonl_failed || self.session_header_written {
+            return;
+        }
+        // Stash for the status sidecar so `minutes transcript --status` can
+        // report the running engine/model without re-reading the JSONL header.
+        self.engine = Some(engine.to_string());
+        self.model = model.map(str::to_string);
+        let header = json!({
+            "type": "session",
+            "engine": engine,
+            "model": model,
+            "source": self.source.as_str(),
+            "pid": std::process::id(),
+            "started_at": self.start_wall,
+            "version": env!("CARGO_PKG_VERSION"),
+        });
+        match serde_json::to_string(&header) {
+            Ok(json) => {
+                if let Err(e) = writeln!(self.jsonl_writer, "{}", json) {
+                    tracing::error!("JSONL session header write failed: {}", e);
+                    self.jsonl_failed = true;
+                } else if let Err(e) = self.jsonl_writer.flush() {
+                    tracing::error!("JSONL session header flush failed: {}", e);
+                    self.jsonl_failed = true;
+                } else {
+                    self.session_header_written = true;
+                }
+            }
+            Err(e) => {
+                tracing::error!("failed to serialize session header: {}", e);
+            }
+        }
     }
 
     /// Write the lightweight status file (atomic rename).
@@ -394,6 +506,8 @@ impl LiveTranscriptWriter {
             diagnostic: diagnostic.map(str::to_string).or(backlog_diagnostic),
             pending_utterances: (self.pending_utterances > 0).then_some(self.pending_utterances),
             dropped_utterances: (self.dropped_utterances > 0).then_some(self.dropped_utterances),
+            engine: self.engine.clone(),
+            model: self.model.clone(),
         };
         write_live_status(&status);
         self.last_status_write = Instant::now();
@@ -744,6 +858,22 @@ fn run_inner(
     if apple_live_enabled {
         eprintln!("[minutes] Apple Speech live transcript enabled (experimental, standalone only)");
     }
+
+    // Now that the runtime fallbacks have settled, stamp the JSONL with a
+    // session header so any tail-reader knows which engine produced the
+    // following lines without resorting to `ps`.
+    let effective_engine = if apple_live_enabled {
+        "apple-speech"
+    } else if parakeet_live_enabled {
+        "parakeet"
+    } else {
+        "whisper"
+    };
+    let header_model = live_effective_model(config, effective_engine);
+    writer.write_session_header(effective_engine, header_model.as_deref());
+    // Re-mark healthy so the status sidecar picks up engine/model immediately
+    // (the initial mark_healthy() above ran before the engine was resolved).
+    writer.mark_healthy();
 
     // Warm the parakeet sidecar at session start so the first utterance doesn't
     // pay subprocess-spawn + model-load latency. We only warm the sidecar lane
@@ -2180,6 +2310,21 @@ fn run_sidecar_inner_mpsc(
         );
     }
 
+    // Stamp the JSONL with a session header. The recording sidecar only ever
+    // runs whisper or parakeet — apple-speech requests fall back to whisper
+    // (see the eprintln above), so resolution is just the parakeet gate.
+    let effective_engine = if parakeet_live_enabled {
+        "parakeet"
+    } else {
+        "whisper"
+    };
+    let header_model = live_effective_model(config, effective_engine);
+    if let Some(w) = lock_ignore_poison(&writer).as_mut() {
+        w.write_session_header(effective_engine, header_model.as_deref());
+        // Re-mark healthy so the status sidecar picks up engine/model immediately.
+        w.mark_healthy();
+    }
+
     // ── Transcription worker ─────────────────────────────────────
     // Inference must never run on this (consumer) thread: a single slow or
     // wedged engine call starves the bounded capture channel (audio drops →
@@ -2388,12 +2533,26 @@ fn read_since_line_from_path(
             Ok(tl) if tl.line > since_line => lines.push(tl),
             Ok(_) => {} // before cursor
             Err(e) => {
+                // The `{"type":"session",...}` header is not a transcript line.
+                // Skip it silently; warn on anything else.
+                if is_session_header_line(&line_str) {
+                    continue;
+                }
                 tracing::warn!("skipping malformed JSONL line: {}", e);
             }
         }
     }
 
     Ok(lines)
+}
+
+/// True iff `line` is a JSONL session header (first record of the file).
+/// Used to distinguish the tagged header from a genuinely malformed line.
+fn is_session_header_line(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+        .is_some_and(|t| t == "session")
 }
 
 /// Read transcript lines from the last N milliseconds (wall clock time).
@@ -2481,6 +2640,22 @@ fn derive_session_status(
         None
     };
 
+    // Engine/model are persisted on every heartbeat by the writer. Surface
+    // them only when a session is active — a stale status file from a prior
+    // session would otherwise leak a wrong engine label.
+    let (engine, model) = if active {
+        (
+            live_status
+                .as_ref()
+                .and_then(|status| status.engine.clone()),
+            live_status
+                .as_ref()
+                .and_then(|status| status.model.clone()),
+        )
+    } else {
+        (None, None)
+    };
+
     SessionStatus {
         active,
         pid,
@@ -2496,6 +2671,8 @@ fn derive_session_status(
         },
         source,
         diagnostic,
+        engine,
+        model,
     }
 }
 
@@ -2529,6 +2706,8 @@ fn write_live_status_transition(state: LiveStatusState, diagnostic: Option<&str>
         diagnostic: diagnostic.map(str::to_string),
         pending_utterances: existing.as_ref().and_then(|s| s.pending_utterances),
         dropped_utterances: existing.as_ref().and_then(|s| s.dropped_utterances),
+        engine: existing.as_ref().and_then(|s| s.engine.clone()),
+        model: existing.as_ref().and_then(|s| s.model.clone()),
     };
     write_live_status(&status);
 }
@@ -2683,6 +2862,8 @@ mod tests {
             diagnostic: None,
             pending_utterances: None,
             dropped_utterances: None,
+            engine: None,
+            model: None,
         }
     }
 
@@ -2859,6 +3040,159 @@ mod tests {
                 }
                 other => panic!("expected LiveUtteranceFinal, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn session_header_is_first_line_and_reader_skips_it_silently() {
+        with_temp_home(|| {
+            let config = Config::default();
+            let mut writer =
+                LiveTranscriptWriter::new(&config, None, TranscriptSource::Standalone).unwrap();
+
+            writer.write_session_header("parakeet", Some("parakeet-tdt-0.6b-v3"));
+            assert!(writer.write_utterance("first utterance", 0.5));
+
+            // Idempotent — a second call writes nothing.
+            writer.write_session_header("parakeet", Some("parakeet-tdt-0.6b-v3"));
+            assert!(writer.write_utterance("second utterance", 0.5));
+
+            let raw = std::fs::read_to_string(pid::live_transcript_jsonl_path()).unwrap();
+            let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+            assert_eq!(
+                lines.len(),
+                3,
+                "expected 1 header + 2 utterances, got: {raw}"
+            );
+
+            let header: SessionHeader = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(header.kind, "session");
+            assert_eq!(header.engine, "parakeet");
+            assert_eq!(header.model.as_deref(), Some("parakeet-tdt-0.6b-v3"));
+            assert_eq!(header.source, "standalone");
+            assert_eq!(header.pid, std::process::id());
+            assert!(!header.version.is_empty());
+
+            assert!(is_session_header_line(lines[0]));
+            assert!(!is_session_header_line(lines[1]));
+
+            // Reader returns the two utterance lines only — header is skipped.
+            let parsed = read_since_line(0).unwrap();
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].line, 1);
+            assert_eq!(parsed[0].text, "first utterance");
+            assert_eq!(parsed[1].line, 2);
+            assert_eq!(parsed[1].text, "second utterance");
+        });
+    }
+
+    #[test]
+    fn session_header_omits_model_for_apple_speech() {
+        with_temp_home(|| {
+            let config = Config::default();
+            let mut writer =
+                LiveTranscriptWriter::new(&config, None, TranscriptSource::Standalone).unwrap();
+
+            writer.write_session_header("apple-speech", live_effective_model(&config, "apple-speech").as_deref());
+            assert!(writer.write_utterance("hi", 0.1));
+
+            let raw = std::fs::read_to_string(pid::live_transcript_jsonl_path()).unwrap();
+            let first = raw.lines().next().unwrap();
+            let header: SessionHeader = serde_json::from_str(first).unwrap();
+            assert_eq!(header.engine, "apple-speech");
+            assert!(header.model.is_none(), "apple-speech header should omit model");
+        });
+    }
+
+    #[test]
+    fn live_effective_model_picks_per_engine_string() {
+        let mut config = Config::default();
+        config.transcription.parakeet_model = "parakeet-tdt-0.6b-v3".into();
+        config.live_transcript.model = "ggml-base.en.bin".into();
+        config.transcription.model = "ggml-tiny.bin".into();
+
+        assert_eq!(
+            live_effective_model(&config, "parakeet").as_deref(),
+            Some("parakeet-tdt-0.6b-v3")
+        );
+        // whisper prefers live_transcript.model when present
+        assert_eq!(
+            live_effective_model(&config, "whisper").as_deref(),
+            Some("ggml-base.en.bin")
+        );
+        // apple-speech intentionally has no model string
+        assert_eq!(live_effective_model(&config, "apple-speech"), None);
+
+        // Falls back to batch transcription.model when live_transcript.model is empty
+        config.live_transcript.model.clear();
+        assert_eq!(
+            live_effective_model(&config, "whisper").as_deref(),
+            Some("ggml-tiny.bin")
+        );
+    }
+
+    #[test]
+    fn session_status_surfaces_engine_and_model_from_writer() {
+        with_temp_home(|| {
+            // No session yet: engine/model absent and `active` false.
+            let s = session_status();
+            assert!(!s.active);
+            assert!(s.engine.is_none());
+            assert!(s.model.is_none());
+
+            // Bring up a writer, hold its PID, write the session header, and
+            // mark healthy — that's the same sequence the live `run` loop
+            // follows after parakeet/apple-speech runtime gates resolve.
+            let config = Config::default();
+            let _pid_guard = pid::create_pid_guard(&pid::live_transcript_pid_path()).unwrap();
+            let mut writer =
+                LiveTranscriptWriter::new(&config, Some("sess-engine".into()), TranscriptSource::Standalone)
+                    .unwrap();
+            writer.write_session_header("parakeet", Some("parakeet-tdt-0.6b-v3"));
+            writer.mark_healthy();
+
+            let s = session_status();
+            assert!(s.active, "session should be active while pid guard held");
+            assert_eq!(s.engine.as_deref(), Some("parakeet"));
+            assert_eq!(s.model.as_deref(), Some("parakeet-tdt-0.6b-v3"));
+            assert_eq!(s.session_id.as_deref(), Some("sess-engine"));
+
+            // Subsequent heartbeats keep engine/model populated (regression
+            // guard: easy to accidentally drop them in a future refactor).
+            writer.mark_healthy();
+            let s = session_status();
+            assert_eq!(s.engine.as_deref(), Some("parakeet"));
+        });
+    }
+
+    #[test]
+    fn session_status_clears_engine_when_session_is_inactive() {
+        with_temp_home(|| {
+            // Write a stale status file from a prior parakeet session (no pid
+            // guard → session is not active). Engine must NOT leak through.
+            let stale = LiveStatus {
+                start_time: Local::now() - ChronoDuration::seconds(60),
+                updated_at: Local::now() - ChronoDuration::seconds(60),
+                state: LiveStatusState::Healthy,
+                line_count: 12,
+                last_offset_ms: 60_000,
+                last_duration_ms: 1000,
+                session_id: Some("old".into()),
+                diagnostic: None,
+                pending_utterances: None,
+                dropped_utterances: None,
+                engine: Some("parakeet".into()),
+                model: Some("parakeet-tdt-0.6b-v3".into()),
+            };
+            write_live_status(&stale);
+
+            let s = session_status();
+            assert!(!s.active);
+            assert!(
+                s.engine.is_none(),
+                "stale status must not surface engine when no session is active"
+            );
+            assert!(s.model.is_none());
         });
     }
 
