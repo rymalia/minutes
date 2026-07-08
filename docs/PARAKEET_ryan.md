@@ -42,8 +42,7 @@ otherwise look redundant:
 - **The Silero VAD weights Minutes installs are Parakeet-specific.** Minutes ships
   a known-good `silero_vad_v5.safetensors` *inside the CLI binary*; `minutes setup
   --parakeet` extracts it to disk so the `parakeet` binary can load it. This is a
-  different file from Whisper's VAD model — see
-  [The two Silero VAD files](#the-two-silero-vad-files) for more detail.
+  different file from Whisper's VAD model.
 
 ---
 
@@ -133,7 +132,9 @@ The `parakeet` Cargo feature must be enabled at build time:
 cd <path/to/your/minutes/checkout>     # e.g. ~/Sites/minutes
 cargo build --release -p minutes-cli --features parakeet
 mkdir -p ~/.local/bin
-cp target/release/minutes ~/.local/bin/minutes
+# rm first: an in-place cp over a running binary invalidates its code signature
+# and macOS SIGKILLs it on next launch (see CLAUDE.md / PR #303).
+rm -f ~/.local/bin/minutes && cp target/release/minutes ~/.local/bin/minutes
 # Make sure ~/.local/bin is on PATH (add to ~/.zshrc if it isn't):
 #   export PATH="$HOME/.local/bin:$PATH"
 
@@ -155,7 +156,7 @@ Note: The `parakeet` feature is opt-in and not included in the default build.
 Whisper is always compiled in (it's the default feature). Both engines can coexist
 in the same binary — the config file selects the offline/batch path plus both
 live transcription paths (`minutes record` sidecar and standalone `minutes live`).
-Dictation still uses Whisper. See [Scope](#scope).
+Dictation still uses Whisper. See [Scope](#scope-of-parakeet-integration-in-minutes).
 
 ---  
 
@@ -192,8 +193,14 @@ Parakeet models are distributed as `.nemo` files on HuggingFace and must be
 converted to safetensors format.
 
 ```bash
-# Install Python dependencies
-pip install numpy safetensors torch torchaudio huggingface_hub packaging
+# Install Python dependencies in a throwaway venv so pip and python share one
+# interpreter (delete the env when done). torchaudio and huggingface_hub are
+# NOT needed — the .nemo is a plain curl below. packaging is a transitive that
+# safetensors does not auto-pull, and torch warns on first tensor op without
+# numpy, so install both explicitly.
+python3 -m venv ~/parakeet-convert-env
+source ~/parakeet-convert-env/bin/activate
+python -m pip install torch safetensors packaging numpy
 
 # Step 1 — install native Silero VAD weights & prepare a dir for the model
 minutes setup --parakeet
@@ -202,7 +209,8 @@ minutes setup --parakeet
 # Run from inside your parakeet.cpp clone — it has scripts/convert_nemo.py, and
 # keeping the .nemo here means every path below resolves in one directory.
 cd ~/src/parakeet.cpp
-hf download nvidia/parakeet-tdt-0.6b-v3 parakeet-tdt-0.6b-v3.nemo --local-dir .
+# Public HF URL; redirects to the xet-hub CDN, no auth or huggingface_hub needed.
+curl -L -O https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/parakeet-tdt-0.6b-v3.nemo
 mkdir -p ~/.minutes/models/parakeet/tdt-600m
 python scripts/convert_nemo.py parakeet-tdt-0.6b-v3.nemo -o ~/.minutes/models/parakeet/tdt-600m/tdt-600m.safetensors --model 600m-tdt
 
@@ -233,17 +241,21 @@ Use these steps (same as above but with model name swapped).
 # Model Install for English-only version (tdt-ctc-110m):
 
 # Install Python dependencies in a throwaway venv so pip and python share one
-# interpreter and the `hf` downloader lands on PATH (delete the env when done).
+# interpreter (delete the env when done). torchaudio and huggingface_hub are
+# NOT needed — the .nemo is a plain curl below. packaging is a transitive that
+# safetensors does not auto-pull, and torch warns on first tensor op without
+# numpy, so install both explicitly.
 python3 -m venv ~/parakeet-convert-env
 source ~/parakeet-convert-env/bin/activate
-python -m pip install numpy safetensors torch torchaudio huggingface_hub packaging
+python -m pip install torch safetensors packaging numpy
 
 # Step 1 — install native Silero VAD weights & prepare dir for tdt-ctc-110m model 
 minutes setup --parakeet --parakeet-model tdt-ctc-110m
 
 # Step 2 — download and convert the model
 cd ~/src/parakeet.cpp
-hf download nvidia/parakeet-tdt_ctc-110m parakeet-tdt_ctc-110m.nemo --local-dir .
+# Public HF URL; redirects to the xet-hub CDN, no auth or huggingface_hub needed.
+curl -L -O https://huggingface.co/nvidia/parakeet-tdt_ctc-110m/resolve/main/parakeet-tdt_ctc-110m.nemo
 mkdir -p ~/.minutes/models/parakeet/tdt-ctc-110m
 python scripts/convert_nemo.py parakeet-tdt_ctc-110m.nemo -o ~/.minutes/models/parakeet/tdt-ctc-110m/tdt-ctc-110m.safetensors --model 110m-tdt-ctc
 
@@ -272,8 +284,8 @@ Edit `~/.config/minutes/config.toml`:
 engine = "parakeet"              # "whisper" (default) or "parakeet"
 parakeet_model = "tdt-600m"      # "tdt-ctc-110m" (English) or "tdt-600m" (multilingual v3)
 parakeet_binary = "/Users/you/.local/bin/parakeet"  # Prefer an absolute path for desktop app launches
-parakeet_sidecar_enabled = true  # Reuse warm example-server socket for live mode (requires example-server copied above)
-parakeet_boost_limit = 25        # Experimental: top graph-derived boost phrases (0 disables)
+# parakeet_sidecar_enabled auto-enables when example-server (copied above) resolves; set true/false to force
+parakeet_boost_limit = 25        # Experimental opt-in (default 0 = disabled): top graph-derived boost phrases
 parakeet_boost_score = 2.0       # Experimental tuning for parakeet.cpp --boost-score
 parakeet_fp16 = true             # Default on macOS Apple Silicon: ~35% faster transcription with lower GPU memory (see docs/designs/parakeet-perf-2026-04-14.md)
 parakeet_vocab = "tdt-600m.tokenizer.vocab"  # Safer when multiple Parakeet models are installed
@@ -342,7 +354,8 @@ Today, `engine = "parakeet"` is wired for these paths:
 - standalone live transcription (`minutes live` and desktop Live Mode) — see RFC 0002
 
 Both live paths route each VAD-gated utterance through the Parakeet path. If
-`parakeet_sidecar_enabled = true`, they reuse the warm `example-server` socket;
+the sidecar is effective (auto-on when `example-server` resolves, or forced with
+`parakeet_sidecar_enabled = true`), they reuse the warm `example-server` socket;
 otherwise they fall back to the Parakeet subprocess path for each utterance.
 The standalone live path additionally warms the sidecar at session start so the
 first utterance does not pay the subprocess-spawn + model-load cost.
@@ -355,8 +368,9 @@ still configured separately and remains standalone-live-only; this note is just
 about the fallback order behind that path. See [`docs/APPLE_SPEECH.md`](APPLE_SPEECH.md)
 for the current Apple Speech scope and desktop-settings limitation.
 
-Strongly recommended for live use: set `parakeet_sidecar_enabled = true` and
-ensure `example-server` is discoverable (either on `PATH` or via
+Strongly recommended for live use: install `example-server` (the sidecar then
+auto-enables; `parakeet_sidecar_enabled = true` forces it) and ensure
+`example-server` is discoverable (either on `PATH` or via
 `MINUTES_PARAKEET_SERVER_BINARY`). Without the warm sidecar, every live
 utterance incurs full subprocess startup, which makes live mode visibly slow.
 
