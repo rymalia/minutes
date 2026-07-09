@@ -1167,6 +1167,17 @@ captured during this meeting. Look at each one before writing the summary.{} {}"
     String::new()
 }
 
+/// Build the command line + stdin payload for an agent-CLI run.
+///
+/// `screen_files`: screenshots to deliver, per-agent (claude: dir grant via
+/// `--allowedTools Read --add-dir`; codex: `--image` attachments; others:
+/// none — see build_agent_screen_instructions).
+///
+/// `lean` (#382) applies to claude ONLY — other agents ignore it. It runs
+/// claude with no MCP servers and no tools for tiny text→JSON calls like
+/// speaker mapping, and is therefore incompatible with `screen_files`
+/// (rejected below): `--tools ""` would deny the very Read tool the
+/// screenshot prompt instructs claude to use.
 fn prepare_agent_invocation(
     agent_cmd: &str,
     prompt: &str,
@@ -1174,17 +1185,20 @@ fn prepare_agent_invocation(
     lean: bool,
 ) -> Result<AgentInvocation, Box<dyn std::error::Error>> {
     if matches_agent_binary(agent_cmd, "claude") {
+        // Reject the contradictory combination outright rather than letting a
+        // future caller ship a prompt that says "open the screenshots" with an
+        // invocation that disables all tools.
+        if lean && !existing_screen_files(screen_files).is_empty() {
+            return Err("claude lean mode cannot be combined with screen context \
+                 (lean disables all tools, including the Read tool screenshots require)"
+                .into());
+        }
         // `lean` (#382): speaker mapping is a tiny text->JSON classification, not a
         // full agent run. Run claude with NO MCP servers and NO tools so it can't
         // hang on MCP/tool init (loading the user's own Minutes MCP server was a
         // prime suspect for the 120s hang). `--strict-mcp-config` + an empty
         // `{"mcpServers":{}}` guarantees zero MCP startup; `--tools ""` disables
         // tools; plain single-shot print mode.
-        //
-        // Lean is incompatible with screen context by construction: `--tools ""`
-        // would deny the Read tool the screenshot path below requires. Lean
-        // callers are text-only (they pass no screen_files), and lean wins here
-        // if both are ever supplied.
         let args = if lean {
             vec![
                 "-p".into(),
@@ -3232,6 +3246,25 @@ PARTICIPANTS:
         let plain = prepare_agent_invocation("claude", "p", &[], false).unwrap();
         assert_eq!(plain.args, vec!["-p", "-"]);
         assert!(!plain.args.iter().any(|a| a == "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn prepare_agent_invocation_rejects_lean_with_screens() {
+        // The contradictory state — a prompt telling claude to open images
+        // while `--tools ""` denies the Read tool — must be an error, not
+        // silently-accepted behavior. Lean callers are text-only by design.
+        let dir = tempfile::tempdir().unwrap();
+        let screen = dir.path().join("screen-0001-0030s.png");
+        std::fs::write(&screen, b"png").unwrap();
+
+        let err = prepare_agent_invocation("claude", "p", std::slice::from_ref(&screen), true)
+            .err()
+            .expect("lean + screens must be rejected");
+        assert!(err.to_string().contains("lean mode cannot be combined"));
+
+        // Nonexistent paths deliver nothing, so lean stays valid with them.
+        let ghost = vec![std::path::PathBuf::from("/nope/x.png")];
+        assert!(prepare_agent_invocation("claude", "p", &ghost, true).is_ok());
     }
 
     #[test]
