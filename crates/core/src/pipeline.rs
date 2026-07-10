@@ -1807,17 +1807,12 @@ where
     let mut raw_summary: Option<summarize::Summary> = None;
     let summary = if config.summarization.engine != "none" {
         on_progress(PipelineStage::Summarizing);
-        let transcript_with_notes = if let Some(notes) = context.user_notes.as_ref() {
-            format!(
-                "USER NOTES (these moments were marked as important — weight them heavily):\n{}\n\nTRANSCRIPT:\n{}",
-                notes, transcript
-            )
-        } else {
-            transcript.clone()
-        };
-
+        // Notes are passed separately so the agent path can byte-budget them
+        // apart from the transcript and keep the screenshot coverage bound
+        // derived from transcript text only.
         summarize::summarize_with_template(
-            &transcript_with_notes,
+            &transcript,
+            context.user_notes.as_deref(),
             &screen_files,
             config,
             context.template.as_ref(),
@@ -2416,19 +2411,13 @@ where
         on_progress(PipelineStage::Summarizing);
         tracing::info!(step = "summarize", "generating summary");
 
-        // Build transcript with user notes as context
-        let transcript_with_notes = if let Some(ref n) = user_notes {
-            format!(
-                "USER NOTES (these moments were marked as important — weight them heavily):\n{}\n\nTRANSCRIPT:\n{}",
-                n, transcript
-            )
-        } else {
-            transcript.clone()
-        };
-
-        // Send screenshots as actual images to vision-capable LLMs
+        // Send screenshots as actual images to vision-capable LLMs. Notes are
+        // passed separately so the agent path can byte-budget them apart from
+        // the transcript and keep the screenshot coverage bound derived from
+        // transcript text only.
         summarize::summarize_with_template(
-            &transcript_with_notes,
+            &transcript,
+            user_notes.as_deref(),
             &screen_files,
             config,
             template,

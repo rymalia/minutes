@@ -46,6 +46,26 @@ pub fn summarize(transcript: &str, config: &Config) -> Option<Summary> {
     summarize_with_screens(transcript, &[], config, None)
 }
 
+/// Header prepended to timestamped user notes when they accompany a
+/// transcript into a model call.
+const USER_NOTES_HEADER: &str =
+    "USER NOTES (these moments were marked as important — weight them heavily):";
+
+/// Compose user notes and transcript into the single text block the
+/// direct-API and local engines receive. The agent path keeps them separate:
+/// note lines share the `[M:SS]` stamp format with transcript lines, so the
+/// byte cap and the screenshot coverage bound must be derived from transcript
+/// text only — a stamp inside notes must never authorize image delivery.
+fn compose_notes_and_transcript(user_notes: Option<&str>, transcript: &str) -> String {
+    match user_notes {
+        Some(notes) => format!(
+            "{}\n{}\n\nTRANSCRIPT:\n{}",
+            USER_NOTES_HEADER, notes, transcript
+        ),
+        None => transcript.to_string(),
+    }
+}
+
 /// Summarize a transcript with optional screen context screenshots.
 /// Direct-API engines (claude/openai/mistral) receive screen images as
 /// base64-encoded image content; agent-CLI engines receive them through
@@ -57,14 +77,19 @@ pub fn summarize_with_screens(
     config: &Config,
     log_file: Option<&str>,
 ) -> Option<Summary> {
-    summarize_with_template(transcript, screen_files, config, None, log_file)
+    summarize_with_template(transcript, None, screen_files, config, None, log_file)
 }
 
 /// Summarize a transcript with an optional template applied. The template's
 /// `additional_instructions` and `language` (if set) are layered on top of the
 /// baseline structured-extraction prompt. Pass `None` for the legacy behavior.
+///
+/// `user_notes` are timestamped notes captured during the recording. They are
+/// passed separately from the transcript (rather than pre-concatenated by the
+/// caller) so the agent path can budget and coverage-bound them independently.
 pub fn summarize_with_template(
     transcript: &str,
+    user_notes: Option<&str>,
     screen_files: &[std::path::PathBuf],
     config: &Config,
     template: Option<&Template>,
@@ -72,7 +97,9 @@ pub fn summarize_with_template(
 ) -> Option<Summary> {
     let engine = &config.summarization.engine;
     let model = summarization_model_hint(config, !screen_files.is_empty());
-    let input_chars = transcript.len();
+    // What non-agent engines receive; also the honest input-size metric.
+    let combined = compose_notes_and_transcript(user_notes, transcript);
+    let input_chars = combined.len();
     let step_started = Instant::now();
 
     if engine == "none" {
@@ -99,7 +126,14 @@ pub fn summarize_with_template(
         "auto" => {
             if let Some(agent) = detect_agent_cli() {
                 tracing::info!(agent = %agent, "auto-detected AI CLI for summarization");
-                summarize_with_agent_cmd(transcript, screen_files, config, template, &agent)
+                summarize_with_agent_cmd(
+                    transcript,
+                    user_notes,
+                    screen_files,
+                    config,
+                    template,
+                    &agent,
+                )
             } else {
                 tracing::info!(
                     "no AI CLI found (claude, codex, gemini, opencode), skipping summarization"
@@ -121,13 +155,13 @@ pub fn summarize_with_template(
                 return None;
             }
         }
-        "agent" => summarize_with_agent(transcript, screen_files, config, template),
-        "claude" => summarize_with_claude(transcript, screen_files, config, template),
-        "openai" => summarize_with_openai(transcript, screen_files, config, template),
-        "mistral" => summarize_with_mistral(transcript, screen_files, config, template),
-        "ollama" => summarize_with_ollama(transcript, config, template),
+        "agent" => summarize_with_agent(transcript, user_notes, screen_files, config, template),
+        "claude" => summarize_with_claude(&combined, screen_files, config, template),
+        "openai" => summarize_with_openai(&combined, screen_files, config, template),
+        "mistral" => summarize_with_mistral(&combined, screen_files, config, template),
+        "ollama" => summarize_with_ollama(&combined, config, template),
         "openai-compatible" | "openai_compatible" => {
-            summarize_with_openai_compatible(transcript, screen_files, config, template)
+            summarize_with_openai_compatible(&combined, screen_files, config, template)
         }
         other => {
             tracing::warn!(engine = %other, "unknown summarization engine, skipping");
@@ -955,6 +989,74 @@ fn truncate_transcript(transcript: &str, max_bytes: usize) -> (&str, bool) {
     }
 }
 
+/// Transcript byte cap for the agent prompt. Truncation silently drops the
+/// transcript tail — where decisions and action items cluster — so the
+/// preparation helper logs a warning until agent-side chunking exists.
+const MAX_AGENT_TRANSCRIPT_BYTES: usize = 100_000;
+
+/// Byte cap for user notes in the agent prompt. Notes are hand-typed during
+/// the recording, so this is generous in practice; the cap exists so
+/// pathological notes cannot bloat the prompt. Independent of the transcript
+/// cap: notes never consume transcript budget.
+const MAX_AGENT_NOTES_BYTES: usize = 10_000;
+
+/// The text parts of an agent summarization prompt, budgeted independently.
+struct AgentTranscriptInput<'t> {
+    /// User-notes block (header + notes + `TRANSCRIPT:` divider), or empty.
+    /// Rides ahead of the transcript, exactly as pipeline callers historically
+    /// prepended it.
+    notes_block: String,
+    /// Transcript truncated at its own byte cap, cut at a line boundary.
+    transcript: &'t str,
+    /// True when the transcript was cut. Screenshot selection must then be
+    /// bounded by the last `[M:SS]` stamp in `transcript` — and never by
+    /// stamps in `notes_block`, which share the same format: a late-stamped
+    /// note must not authorize images from undelivered transcript ranges.
+    transcript_truncated: bool,
+}
+
+/// Budget user notes and transcript for the agent prompt, independently.
+/// Notes are clipped to their own cap and the transcript keeps its full
+/// budget regardless of note size, so bulky notes can neither starve the
+/// transcript nor (via their `[M:SS]` stamps) widen the screenshot coverage
+/// bound derived from the truncated transcript.
+fn prepare_agent_transcript_input<'t>(
+    transcript: &'t str,
+    user_notes: Option<&str>,
+) -> AgentTranscriptInput<'t> {
+    let notes_block = match user_notes {
+        Some(notes) => {
+            let (clipped_notes, notes_truncated) =
+                truncate_transcript(notes, MAX_AGENT_NOTES_BYTES);
+            if notes_truncated {
+                tracing::warn!(
+                    notes_bytes = notes.len(),
+                    max_notes_bytes = MAX_AGENT_NOTES_BYTES,
+                    "user notes truncated at byte cap"
+                );
+            }
+            format!("{}\n{}\n\nTRANSCRIPT:\n", USER_NOTES_HEADER, clipped_notes)
+        }
+        None => String::new(),
+    };
+
+    let (truncated, transcript_truncated) =
+        truncate_transcript(transcript, MAX_AGENT_TRANSCRIPT_BYTES);
+    if transcript_truncated {
+        tracing::warn!(
+            transcript_bytes = transcript.len(),
+            max_transcript_bytes = MAX_AGENT_TRANSCRIPT_BYTES,
+            "agent transcript truncated at byte cap; summary will not cover the meeting tail"
+        );
+    }
+
+    AgentTranscriptInput {
+        notes_block,
+        transcript: truncated,
+        transcript_truncated,
+    }
+}
+
 /// The screenshots that can actually be handed to an agent: existing files
 /// only, capped at MAX_SCREEN_IMAGES (mirrors the API path's cap).
 fn existing_screen_files(screen_files: &[std::path::PathBuf]) -> Vec<&std::path::PathBuf> {
@@ -1019,9 +1121,9 @@ fn even_sample<T: Clone>(items: &[T], k: usize) -> Vec<T> {
 /// image from after the cutoff would reach the model with no corresponding
 /// transcript — so sampling is bounded by the last `[M:SS]` stamp surviving
 /// truncation. When the truncated transcript has no parseable stamp, its
-/// temporal endpoint is unknowable — selection falls back to start-anchored
-/// "first N" as a conservative compatibility choice (matching pre-existing
-/// behavior and minimizing mismatch risk), not a guaranteed-safe one.
+/// temporal endpoint is unknowable — selection fails closed and delivers no
+/// images, keeping the coverage rule absolute. (An untruncated transcript
+/// needs no stamps: everything was delivered, so full-range sampling is safe.)
 fn select_agent_screen_files(
     screen_files: &[std::path::PathBuf],
     truncated_transcript: &str,
@@ -1050,14 +1152,10 @@ fn select_agent_screen_files(
                 .cloned()
                 .collect()
         }
-        // No parseable stamps: keep the pre-existing first-N behavior.
-        // Start-anchoring minimizes (but cannot eliminate — the endpoint is
-        // unknown) the risk of pairing images with undelivered transcript.
-        None => existing
-            .into_iter()
-            .take(MAX_SCREEN_IMAGES)
-            .cloned()
-            .collect(),
+        // No parseable stamps in a truncated transcript: the delivered time
+        // range is unknowable, so any image risks pairing with undelivered
+        // transcript. Fail closed — no images.
+        None => Vec::new(),
     }
 }
 
@@ -1323,16 +1421,25 @@ fn prepare_agent_invocation(
 /// Summarize using a specific agent command (used by the "auto" engine).
 fn summarize_with_agent_cmd(
     transcript: &str,
+    user_notes: Option<&str>,
     screen_files: &[std::path::PathBuf],
     config: &Config,
     template: Option<&Template>,
     cmd: &str,
 ) -> Result<Summary, Box<dyn std::error::Error>> {
-    summarize_with_agent_impl(transcript, screen_files, config, template, cmd.to_string())
+    summarize_with_agent_impl(
+        transcript,
+        user_notes,
+        screen_files,
+        config,
+        template,
+        cmd.to_string(),
+    )
 }
 
 fn summarize_with_agent(
     transcript: &str,
+    user_notes: Option<&str>,
     screen_files: &[std::path::PathBuf],
     config: &Config,
     template: Option<&Template>,
@@ -1343,11 +1450,19 @@ fn summarize_with_agent(
         config.summarization.agent_command.clone()
     };
     let agent_cmd = resolve_agent_path(&agent_cmd);
-    summarize_with_agent_impl(transcript, screen_files, config, template, agent_cmd)
+    summarize_with_agent_impl(
+        transcript,
+        user_notes,
+        screen_files,
+        config,
+        template,
+        agent_cmd,
+    )
 }
 
 fn summarize_with_agent_impl(
     transcript: &str,
+    user_notes: Option<&str>,
     screen_files: &[std::path::PathBuf],
     config: &Config,
     template: Option<&Template>,
@@ -1360,6 +1475,7 @@ fn summarize_with_agent_impl(
     // See issue #243.
     summarize_with_agent_impl_timeout(
         transcript,
+        user_notes,
         screen_files,
         config,
         template,
@@ -1370,6 +1486,7 @@ fn summarize_with_agent_impl(
 
 fn summarize_with_agent_impl_timeout(
     transcript: &str,
+    user_notes: Option<&str>,
     screen_files: &[std::path::PathBuf],
     config: &Config,
     template: Option<&Template>,
@@ -1378,35 +1495,25 @@ fn summarize_with_agent_impl_timeout(
 ) -> Result<Summary, Box<dyn std::error::Error>> {
     use std::io::{Read, Write};
 
-    // Byte-cap the transcript at the last complete line. NOTE: this silently
-    // drops the transcript tail — which is where decisions and action items
-    // cluster. Screenshot selection below must stay within the surviving
-    // range (coverage rule), and the warning makes the loss visible in logs
-    // until agent-side chunking exists.
-    let max_transcript = 100_000;
-    let (truncated, was_truncated) = truncate_transcript(transcript, max_transcript);
-    if was_truncated {
-        tracing::warn!(
-            transcript_bytes = transcript.len(),
-            max_transcript,
-            "agent transcript truncated at byte cap; summary will not cover the meeting tail"
-        );
-    }
+    let input = prepare_agent_transcript_input(transcript, user_notes);
 
     // Screen context: delivery is per-agent (see build_agent_screen_instructions)
     // rather than base64-inlined like the direct-API path — claude opens the
     // PNGs with its Read tool, codex gets them as `--image` attachments, and
     // agents without a verified headless image path get no screen section.
     // Selection samples evenly across the meeting, bounded by the transcript
-    // range that survived truncation (select_agent_screen_files).
-    let selected_screens = select_agent_screen_files(screen_files, truncated, was_truncated);
+    // range that survived truncation (select_agent_screen_files). Only the
+    // truncated transcript — never the notes block — feeds the bound.
+    let selected_screens =
+        select_agent_screen_files(screen_files, input.transcript, input.transcript_truncated);
     let screen_instructions = build_agent_screen_instructions(&agent_cmd, &selected_screens);
 
     let prompt = format!(
-        "{}{}\n\nSummarize this transcript:\n\n<transcript>\n{}\n</transcript>",
+        "{}{}\n\nSummarize this transcript:\n\n<transcript>\n{}{}\n</transcript>",
         build_system_prompt(get_effective_summary_language(config), template),
         screen_instructions,
-        truncated
+        input.notes_block,
+        input.transcript
     );
 
     tracing::info!(
@@ -3500,6 +3607,17 @@ PARTICIPANTS:
     }
 
     #[test]
+    fn compose_notes_and_transcript_matches_legacy_shape() {
+        assert_eq!(
+            compose_notes_and_transcript(None, "[0:10] hello"),
+            "[0:10] hello"
+        );
+        let combined = compose_notes_and_transcript(Some("[0:05] a note"), "[0:10] hello");
+        assert!(combined.starts_with(USER_NOTES_HEADER));
+        assert!(combined.contains("[0:05] a note\n\nTRANSCRIPT:\n[0:10] hello"));
+    }
+
+    #[test]
     fn select_agent_screens_samples_whole_meeting_when_not_truncated() {
         let dir = tempfile::tempdir().unwrap();
         let files: Vec<std::path::PathBuf> = (0..20u64)
@@ -3574,7 +3692,7 @@ PARTICIPANTS:
     }
 
     #[test]
-    fn select_agent_screens_falls_back_to_first_n_without_stamps() {
+    fn select_agent_screens_fails_closed_when_truncated_without_stamps() {
         let dir = tempfile::tempdir().unwrap();
         let files: Vec<std::path::PathBuf> = (0..12u64)
             .map(|i| {
@@ -3586,9 +3704,127 @@ PARTICIPANTS:
             })
             .collect();
 
-        // Truncated transcript with no parseable stamps: stay start-anchored.
+        // Truncated transcript with no parseable stamps: the delivered time
+        // range is unknowable, so the coverage rule requires zero images.
         let selected = select_agent_screen_files(&files, "unstamped transcript text", true);
-        assert_eq!(selected, files[..MAX_SCREEN_IMAGES].to_vec());
+        assert!(selected.is_empty());
+
+        // The same unstamped text NOT truncated was fully delivered — normal
+        // whole-meeting sampling applies.
+        let selected = select_agent_screen_files(&files, "unstamped transcript text", false);
+        assert_eq!(selected.len(), MAX_SCREEN_IMAGES);
+    }
+
+    #[test]
+    fn agent_coverage_bound_ignores_stamps_in_user_notes() {
+        // Regression (Codex finding on #421): user notes share the `[M:SS]`
+        // stamp format and ride ahead of the transcript. A late-stamped note
+        // must not widen the screenshot coverage bound when the transcript
+        // itself was truncated earlier — the bound comes from transcript
+        // text only. Exercises the production preparation path.
+        let line = "this line is filler to bulk the transcript up to the byte cap quickly";
+        let mut transcript = String::new();
+        let mut secs = 0u64;
+        while transcript.len() <= 150_000 {
+            transcript.push_str(&format!("[{}:{:02}] {}\n", secs / 60, secs % 60, line));
+            secs += 10;
+        }
+        let notes = format!(
+            "[{}:{:02}] note stamped at the very end",
+            secs / 60,
+            secs % 60
+        );
+
+        let input = prepare_agent_transcript_input(&transcript, Some(&notes));
+        assert!(input.transcript_truncated);
+        assert!(
+            input.notes_block.contains(&notes),
+            "the note itself is still delivered"
+        );
+        let bound = last_transcript_stamp_secs(input.transcript).expect("stamps must parse");
+        assert!(
+            bound < secs,
+            "test setup: the note is stamped past the bound"
+        );
+
+        // Screenshots span the full recording, including the note's range.
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<std::path::PathBuf> = (0..40u64)
+            .map(|i| {
+                let elapsed = i * (secs / 40);
+                let p = dir
+                    .path()
+                    .join(format!("screen-{:04}-{:04}s.png", i, elapsed));
+                std::fs::write(&p, b"png").unwrap();
+                p
+            })
+            .collect();
+
+        let selected =
+            select_agent_screen_files(&files, input.transcript, input.transcript_truncated);
+        assert!(!selected.is_empty());
+        for f in &selected {
+            let elapsed = crate::screen::elapsed_secs_from_filename(f).unwrap();
+            assert!(
+                elapsed <= bound,
+                "screenshot at {}s outruns the transcript bound {}s — a note stamp leaked into coverage",
+                elapsed,
+                bound
+            );
+        }
+
+        // And the old concatenated shape (what the pipeline used to send)
+        // demonstrates the bug this guards against: the note's stamp becomes
+        // the last line and would have authorized end-of-meeting images.
+        assert_eq!(
+            last_transcript_stamp_secs(&format!(
+                "{}{}\n{}",
+                input.notes_block, input.transcript, notes
+            )),
+            Some(secs),
+            "sanity: a trailing note stamp would widen the bound if concatenated"
+        );
+    }
+
+    #[test]
+    fn bulky_notes_cannot_starve_the_transcript_budget() {
+        // Codex finding on #421, second half: notes and transcript have
+        // independent byte caps. Even absurdly large notes (>100KB) must be
+        // clipped to their own cap while the transcript keeps its full
+        // budget, and the coverage bound stays note-independent.
+        let line = "this line is filler to bulk the transcript up to the byte cap quickly";
+        let mut transcript = String::new();
+        let mut secs = 0u64;
+        while transcript.len() <= 150_000 {
+            transcript.push_str(&format!("[{}:{:02}] {}\n", secs / 60, secs % 60, line));
+            secs += 10;
+        }
+        let huge_notes =
+            format!("[{}:{:02}] pathological note\n", secs / 60, secs % 60).repeat(4_000); // ~120KB of late-stamped notes
+        assert!(huge_notes.len() > MAX_AGENT_TRANSCRIPT_BYTES);
+
+        let with_huge_notes = prepare_agent_transcript_input(&transcript, Some(&huge_notes));
+        let without_notes = prepare_agent_transcript_input(&transcript, None);
+
+        // Notes are clipped to their own cap (plus the fixed header/divider).
+        assert!(
+            with_huge_notes.notes_block.len()
+                <= MAX_AGENT_NOTES_BYTES + USER_NOTES_HEADER.len() + "\n\n\nTRANSCRIPT:\n".len(),
+            "notes block ({} bytes) exceeds its independent cap",
+            with_huge_notes.notes_block.len()
+        );
+
+        // The transcript is byte-identical to the no-notes case: notes take
+        // nothing from its budget.
+        assert_eq!(with_huge_notes.transcript, without_notes.transcript);
+        assert!(with_huge_notes.transcript_truncated);
+
+        // And the coverage bound is identical too — the late note stamps
+        // clipped into the notes block cannot widen it.
+        assert_eq!(
+            last_transcript_stamp_secs(with_huge_notes.transcript),
+            last_transcript_stamp_secs(without_notes.transcript)
+        );
     }
 
     #[test]
@@ -3805,6 +4041,7 @@ EOF
 
         let summary = summarize_with_agent_impl_timeout(
             "short transcript",
+            None,
             &[],
             &config,
             None,
