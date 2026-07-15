@@ -96,6 +96,40 @@ Screenshot context requires an endpoint that accepts OpenAI-style image content
 parts. Text-only summaries use plain string chat content for broader local
 server compatibility.
 
+### `[copilot]` — real-time nudge stream
+
+This section is deliberately separate from `[summarization]`: the copilot is a
+latency-bounded live consumer, while summarization runs after recording. An
+explicit `minutes copilot start` may start a foreground session when
+`enabled = false`; the flag controls implicit startup by future host surfaces.
+
+| key | default | meaning |
+|---|---|---|
+| `enabled` | `false` | Allow implicit copilot startup; explicit CLI startup remains available. |
+| `surface` | `"tui"` | Default CLI surface: `"tui"` or newline-delimited JSON with `"stdout"`. |
+| `mode` | `"generic"` | Default session policy: `sales`, `discovery`, `interview`, `negotiation`, `difficult-conversation`, `decision`, or `generic`; `--mode` overrides it. |
+| `fast_provider` | `"auto-local"` | Fast-lane provider request. `"auto-local"` probes eligible local providers at session start and selects a healthy model within the routing policy; Apple Foundation Models remains a provider stub until the separate native fast-follow lands. |
+| `fast_model` | `"llama3.2"` | Ollama model used for structured nudges. |
+| `allow_cloud` | `false` | Cloud opt-in gate. Cloud adapters are intentionally not implemented in the first copilot release. |
+| `meeting_goal` | unset | Optional default outcome Coach should optimize for. |
+| `arming_behavior` | `"ask-each-meeting"` | Desktop behavior at recording start: `"automatic"`, `"ask-each-meeting"`, or `"off"` (manual starts remain available). |
+| `critical_notifications_only` | `true` | Suppress non-critical Coach notifications. |
+| `onboarding_seen` | `false` | Desktop first-run explainer state. Managed by the app. |
+| `nudge_ttl_ms` | `12000` | Lifetime of a rendered nudge in milliseconds. |
+| `target_latency_ms` | `5000` | Fast request timeout/latency target; timeout degrades only the copilot. |
+| `history_grounding` | `true` | Refresh a bounded battle card asynchronously from unrestricted graph, structured intent, and FTS data. |
+| `live_partials` | `true` | Enable ephemeral partial coaching when `minutes copilot start --live` owns a streaming Whisper session in-process. External capture remains `final_only`. |
+| `partial_debounce_ms` | `250` | Coalesce rapid partial corrections before starting the fast model lane. |
+| `depth_refresh_secs` | `60` | Slow strategy refresh cadence, clamped to 30–90 seconds; topic shifts and decisive finals may refresh earlier. |
+| `grounding_refresh_secs` | `15` | Minimum stable-final grounding cadence; topic shifts bypass it. Retrieval never runs on capture or the fast path. |
+
+Ollama defaults to `http://localhost:11434`. Set `OLLAMA_HOST` to use another
+local endpoint. Meeting text and history are passed as delimited untrusted data,
+the loop exposes no tools, and restricted meetings are excluded from every
+battle-card source. Dismissed/helpful/not-helpful feedback changes only bounded
+session cadence and confidence gates. See
+[RFC 0004](../rfcs/0004-copilot-realtime-stream.md).
+
 ### `[recording]` — capture behavior
 
 | key | default | meaning |

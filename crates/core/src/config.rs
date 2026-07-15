@@ -20,6 +20,7 @@ pub struct Config {
     pub transcription: TranscriptionConfig,
     pub diarization: DiarizationConfig,
     pub summarization: SummarizationConfig,
+    pub copilot: CopilotConfig,
     pub search: SearchConfig,
     pub daily_notes: DailyNotesConfig,
     pub security: SecurityConfig,
@@ -81,18 +82,24 @@ impl Default for GlobalHotkeyConfig {
 /// `completion_enabled` controls the system notification fired when a
 /// recording finishes processing. Defaults to `true` to preserve the
 /// historical behavior (AppState previously seeded `AtomicBool::new(true)`).
-/// `#[serde(default)]` keeps old `config.toml` files loading.
+/// `copilot_critical_enabled` is deliberately opt-in: the Coach HUD is the
+/// primary advice surface, and system notifications are reserved for critical
+/// advice while that HUD is hidden. `#[serde(default)]` keeps old
+/// `config.toml` files loading.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationsConfig {
     /// Whether the "processing complete" notification is shown.
     pub completion_enabled: bool,
+    /// Whether critical Coach advice may notify while the HUD is hidden.
+    pub copilot_critical_enabled: bool,
 }
 
 impl Default for NotificationsConfig {
     fn default() -> Self {
         Self {
             completion_enabled: true,
+            copilot_critical_enabled: false,
         }
     }
 }
@@ -332,6 +339,88 @@ pub struct SummarizationConfig {
     pub openai_compatible_api_key_env: String,
     pub mistral_model: String,
     pub language: String,
+}
+
+/// Real-time copilot configuration.
+///
+/// This is deliberately separate from [`SummarizationConfig`]: the copilot is
+/// a latency-bounded, failure-isolated event-stream consumer, while meeting
+/// summarization is a post-processing pipeline. `auto-local` is resolved from
+/// live provider probes at session start rather than a platform preference
+/// list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CopilotConfig {
+    /// Permit hosts to auto-start the copilot. An explicit CLI start is still
+    /// treated as intentional one-session activation when this is false.
+    pub enabled: bool,
+    /// Default presentation surface (`tui` or `stdout`).
+    pub surface: String,
+    /// Default per-session coaching policy. The CLI `--mode` flag overrides it.
+    pub mode: String,
+    /// Fast-lane provider. `auto-local` measures every eligible provider.
+    pub fast_provider: String,
+    /// Model name sent to the fast provider.
+    pub fast_model: String,
+    /// Hard opt-in gate for future cloud provider implementations.
+    pub allow_cloud: bool,
+    /// Optional default outcome the user wants Coach to optimize for.
+    pub meeting_goal: Option<String>,
+    /// How a desktop host should offer Coach at recording start.
+    pub arming_behavior: CopilotArmingBehavior,
+    /// Limit Coach notifications to suggestions marked as critical.
+    pub critical_notifications_only: bool,
+    /// Whether the desktop first-run Coach explainer has been dismissed.
+    pub onboarding_seen: bool,
+    /// Lifetime of a rendered nudge.
+    pub nudge_ttl_ms: u64,
+    /// End-to-end fast-lane latency budget and provider timeout.
+    pub target_latency_ms: u64,
+    /// Whether graph/search history is assembled into the battle card.
+    pub history_grounding: bool,
+    /// Enable ephemeral in-process partial evidence for a copilot-owned live
+    /// session. External capture and non-streaming backends remain final-only.
+    pub live_partials: bool,
+    /// Coalesce fast partial corrections before starting a model request.
+    pub partial_debounce_ms: u64,
+    /// Slow strategy refresh cadence, clamped to 30–90 seconds by the runner.
+    pub depth_refresh_secs: u64,
+    /// Minimum cadence for stable-final grounding refreshes. Topic shifts bypass it.
+    pub grounding_refresh_secs: u64,
+}
+
+/// Recording-start behavior for desktop Coach hosts.
+///
+/// `Off` keeps manual Coach starts available; it only suppresses automatic
+/// startup and the per-meeting prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CopilotArmingBehavior {
+    Automatic,
+    #[default]
+    AskEachMeeting,
+    Off,
+}
+
+impl CopilotArmingBehavior {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::AskEachMeeting => "ask-each-meeting",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl CopilotConfig {
+    /// Normalize the configured routing request. Actual provider resolution is
+    /// performed from live health/latency/capacity probes at session start.
+    pub fn resolved_fast_provider(&self) -> &str {
+        match self.fast_provider.trim() {
+            "" | "auto-local" => "auto-local",
+            provider => provider,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -990,6 +1079,7 @@ impl Default for Config {
             transcription: TranscriptionConfig::default(),
             diarization: DiarizationConfig::default(),
             summarization: SummarizationConfig::default(),
+            copilot: CopilotConfig::default(),
             search: SearchConfig::default(),
             daily_notes: DailyNotesConfig::default(),
             security: SecurityConfig::default(),
@@ -1070,6 +1160,30 @@ impl Default for SummarizationConfig {
             openai_compatible_api_key_env: String::new(),
             mistral_model: "mistral-large-latest".into(),
             language: "auto".into(),
+        }
+    }
+}
+
+impl Default for CopilotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            surface: "tui".into(),
+            mode: "generic".into(),
+            fast_provider: "auto-local".into(),
+            fast_model: "llama3.2".into(),
+            allow_cloud: false,
+            meeting_goal: None,
+            arming_behavior: CopilotArmingBehavior::AskEachMeeting,
+            critical_notifications_only: true,
+            onboarding_seen: false,
+            nudge_ttl_ms: 12_000,
+            target_latency_ms: 5_000,
+            history_grounding: true,
+            live_partials: true,
+            partial_debounce_ms: 250,
+            depth_refresh_secs: 60,
+            grounding_refresh_secs: 15,
         }
     }
 }
@@ -1575,6 +1689,27 @@ mod tests {
         );
         assert_eq!(config.diarization.engine, "auto");
         assert_eq!(config.summarization.engine, "none");
+        assert!(!config.copilot.enabled);
+        assert_eq!(config.copilot.surface, "tui");
+        assert_eq!(config.copilot.mode, "generic");
+        assert_eq!(config.copilot.fast_provider, "auto-local");
+        assert_eq!(config.copilot.resolved_fast_provider(), "auto-local");
+        assert_eq!(config.copilot.fast_model, "llama3.2");
+        assert!(!config.copilot.allow_cloud);
+        assert_eq!(
+            config.copilot.arming_behavior,
+            CopilotArmingBehavior::AskEachMeeting
+        );
+        assert!(config.copilot.meeting_goal.is_none());
+        assert!(config.copilot.critical_notifications_only);
+        assert!(!config.copilot.onboarding_seen);
+        assert_eq!(config.copilot.nudge_ttl_ms, 12_000);
+        assert_eq!(config.copilot.target_latency_ms, 5_000);
+        assert!(config.copilot.history_grounding);
+        assert!(config.copilot.live_partials);
+        assert_eq!(config.copilot.partial_debounce_ms, 250);
+        assert_eq!(config.copilot.depth_refresh_secs, 60);
+        assert_eq!(config.copilot.grounding_refresh_secs, 15);
         assert_eq!(config.search.engine, "builtin");
         assert!(!config.daily_notes.enabled);
         assert_eq!(config.dictation.backend, "whisper");
@@ -1588,6 +1723,60 @@ mod tests {
         assert_eq!(config.consent.mode, ConsentMode::Remind);
         assert!(config.consent.default_basis.is_none());
         assert!(config.consent.disclosure_script.contains("Minutes"));
+    }
+
+    #[test]
+    fn copilot_config_deserializes_independently_from_summarization() {
+        let parsed: Config = toml::from_str(
+            r#"
+            [summarization]
+            engine = "none"
+
+            [copilot]
+            enabled = true
+            surface = "stdout"
+            mode = "decision"
+            fast_provider = "ollama"
+            fast_model = "qwen3:4b"
+            allow_cloud = false
+            meeting_goal = "Leave with a clear next step"
+            arming_behavior = "automatic"
+            critical_notifications_only = false
+            onboarding_seen = true
+            nudge_ttl_ms = 9000
+            target_latency_ms = 3500
+            history_grounding = false
+            live_partials = false
+            partial_debounce_ms = 400
+            depth_refresh_secs = 75
+            grounding_refresh_secs = 20
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.summarization.engine, "none");
+        assert!(parsed.copilot.enabled);
+        assert_eq!(parsed.copilot.surface, "stdout");
+        assert_eq!(parsed.copilot.mode, "decision");
+        assert_eq!(parsed.copilot.resolved_fast_provider(), "ollama");
+        assert_eq!(parsed.copilot.fast_model, "qwen3:4b");
+        assert_eq!(
+            parsed.copilot.meeting_goal.as_deref(),
+            Some("Leave with a clear next step")
+        );
+        assert_eq!(
+            parsed.copilot.arming_behavior,
+            CopilotArmingBehavior::Automatic
+        );
+        assert!(!parsed.copilot.critical_notifications_only);
+        assert!(parsed.copilot.onboarding_seen);
+        assert_eq!(parsed.copilot.nudge_ttl_ms, 9_000);
+        assert_eq!(parsed.copilot.target_latency_ms, 3_500);
+        assert!(!parsed.copilot.history_grounding);
+        assert!(!parsed.copilot.live_partials);
+        assert_eq!(parsed.copilot.partial_debounce_ms, 400);
+        assert_eq!(parsed.copilot.depth_refresh_secs, 75);
+        assert_eq!(parsed.copilot.grounding_refresh_secs, 20);
     }
 
     #[test]
@@ -1966,6 +2155,8 @@ enabled = true
         assert_eq!(config.global_hotkey.shortcut, "CmdOrCtrl+Shift+M");
         // Completion notifications default-on, preserving prior behavior.
         assert!(config.notifications.completion_enabled);
+        // Coach alerts are opt-in and hidden-HUD-only.
+        assert!(!config.notifications.copilot_critical_enabled);
     }
 
     #[test]
@@ -1980,6 +2171,7 @@ enabled = true
         assert!(!parsed.global_hotkey.shortcut_enabled);
         assert_eq!(parsed.global_hotkey.shortcut, "CmdOrCtrl+Shift+M");
         assert!(parsed.notifications.completion_enabled);
+        assert!(!parsed.notifications.copilot_critical_enabled);
     }
 
     #[test]
@@ -1988,12 +2180,14 @@ enabled = true
         config.global_hotkey.shortcut_enabled = true;
         config.global_hotkey.shortcut = "CmdOrCtrl+Shift+J".into();
         config.notifications.completion_enabled = false;
+        config.notifications.copilot_critical_enabled = true;
 
         let out = toml::to_string(&config).unwrap();
         let parsed: Config = toml::from_str(&out).unwrap();
         assert!(parsed.global_hotkey.shortcut_enabled);
         assert_eq!(parsed.global_hotkey.shortcut, "CmdOrCtrl+Shift+J");
         assert!(!parsed.notifications.completion_enabled);
+        assert!(parsed.notifications.copilot_critical_enabled);
     }
 
     #[test]

@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Coach</title>
+  <script src="scripts/ui-zoom.js"></script>
+  <link rel="stylesheet" href="styles/ui-zoom-tokens.css">
+  <style>
+    @font-face {
+      font-family: 'Geist';
+      font-style: normal;
+      font-weight: 400;
+      src: url('fonts/Geist-Regular.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'Geist';
+      font-style: normal;
+      font-weight: 500 600;
+      src: url('fonts/Geist-Medium.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'Geist Mono';
+      font-style: normal;
+      font-weight: 400;
+      src: url('fonts/GeistMono-Regular.woff2') format('woff2');
+    }
+
+    * { box-sizing: border-box; }
+
+    :root {
+      color-scheme: dark;
+      --panel: rgba(20, 20, 18, 0.975);
+      --panel-raised: #1c1c19;
+      --panel-hover: rgba(244, 240, 231, 0.075);
+      --line: rgba(244, 240, 231, 0.13);
+      --line-strong: rgba(244, 240, 231, 0.23);
+      --text: #f4f0e7;
+      --muted: #b6b0a5;
+      --quiet: #9d978d;
+      --accent: #62d77d;
+      --accent-soft: rgba(48, 209, 88, 0.12);
+      --blue: #8fc5e8;
+      --blue-soft: rgba(143, 197, 232, 0.13);
+      --amber: #e7b16f;
+      --amber-soft: rgba(231, 177, 111, 0.13);
+      --red: #f09187;
+      --red-soft: rgba(240, 145, 135, 0.13);
+      --neutral: #aaa59c;
+      --neutral-soft: rgba(170, 165, 156, 0.11);
+      --shadow: 0 22px 54px rgba(0, 0, 0, 0.42), 0 5px 16px rgba(0, 0, 0, 0.28);
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        color-scheme: light;
+        --panel: rgba(248, 244, 237, 0.985);
+        --panel-raised: #eee9df;
+        --panel-hover: rgba(26, 25, 22, 0.065);
+        --line: rgba(26, 25, 22, 0.12);
+        --line-strong: rgba(26, 25, 22, 0.22);
+        --text: #1a1916;
+        --muted: #625e56;
+        --quiet: #706b63;
+        --accent: #9b432e;
+        --accent-soft: rgba(201, 107, 78, 0.11);
+        --blue: #315f7b;
+        --blue-soft: rgba(49, 95, 123, 0.10);
+        --amber: #864a27;
+        --amber-soft: rgba(134, 74, 39, 0.10);
+        --red: #923e37;
+        --red-soft: rgba(146, 62, 55, 0.10);
+        --neutral: #56534d;
+        --neutral-soft: rgba(86, 83, 77, 0.09);
+        --shadow: 0 22px 54px rgba(58, 47, 30, 0.17), 0 5px 16px rgba(58, 47, 30, 0.10);
+      }
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: transparent;
+    }
+
+    body {
+      display: flex;
+      align-items: flex-end;
+      /* Margins let the card shadow fade instead of clipping square at the
+         window rect; keep in sync with COPILOT_HUD_SIZE (card 492x211). */
+      padding: 24px 40px 44px;
+      color: var(--text);
+      font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    .hud {
+      --kind-color: var(--accent);
+      --kind-soft: var(--accent-soft);
+      --nudge-opacity: 1;
+      --nudge-glow: 0.42;
+      position: relative;
+      isolation: isolate;
+      width: 100%;
+      height: 211px;
+      overflow: hidden;
+      border: 1px solid var(--line-strong);
+      border-radius: 22px 22px 16px 16px;
+      background:
+        linear-gradient(118deg, color-mix(in srgb, var(--kind-soft) 42%, transparent), transparent 36%),
+        var(--panel);
+      box-shadow: var(--shadow), inset 0 1px 0 rgba(255, 255, 255, 0.055);
+      animation: hud-enter 240ms cubic-bezier(0.22, 0.8, 0.24, 1) both;
+    }
+
+    .hud::before {
+      position: absolute;
+      z-index: -1;
+      top: 0;
+      right: 0;
+      left: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--line-strong) 28%, var(--line-strong) 72%, transparent);
+      content: '';
+    }
+
+    /* Subtle film grain: warms the panel + kills gradient banding.
+       Behind content (never over text), desaturated, disabled in forced-colors. */
+    .hud::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      border-radius: inherit;
+      opacity: 0.045;
+      mix-blend-mode: soft-light;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
+      background-size: 120px 120px;
+    }
+
+    @keyframes hud-enter {
+      from { opacity: 0; transform: translateY(10px) scale(0.985); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    .header {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      height: 48px;
+      padding: 8px 10px 7px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .identity,
+    .state,
+    .controls,
+    .kind,
+    .source-chip,
+    .footer {
+      display: flex;
+      align-items: center;
+    }
+
+    .identity { gap: 7px; }
+
+    .coach-mark {
+      display: inline-flex;
+      align-items: flex-end;
+      gap: 2px;
+      width: 18px;
+      height: 18px;
+      padding: 4px;
+      border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
+      border-radius: 6px 6px 4px 4px;
+      background: var(--accent-soft);
+    }
+
+    .coach-mark i {
+      width: 2px;
+      border-radius: 999px;
+      background: var(--accent);
+    }
+
+    .coach-mark i:nth-child(1) { height: 4px; opacity: 0.62; }
+    .coach-mark i:nth-child(2) { height: 8px; }
+    .coach-mark i:nth-child(3) { height: 6px; opacity: 0.78; }
+
+    .coach-name {
+      color: var(--text);
+      font-size: var(--text-sm);
+      font-weight: 600;
+      letter-spacing: -0.012em;
+    }
+
+    .privacy {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--quiet);
+      font-family: 'Geist Mono', ui-monospace, monospace;
+      font-size: var(--text-2xs);
+      letter-spacing: 0.035em;
+      text-transform: uppercase;
+    }
+
+    .privacy::before {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--accent);
+      content: '';
+    }
+
+    .state {
+      min-width: 0;
+      justify-content: flex-start;
+      gap: 7px;
+      color: var(--muted);
+      font-family: 'Geist Mono', ui-monospace, monospace;
+      font-size: var(--text-meta);
+      letter-spacing: 0.045em;
+      text-transform: uppercase;
+    }
+
+    .state-dot {
+      width: 6px;
+      height: 6px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+
+    [data-state="thinking"] .state-dot { background: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); }
+    [data-state="paused"] .state-dot { background: var(--neutral); box-shadow: 0 0 0 3px var(--neutral-soft); }
+    [data-state="degraded"] .state-dot { background: var(--red); box-shadow: 0 0 0 3px var(--red-soft); }
+
+    .state-motion {
+      display: inline-flex;
+      align-items: center;
+      width: 42px;
+      height: 8px;
+      overflow: hidden;
+    }
+
+    .arming-steps,
+    .thinking-track {
+      display: none;
+      align-items: center;
+      width: 100%;
+      height: 100%;
+    }
+
+    [data-state="arming"] .arming-steps,
+    [data-state="thinking"] .thinking-track { display: flex; }
+
+    .arming-steps { gap: 3px; }
+
+    .arming-steps i {
+      width: 11px;
+      height: 2px;
+      border-radius: 999px;
+      background: var(--accent);
+      opacity: 0.24;
+      transform: scaleX(0.45);
+      animation: arm-step 1.8s ease-in-out infinite;
+    }
+
+    .arming-steps i:nth-child(2) { animation-delay: 240ms; }
+    .arming-steps i:nth-child(3) { animation-delay: 480ms; }
+
+    @keyframes arm-step {
+      0%, 72%, 100% { opacity: 0.24; transform: scaleX(0.45); }
+      26% { opacity: 0.95; transform: scaleX(1); }
+    }
+
+    .thinking-track {
+      position: relative;
+      border-radius: 999px;
+      background: var(--blue-soft);
+    }
+
+    .thinking-track::after {
+      width: 13px;
+      height: 2px;
+      border-radius: 999px;
+      background: var(--blue);
+      content: '';
+      opacity: 0.85;
+      animation: think-sweep 1.55s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+    }
+
+    @keyframes think-sweep {
+      0% { opacity: 0.3; transform: translateX(0); }
+      50% { opacity: 1; transform: translateX(29px); }
+      100% { opacity: 0.3; transform: translateX(0); }
+    }
+
+    .controls { gap: 6px; }
+
+    button {
+      position: relative;
+      min-width: 76px;
+      min-height: 32px;
+      overflow: hidden;
+      padding: 0 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font: 500 var(--text-xs) 'Geist', sans-serif;
+      transform: scale(1);
+      transition: opacity 140ms ease, transform 140ms ease;
+    }
+
+    button::before {
+      position: absolute;
+      inset: 0;
+      background: var(--panel-hover);
+      content: '';
+      opacity: 0;
+      transition: opacity 140ms ease;
+    }
+
+    button span { position: relative; }
+    button:hover:not(:disabled) { color: var(--text); }
+    button:hover:not(:disabled)::before { opacity: 1; }
+    button:active:not(:disabled) { transform: scale(0.965); }
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    button:disabled { cursor: default; opacity: 0.38; }
+    button[aria-pressed="true"] { border-color: var(--line-strong); color: var(--text); }
+
+    .stage {
+      position: relative;
+      min-height: 126px;
+      padding: 14px 17px 10px;
+    }
+
+    .empty-state {
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr);
+      gap: 11px;
+      align-items: start;
+    }
+
+    .state-icon {
+      display: grid;
+      width: 28px;
+      height: 28px;
+      margin-top: 1px;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px 10px 7px 7px;
+      background: var(--panel-raised);
+      color: var(--accent);
+      font-family: 'Geist Mono', ui-monospace, monospace;
+      font-size: var(--text-sm);
+    }
+
+    [data-state="thinking"] .state-icon { color: var(--blue); }
+    [data-state="paused"] .state-icon { color: var(--neutral); }
+    [data-state="degraded"] .state-icon { color: var(--red); }
+
+    .state-hero,
+    .nudge-text {
+      margin: 0;
+      color: var(--text);
+      font-size: var(--text-xl);
+      font-weight: 600;
+      line-height: 1.22;
+      letter-spacing: -0.025em;
+    }
+
+    .state-support {
+      display: -webkit-box;
+      margin: 5px 0 0;
+      overflow: hidden;
+      color: var(--muted);
+      font-size: var(--text-body);
+      line-height: 1.38;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+    }
+
+    .nudge-shell {
+      position: relative;
+      display: none;
+      min-width: 0;
+      opacity: var(--nudge-opacity);
+      transition: opacity 1s linear;
+    }
+
+    .nudge-shell::before {
+      position: absolute;
+      z-index: -1;
+      inset: -28px -24px -20px;
+      background: radial-gradient(circle at 10% 10%, var(--kind-soft), transparent 48%);
+      content: '';
+      opacity: var(--nudge-glow);
+      transition: opacity 1s linear;
+    }
+
+    .has-nudge .empty-state { display: none; }
+    .has-nudge .nudge-shell { display: block; }
+
+    .nudge-shell.is-arriving {
+      animation: nudge-arrive 320ms cubic-bezier(0.22, 0.8, 0.24, 1) both;
+    }
+
+    @keyframes nudge-arrive {
+      from { opacity: 0; transform: translateY(7px); }
+      to { opacity: var(--nudge-opacity); transform: translateY(0); }
+    }
+
+    .nudge-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+      margin-bottom: 7px;
+    }
+
+    .kind {
+      flex: 0 0 auto;
+      gap: 5px;
+      padding: 3px 7px 3px 4px;
+      border: 1px solid color-mix(in srgb, var(--kind-color) 42%, transparent);
+      border-radius: 999px;
+      background: var(--kind-soft);
+      color: var(--kind-color);
+      font-family: 'Geist Mono', ui-monospace, monospace;
+      font-size: var(--text-2xs);
+      letter-spacing: 0.055em;
+      text-transform: uppercase;
+    }
+
+    .kind-icon {
+      display: grid;
+      width: 16px;
+      height: 16px;
+      place-items: center;
+      border: 1px solid color-mix(in srgb, var(--kind-color) 38%, transparent);
+      border-radius: 50%;
+      font-size: var(--text-2xs);
+      line-height: 1;
+    }
+
+    .hud[data-kind="say"] { --kind-color: var(--accent); --kind-soft: var(--accent-soft); }
+    .hud[data-kind="ask"] { --kind-color: var(--blue); --kind-soft: var(--blue-soft); }
+    .hud[data-kind="clarify"] { --kind-color: var(--amber); --kind-soft: var(--amber-soft); }
+    .hud[data-kind="hold"] { --kind-color: var(--neutral); --kind-soft: var(--neutral-soft); }
+    .hud[data-kind="watch"] { --kind-color: var(--red); --kind-soft: var(--red-soft); }
+
+    .source-chip {
+      min-width: 0;
+      max-width: 292px;
+      padding: 4px 8px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel-raised);
+      color: var(--muted);
+      font-family: 'Geist Mono', ui-monospace, monospace;
+      font-size: var(--text-2xs);
+      letter-spacing: 0.01em;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .nudge-text {
+      display: -webkit-box;
+      max-height: 78px;
+      overflow: hidden;
+      font-size: 1.3125rem;
+      line-height: 1.22;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 3;
+    }
+
+    .footer {
+      position: absolute;
+      right: 0;
+      bottom: 0;
+      left: 0;
+      height: 37px;
+      gap: 7px;
+      padding: 0 16px;
+      border-top: 1px solid var(--line);
+      color: var(--quiet);
+      font-size: var(--text-meta);
+      line-height: 1.25;
+    }
+
+    .footer-mark {
+      width: 5px;
+      height: 5px;
+      flex: 0 0 auto;
+      border: 1px solid var(--quiet);
+      border-radius: 50%;
+    }
+
+    .footer-copy {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation: none !important;
+        transition: none !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    @media (forced-colors: active) {
+      .hud::after { display: none; }
+      .hud,
+      button,
+      .kind,
+      .source-chip,
+      .state-icon { border-color: CanvasText; }
+      .state-dot,
+      .privacy::before,
+      .coach-mark i { background: CanvasText; }
+    }
+  </style>
+</head>
+<body>
+  <main class="hud" id="hud" data-state="arming" data-kind="say" data-tauri-drag-region>
+    <header class="header">
+      <div class="identity" aria-label="Minutes Coach, private">
+        <span class="coach-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="coach-name">Coach</span>
+        <span class="privacy">Private</span>
+      </div>
+
+      <div class="state" role="status" aria-live="polite">
+        <span class="state-dot" aria-hidden="true"></span>
+        <span id="state-label">Arming</span>
+        <span class="state-motion" aria-hidden="true">
+          <span class="arming-steps"><i></i><i></i><i></i></span>
+          <span class="thinking-track"></span>
+        </span>
+      </div>
+
+      <div class="controls">
+        <button id="pause" type="button" aria-pressed="false" title="Pause coaching; recording keeps going">
+          <span id="pause-label">Pause</span>
+        </button>
+        <button id="dismiss" type="button" title="Dismiss this suggestion" disabled>
+          <span id="dismiss-label">Dismiss</span>
+        </button>
+      </div>
+    </header>
+
+    <section class="stage" aria-live="polite" aria-atomic="true">
+      <div class="empty-state">
+        <div class="state-icon" id="state-icon" aria-hidden="true">···</div>
+        <div>
+          <p class="state-hero" id="state-copy">Loading meeting context</p>
+          <p class="state-support" id="state-support">Coach is getting the conversation ready.</p>
+        </div>
+      </div>
+
+      <div class="nudge-shell" id="nudge-shell">
+        <div class="nudge-meta">
+          <div class="kind" id="kind">
+            <span class="kind-icon" id="kind-icon" aria-hidden="true">↑</span>
+            <span id="kind-label">Say</span>
+          </div>
+          <span class="source-chip" id="source-chip"></span>
+        </div>
+        <p class="nudge-text" id="nudge-text"></p>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span class="footer-mark" aria-hidden="true"></span>
+      <span class="footer-copy" id="detail">Private to you · Pause anytime; the meeting keeps going.</span>
+    </footer>
+  </main>
+
+  <script>
+    // Drag the HUD from any non-interactive surface. data-tauri-drag-region
+    // only fires when the mousedown TARGET is the attributed element, and the
+    // card is fully covered by children — so drive startDragging explicitly.
+    // Window-server move: never takes key focus (non-activating preserved).
+    document.addEventListener('mousedown', (event) => {
+      if (event.button !== 0) return;
+      if (event.target.closest('button, a, input, [role="button"]')) return;
+      window.__TAURI__.window.getCurrentWindow().startDragging();
+    });
+
+    const { invoke } = window.__TAURI__.core;
+    const { listen } = window.__TAURI__.event;
+    const hud = document.getElementById('hud');
+    const stateLabel = document.getElementById('state-label');
+    const stateIcon = document.getElementById('state-icon');
+    const stateCopy = document.getElementById('state-copy');
+    const stateSupport = document.getElementById('state-support');
+    const detail = document.getElementById('detail');
+    const kindIcon = document.getElementById('kind-icon');
+    const kindLabel = document.getElementById('kind-label');
+    const nudgeShell = document.getElementById('nudge-shell');
+    const nudgeText = document.getElementById('nudge-text');
+    const sourceChip = document.getElementById('source-chip');
+    const pauseButton = document.getElementById('pause');
+    const pauseLabel = document.getElementById('pause-label');
+    const dismissButton = document.getElementById('dismiss');
+    const dismissLabel = document.getElementById('dismiss-label');
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+    const labels = {
+      arming: 'Arming',
+      listening: 'Listening',
+      thinking: 'Thinking',
+      nudge: 'Nudge',
+      paused: 'Paused',
+      degraded: 'Degraded',
+      off: 'Off',
+    };
+
+    const kindIcons = {
+      say: '↑',
+      ask: '?',
+      clarify: '≈',
+      hold: '—',
+      watch: '!',
+    };
+
+    let snapshot = null;
+    let freshnessTimer = null;
+    let firstUse = true;
+
+    function stateName(value) {
+      const name = String(value || 'Off').toLowerCase();
+      return Object.hasOwn(labels, name) ? name : 'degraded';
+    }
+
+    function plainDegraded(rawValue) {
+      const raw = String(rawValue || '').toLowerCase();
+      if (/history|past meeting|meeting context/.test(raw)) {
+        return {
+          hero: 'Past meeting context isn’t available',
+          support: 'Coach is using this conversation only. Recording and transcription continue.',
+        };
+      }
+      if (/model|provider|ollama|connect|network|server/.test(raw)) {
+        return {
+          hero: 'Coach can’t reach its private model',
+          support: 'Recording and transcription continue. Coach will recover without interrupting them.',
+        };
+      }
+      if (/transcript|speech|audio|capture/.test(raw)) {
+        return {
+          hero: 'Coach isn’t receiving the conversation',
+          support: 'Check that recording or live transcription is running, then Coach can continue.',
+        };
+      }
+      return {
+        hero: 'Coach is temporarily limited',
+        support: 'Recording and transcription continue while Coach tries to recover.',
+      };
+    }
+
+    function presentationFor(state, next) {
+      if (state === 'arming') {
+        const warming = /context ready|warming/i.test(String(next.detail || ''));
+        return warming
+          ? {
+              icon: '◌',
+              hero: 'Starting your private model',
+              support: 'Meeting context is ready. Advice begins in a moment.',
+              footer: 'Everything stays on this Mac while Coach gets ready.',
+            }
+          : {
+              icon: '···',
+              hero: 'Loading meeting context',
+              support: 'Coach is getting the conversation ready before it offers advice.',
+              footer: 'Private to you · Pause anytime; the meeting keeps going.',
+            };
+      }
+      if (state === 'listening') {
+        return {
+          icon: '∿',
+          hero: 'Listening for a useful moment',
+          support: 'Coach stays quiet until there’s something worth saying.',
+          footer: firstUse
+            ? 'Private to you · Pause anytime; the meeting keeps going.'
+            : 'Coach stays hidden from screen sharing.',
+        };
+      }
+      if (state === 'thinking') {
+        return {
+          icon: '···',
+          hero: 'Considering the latest turn',
+          support: 'Listening stays active while Coach decides whether to interrupt.',
+          footer: 'Your recording and transcription continue uninterrupted.',
+        };
+      }
+      if (state === 'paused') {
+        return {
+          icon: 'Ⅱ',
+          hero: 'Coaching is paused',
+          support: 'Recording and transcription continue. Resume whenever you want advice again.',
+          footer: 'Only Coach is paused; the meeting keeps going.',
+        };
+      }
+      if (state === 'degraded') {
+        const limitation = plainDegraded(next.limitation || next.detail);
+        return {
+          icon: '!',
+          hero: limitation.hero,
+          support: limitation.support,
+          footer: 'Your meeting remains safe and keeps recording.',
+        };
+      }
+      if (state === 'nudge') {
+        return {
+          icon: '↑',
+          hero: 'Fresh advice is ready',
+          support: 'Dismiss it when you’re done.',
+          footer: 'Dismiss clears this suggestion only; Pause stops new coaching.',
+        };
+      }
+      return {
+        icon: '—',
+        hero: 'Coach is off',
+        support: 'Start Coach when you want private, in-the-moment guidance.',
+        footer: 'Coach stays hidden from screen sharing.',
+      };
+    }
+
+    function stopFreshness(reset = true) {
+      if (freshnessTimer !== null) window.clearInterval(freshnessTimer);
+      freshnessTimer = null;
+      if (reset) {
+        hud.style.setProperty('--nudge-opacity', 1);
+        hud.style.setProperty('--nudge-glow', 0.42);
+        delete hud.dataset.age;
+      }
+    }
+
+    function freshnessValues(remaining, ttl) {
+      const ratio = Math.max(0, Math.min(1, remaining / ttl));
+      if (reducedMotion.matches) {
+        return {
+          opacity: ratio > 0.5 ? 1 : 0.84,
+          glow: ratio > 0.5 ? 0.42 : 0.1,
+          ratio,
+        };
+      }
+      return {
+        opacity: 0.82 + ratio * 0.18,
+        glow: 0.08 + ratio * 0.34,
+        ratio,
+      };
+    }
+
+    function startFreshness(nudge) {
+      stopFreshness();
+      const created = Date.parse(nudge.created_ts || nudge.createdTs || '');
+      const ttl = Math.max(1, Number(nudge.ttl_ms ?? nudge.ttlMs ?? 0));
+      if (!Number.isFinite(created) || !Number.isFinite(ttl)) return;
+      const expires = created + ttl;
+
+      const paint = () => {
+        const remaining = Math.max(0, expires - Date.now());
+        const freshness = freshnessValues(remaining, ttl);
+        hud.style.setProperty('--nudge-opacity', freshness.opacity.toFixed(3));
+        hud.style.setProperty('--nudge-glow', freshness.glow.toFixed(3));
+        hud.dataset.age = freshness.ratio > 0.66 ? 'fresh' : freshness.ratio > 0.25 ? 'settled' : 'aging';
+
+        if (remaining <= 0) {
+          stopFreshness(false);
+          if (snapshot?.nudge?.id === nudge.id) {
+            snapshot = {
+              ...snapshot,
+              nudge: null,
+              state: snapshot.paused ? 'Paused' : snapshot.limitation ? 'Degraded' : 'Listening',
+            };
+            render(snapshot);
+          }
+        }
+      };
+
+      paint();
+      freshnessTimer = window.setInterval(paint, reducedMotion.matches ? 1000 : 250);
+    }
+
+    function announceArrival() {
+      nudgeShell.classList.remove('is-arriving');
+      void nudgeShell.offsetWidth;
+      nudgeShell.classList.add('is-arriving');
+    }
+
+    function render(next) {
+      const previousNudgeId = snapshot?.nudge?.id;
+      snapshot = next || {};
+      const state = stateName(snapshot.state);
+      const nudge = snapshot.nudge || null;
+      const showNudge = Boolean(nudge) && !['paused', 'degraded', 'off'].includes(state);
+      const nudgeChanged = Boolean(nudge) && nudge.id !== previousNudgeId;
+      const presentation = presentationFor(state, snapshot);
+
+      hud.dataset.state = state;
+      stateLabel.textContent = labels[state];
+      stateIcon.textContent = presentation.icon;
+      stateCopy.textContent = presentation.hero;
+      stateSupport.textContent = presentation.support;
+      detail.textContent = presentation.footer;
+      detail.title = presentation.footer;
+
+      const paused = Boolean(snapshot.paused) || state === 'paused';
+      pauseButton.disabled = !snapshot.active;
+      pauseButton.setAttribute('aria-pressed', String(paused));
+      pauseLabel.textContent = paused ? 'Resume' : 'Pause';
+      dismissButton.disabled = !showNudge;
+      dismissLabel.textContent = 'Dismiss';
+
+      if (showNudge) {
+        const nudgeKind = String(nudge.kind || 'Say');
+        const normalizedKind = Object.hasOwn(kindIcons, nudgeKind.toLowerCase())
+          ? nudgeKind.toLowerCase()
+          : 'say';
+        const source = String(nudge.source_chip || nudge.sourceChip || 'Live transcript');
+        hud.classList.add('has-nudge');
+        hud.dataset.kind = normalizedKind;
+        kindIcon.textContent = kindIcons[normalizedKind];
+        kindLabel.textContent = normalizedKind[0].toUpperCase() + normalizedKind.slice(1);
+        nudgeText.textContent = String(nudge.text || '');
+        nudgeText.title = nudgeText.textContent;
+        sourceChip.textContent = `From ${source}`;
+        sourceChip.title = source;
+        firstUse = false;
+        if (nudgeChanged || freshnessTimer === null) startFreshness(nudge);
+        if (nudgeChanged) announceArrival();
+      } else {
+        hud.classList.remove('has-nudge');
+        hud.dataset.kind = '';
+        nudgeShell.classList.remove('is-arriving');
+        nudgeText.textContent = '';
+        nudgeText.removeAttribute('title');
+        sourceChip.textContent = '';
+        sourceChip.removeAttribute('title');
+        if (!nudge) stopFreshness();
+      }
+    }
+
+    pauseButton.addEventListener('click', async () => {
+      const paused = Boolean(snapshot?.paused) || stateName(snapshot?.state) === 'paused';
+      firstUse = false;
+      pauseButton.disabled = true;
+      pauseButton.setAttribute('aria-busy', 'true');
+      pauseLabel.textContent = paused ? 'Resuming…' : 'Pausing…';
+      try {
+        render(await invoke(paused ? 'cmd_resume_copilot_surface' : 'cmd_pause_copilot_surface'));
+      } catch (error) {
+        render({
+          ...(snapshot || {}),
+          state: 'Degraded',
+          limitation: String(error),
+          detail: String(error),
+        });
+      } finally {
+        pauseButton.removeAttribute('aria-busy');
+      }
+    });
+
+    dismissButton.addEventListener('click', async () => {
+      dismissButton.disabled = true;
+      dismissButton.setAttribute('aria-busy', 'true');
+      dismissLabel.textContent = 'Clearing…';
+      try {
+        render(await invoke('cmd_dismiss_copilot_nudge'));
+      } catch (_error) {
+        dismissButton.disabled = false;
+        dismissLabel.textContent = 'Dismiss';
+      } finally {
+        dismissButton.removeAttribute('aria-busy');
+      }
+    });
+
+    reducedMotion.addEventListener('change', () => {
+      if (snapshot?.nudge) startFreshness(snapshot.nudge);
+    });
+
+    listen('copilot:state', event => render(event.payload));
+    listen('copilot:nudge', event => render({ ...(snapshot || {}), state: 'Nudge', nudge: event.payload }));
+
+    invoke('cmd_copilot_surface_status')
+      .then(render)
+      .catch(error => render({
+        active: false,
+        state: 'Degraded',
+        detail: String(error),
+        limitation: String(error),
+      }));
+  </script>
+</body>
+</html>
