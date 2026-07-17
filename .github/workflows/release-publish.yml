@@ -92,7 +92,7 @@ jobs:
           pack_json="$(mktemp)"
           npm pack --json > "$pack_json"
           mapfile -t pack < <(node - "$pack_json" <<'NODE'
-          const [pack] = require(process.argv[2]);
+          const [pack] = JSON.parse(process.getBuiltinModule("node:fs").readFileSync(process.argv[2], "utf8"));
           if (!pack?.filename || !pack?.integrity) throw new Error("npm pack did not return filename and integrity");
           console.log(pack.filename);
           console.log(pack.integrity);
@@ -157,7 +157,7 @@ jobs:
           pack_json="$(mktemp)"
           npm pack --json > "$pack_json"
           mapfile -t pack < <(node - "$pack_json" <<'NODE'
-          const [pack] = require(process.argv[2]);
+          const [pack] = JSON.parse(process.getBuiltinModule("node:fs").readFileSync(process.argv[2], "utf8"));
           if (!pack?.filename || !pack?.integrity) throw new Error("npm pack did not return filename and integrity");
           console.log(pack.filename);
           console.log(pack.integrity);
@@ -220,6 +220,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libpipewire-0.3-dev libspa-0.2-dev \
+            clang libclang-dev cmake build-essential pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
