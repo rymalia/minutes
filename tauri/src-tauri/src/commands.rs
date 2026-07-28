@@ -35,6 +35,14 @@ pub struct AppState {
     pub processing: Arc<AtomicBool>,
     pub processing_stage: Arc<Mutex<Option<String>>>,
     pub latest_output: Arc<Mutex<Option<OutputNotice>>>,
+    /// Canonical path of the artifact currently being resummarized, if any.
+    ///
+    /// Desktop resummarize runs are serialized **globally**, not merely per
+    /// path: every successful apply rebuilds the shared graph DB and refreshes
+    /// shared indexes (`crates/core/src/derived.rs`), so two concurrent runs on
+    /// different files would contend on those and produce best-effort refresh
+    /// warnings. One at a time, app-wide.
+    pub resummarize_in_flight: Arc<Mutex<Option<PathBuf>>>,
     pub activation_progress: Arc<Mutex<ActivationProgress>>,
     pub call_capture_health: Arc<Mutex<Option<crate::call_capture::CallSourceHealth>>>,
     pub completion_notifications_enabled: Arc<AtomicBool>,
@@ -111,6 +119,42 @@ pub struct AppState {
     /// Monotonic ID source used to keep late teardown from an old cancelled
     /// reader from finishing a newer turn.
     pub(crate) recall_chat_next_turn_id: Arc<AtomicU64>,
+}
+
+/// Releases the in-flight slot on every exit path, including panic and early
+/// return. Never leave the slot set — a stuck slot disables the button until
+/// the app restarts.
+struct ResummarizeInFlightGuard {
+    slot: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl ResummarizeInFlightGuard {
+    /// Claim the slot for `path`. Returns an error naming the currently-running
+    /// artifact when another desktop resummarize is already in flight.
+    fn acquire(slot: &Arc<Mutex<Option<PathBuf>>>, path: &Path) -> Result<Self, String> {
+        let mut current = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(in_flight) = current.as_ref() {
+            return Err(format!(
+                "A resummarize is already in progress for {}. Please wait for it to finish.",
+                in_flight.display()
+            ));
+        }
+
+        *current = Some(path.to_path_buf());
+        Ok(Self {
+            slot: Arc::clone(slot),
+        })
+    }
+}
+
+impl Drop for ResummarizeInFlightGuard {
+    fn drop(&mut self) {
+        let mut current = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = None;
+    }
 }
 
 pub const DEFAULT_COPILOT_GOAL: &str =
@@ -7134,7 +7178,7 @@ pub fn cmd_open_file(app: tauri::AppHandle, path: String) -> Result<(), String> 
     open_target(&app, &path)
 }
 
-fn validate_text_file_path(path: &Path) -> Result<PathBuf, String> {
+fn validate_text_file_path_common(path: &Path) -> Result<(PathBuf, u64), String> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| format!("Cannot resolve {}: {}", path.display(), e))?;
     let path_str = canonical.to_string_lossy();
@@ -7154,12 +7198,18 @@ fn validate_text_file_path(path: &Path) -> Result<PathBuf, String> {
         return Err(format!("Not a file: {}", path_str));
     }
 
+    Ok((canonical, meta.len()))
+}
+
+fn validate_text_file_path(path: &Path) -> Result<PathBuf, String> {
+    let (canonical, size) = validate_text_file_path_common(path)?;
+    let path_str = canonical.to_string_lossy();
+
     // Cap at 1MB to prevent OOM on huge files
-    if meta.len() > 1_048_576 {
+    if size > 1_048_576 {
         return Err(format!(
             "File too large: {} ({} bytes, max 1MB)",
-            path_str,
-            meta.len()
+            path_str, size
         ));
     }
 
@@ -7171,6 +7221,23 @@ fn validate_text_file_path(path: &Path) -> Result<PathBuf, String> {
     if !matches!(extension.as_str(), "md" | "markdown" | "txt" | "json") {
         return Err(format!(
             "Unsupported text file: {} (expected .md, .markdown, .txt, or .json)",
+            path_str
+        ));
+    }
+
+    Ok(canonical)
+}
+
+fn validate_resummarize_meeting_path(path: &Path) -> Result<PathBuf, String> {
+    let (canonical, _) = validate_text_file_path_common(path)?;
+    let path_str = canonical.to_string_lossy();
+    let is_markdown = canonical
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
+    if !is_markdown {
+        return Err(format!(
+            "Unsupported artifact: {} (expected a .md file)",
             path_str
         ));
     }
@@ -7929,6 +7996,90 @@ pub fn cmd_get_meeting_detail(path: String) -> Result<MeetingDetail, String> {
             .to_string()
         }),
     })
+}
+
+fn merge_disposition_json(
+    disposition: minutes_core::resummarize::MergeDisposition,
+) -> (&'static str, Option<String>) {
+    use minutes_core::resummarize::MergeDisposition;
+
+    match disposition {
+        MergeDisposition::Carried => ("carried", None),
+        MergeDisposition::CarriedWithConflict(detail) => ("carried-with-conflict", Some(detail)),
+        MergeDisposition::KeptUnmatched => ("kept-unmatched", None),
+        MergeDisposition::Dropped => ("dropped", None),
+        MergeDisposition::Ambiguous => ("ambiguous", None),
+    }
+}
+
+fn resummarize_report_json(
+    report: minutes_core::resummarize::ResummarizeReport,
+) -> serde_json::Value {
+    let merge_notes: Vec<serde_json::Value> = report
+        .merge_notes
+        .into_iter()
+        .filter_map(|note| {
+            let (disposition, detail) = merge_disposition_json(note.disposition);
+            (disposition != "carried").then(|| {
+                serde_json::json!({
+                    "kind": note.kind,
+                    "previous": note.previous,
+                    "disposition": disposition,
+                    "detail": detail,
+                })
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "path": report.path.display().to_string(),
+        "applied": report.applied,
+        "backup": report.backup.map(|path| path.display().to_string()),
+        "engine": report.engine,
+        "model": report.model,
+        "template": report.template,
+        "sectionsReplaced": report.sections_replaced,
+        "durationMs": report.duration_ms,
+        "mergeNotes": merge_notes,
+        "refreshWarnings": report.refresh.map(|refresh| refresh.warnings).unwrap_or_default(),
+    })
+}
+
+fn resummarize_status_json(slot: &Arc<Mutex<Option<PathBuf>>>) -> serde_json::Value {
+    let in_flight = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    serde_json::json!({
+        "running": in_flight.is_some(),
+        "path": in_flight.as_ref().map(|path| path.display().to_string()),
+    })
+}
+
+#[tauri::command]
+pub async fn cmd_resummarize_meeting(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    let canonical = validate_resummarize_meeting_path(Path::new(&path))?;
+    let _guard = ResummarizeInFlightGuard::acquire(&state.resummarize_in_flight, &canonical)?;
+
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let config = Config::load();
+        let opts = minutes_core::resummarize::ResummarizeOptions {
+            apply: true,
+            template_override: None,
+            refresh: Default::default(),
+        };
+        minutes_core::resummarize::resummarize_meeting(&canonical, &config, &opts)
+    })
+    .await
+    .map_err(|error| format!("resummarize task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+
+    Ok(resummarize_report_json(report))
+}
+
+#[tauri::command]
+pub fn cmd_resummarize_status(state: tauri::State<AppState>) -> serde_json::Value {
+    resummarize_status_json(&state.resummarize_in_flight)
 }
 
 #[tauri::command]
@@ -10943,6 +11094,7 @@ mod tests {
             processing: Arc::new(AtomicBool::new(false)),
             processing_stage: Arc::new(Mutex::new(None)),
             latest_output: Arc::new(Mutex::new(None)),
+            resummarize_in_flight: Arc::new(Mutex::new(None)),
             activation_progress: Arc::new(Mutex::new(ActivationProgress::default())),
             call_capture_health: Arc::new(Mutex::new(None)),
             completion_notifications_enabled: Arc::new(AtomicBool::new(false)),
@@ -10985,6 +11137,82 @@ mod tests {
             recall_chat_turn: Arc::new(Mutex::new(None)),
             recall_chat_next_turn_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    #[test]
+    fn resummarize_guard_blocks_second_acquire() {
+        let slot = Arc::new(Mutex::new(None));
+        let first_path = Path::new("/tmp/first.md");
+        let second_path = Path::new("/tmp/second.md");
+        let _guard = ResummarizeInFlightGuard::acquire(&slot, first_path).unwrap();
+
+        assert!(ResummarizeInFlightGuard::acquire(&slot, first_path).is_err());
+        assert!(ResummarizeInFlightGuard::acquire(&slot, second_path).is_err());
+    }
+
+    #[test]
+    fn resummarize_guard_releases_on_drop() {
+        let slot = Arc::new(Mutex::new(None));
+        let path = Path::new("/tmp/meeting.md");
+
+        let guard = ResummarizeInFlightGuard::acquire(&slot, path).unwrap();
+        drop(guard);
+
+        assert!(ResummarizeInFlightGuard::acquire(&slot, path).is_ok());
+    }
+
+    #[test]
+    fn resummarize_guard_recovers_from_poisoned_lock() {
+        let slot = Arc::new(Mutex::new(None));
+        let poisoned_slot = Arc::clone(&slot);
+        let result = std::thread::spawn(move || {
+            let _lock = poisoned_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            panic!("poison the resummarize slot");
+        })
+        .join();
+        assert!(result.is_err());
+
+        let path = Path::new("/tmp/meeting.md");
+        let guard = ResummarizeInFlightGuard::acquire(&slot, path).unwrap();
+        drop(guard);
+
+        assert!(ResummarizeInFlightGuard::acquire(&slot, path).is_ok());
+    }
+
+    #[test]
+    fn resummarize_status_reports_in_flight_path() {
+        let slot = Arc::new(Mutex::new(None));
+        let path = Path::new("/tmp/meeting.md");
+        let guard = ResummarizeInFlightGuard::acquire(&slot, path).unwrap();
+
+        let running = resummarize_status_json(&slot);
+        assert_eq!(running["running"], true);
+        assert_eq!(running["path"], path.display().to_string());
+
+        drop(guard);
+        let idle = resummarize_status_json(&slot);
+        assert_eq!(idle["running"], false);
+        assert!(idle["path"].is_null());
+    }
+
+    #[test]
+    fn resummarize_path_validation_rejects_non_markdown_and_outside_home() {
+        let home = dirs::home_dir().expect("home dir");
+        let inside_home = TempDir::new_in(home).unwrap();
+        let non_markdown = inside_home.path().join("meeting.txt");
+        fs::write(&non_markdown, "not markdown").unwrap();
+        assert!(validate_resummarize_meeting_path(&non_markdown)
+            .unwrap_err()
+            .contains("expected a .md file"));
+
+        let outside_home = TempDir::new().unwrap();
+        let outside_markdown = outside_home.path().join("meeting.md");
+        fs::write(&outside_markdown, "---\ntitle: Outside\n---\n").unwrap();
+        assert!(validate_resummarize_meeting_path(&outside_markdown)
+            .unwrap_err()
+            .contains("outside home directory"));
     }
 
     #[test]

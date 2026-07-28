@@ -5577,6 +5577,7 @@
         <div class="detail-actions">
           <button class="btn btn-secondary btn-sm" id="btn-create-artifact">Create Draft</button>
           <button class="btn btn-primary btn-sm" id="btn-discuss-ai">Discuss with Agent</button>
+          <button class="btn btn-secondary btn-sm" id="btn-resummarize">Resummarize</button>
           <button class="btn btn-secondary btn-sm" id="btn-open-external">Open in Editor</button>
           <button class="btn btn-danger btn-sm" id="btn-delete-meeting">Delete</button>
         </div>
@@ -6816,6 +6817,7 @@
     const detailMeta = document.getElementById('detail-meta');
     const detailFeedback = document.getElementById('detail-feedback');
     const detailScroll = document.getElementById('detail-scroll');
+    const resummarizeBtn = document.getElementById('btn-resummarize');
     const openExternalBtn = document.getElementById('btn-open-external');
     const aboutOverlay = document.getElementById('about-overlay');
     const aboutVersion = document.getElementById('about-version');
@@ -6901,6 +6903,7 @@
     let proactiveContextBundle = null;
     let latestOutput = null;
     let detailFeedbackTimer = null;
+    let resummarizeConfirmTimer = null;
     let processingJobs = [];
     let readinessItems = [];
     let recoveryItems = [];
@@ -8659,6 +8662,104 @@
       }
     });
 
+    function resetResummarizeButton() {
+      if (resummarizeConfirmTimer) {
+        clearTimeout(resummarizeConfirmTimer);
+        resummarizeConfirmTimer = null;
+      }
+      resummarizeBtn.disabled = false;
+      resummarizeBtn.style.minWidth = '';
+      resummarizeBtn.textContent = 'Resummarize';
+    }
+
+    async function refreshResummarizeButton() {
+      try {
+        const status = await invoke('cmd_resummarize_status');
+        if (status && status.running) {
+          // Runs are globally serialized: disable for any in-flight run, and
+          // say so when it is a different file than the one open here.
+          resummarizeBtn.disabled = true;
+          resummarizeBtn.textContent = 'Resummarizing…';
+          if (status.path && status.path !== currentMeetingPath) {
+            showDetailFeedback('Another meeting is being resummarized — this button unlocks when it finishes.');
+          }
+        } else {
+          resetResummarizeButton();
+        }
+      } catch (e) {
+        console.error('Resummarize status:', e);
+      }
+    }
+
+    resummarizeBtn.addEventListener('click', async () => {
+      const path = currentMeetingPath;
+      if (!path) return;
+      if (resummarizeBtn.disabled) {
+        showDetailFeedback('Another meeting is being resummarized — try again when it finishes.');
+        return;
+      }
+      // Two-step inline confirm: the AI pass has real cost, so an accidental
+      // click must not fire it. Never window.confirm — WKWebView breaks it.
+      if (!resummarizeConfirmTimer) {
+        // Pin the current width before shortening the label. "Confirm?" is
+        // narrower than "Resummarize", and without this the actions row
+        // reflows and slides "Open in Editor" under the cursor — so the
+        // second click of a double-click lands on the wrong button.
+        resummarizeBtn.style.minWidth = `${resummarizeBtn.offsetWidth}px`;
+        resummarizeBtn.textContent = 'Confirm?';
+        showDetailFeedback('Click again to re-run the AI pass. The summary is rewritten and a timestamped backup is saved.');
+        resummarizeConfirmTimer = setTimeout(resetResummarizeButton, 4000);
+        return;
+      }
+      clearTimeout(resummarizeConfirmTimer);
+      resummarizeConfirmTimer = null;
+      resummarizeBtn.disabled = true;
+      resummarizeBtn.textContent = 'Resummarizing…';
+      // The run outlasts the default toast, so hold the pending message until
+      // the success/error message replaces it.
+      showDetailFeedback('Resummarizing… this can take a minute.', 'success', 0);
+      try {
+        const result = await invoke('cmd_resummarize_meeting', { path });
+        const sections = Array.isArray(result.sectionsReplaced) ? result.sectionsReplaced : [];
+        const parts = [
+          sections.length ? `Replaced: ${sections.join(', ')}.` : 'No sections replaced.',
+          result.backup ? `Backup: ${result.backup}` : null,
+        ].filter(Boolean);
+        const mergeNotes = Array.isArray(result.mergeNotes) ? result.mergeNotes : [];
+        if (mergeNotes.length) {
+          const notes = mergeNotes.map((note) =>
+            [note.kind, note.disposition, note.detail || note.previous].filter(Boolean).join(' — '));
+          parts.push(`Merge notes to review: ${notes.join(' | ')}`);
+        }
+        // A refresh warning means the write succeeded but a derived view (graph,
+        // vault, QMD) is now stale — silently dropping it is how a stale index
+        // goes unnoticed.
+        const refreshWarnings = Array.isArray(result.refreshWarnings) ? result.refreshWarnings : [];
+        if (refreshWarnings.length) {
+          parts.push(`Derived views need attention: ${refreshWarnings.join(' | ')}`);
+        }
+        // Merge notes and refresh warnings both name things the user has to act
+        // on — keep them up until the user moves on rather than auto-hiding.
+        // Tone stays 'success' (the write did succeed, and .detail-feedback has
+        // no warning variant); persistence is what carries the emphasis.
+        const needsAttention = mergeNotes.length || refreshWarnings.length;
+        showDetailFeedback(parts.join(' '), 'success', needsAttention ? 0 : 3200);
+        await openMeetingDetail(path);
+        loadMeetings();
+      } catch (e) {
+        const message = e?.message || String(e || 'Unknown error');
+        console.error('Resummarize:', e);
+        // Errors are actionable (a ConcurrentEdit asks the user to save their
+        // editor and re-run) — do not auto-hide them.
+        showDetailFeedback(message, 'error', 0);
+        // Reload without retrying: a ConcurrentEdit means the on-disk file
+        // moved on, so show the user its current state.
+        await openMeetingDetail(path);
+      } finally {
+        resetResummarizeButton();
+      }
+    });
+
     document.getElementById('btn-stop').addEventListener('click', async () => {
       try {
         stopRequested = true;
@@ -8970,6 +9071,10 @@
         clearTimeout(detailFeedbackTimer);
         detailFeedbackTimer = null;
       }
+      if (resummarizeConfirmTimer) {
+        clearTimeout(resummarizeConfirmTimer);
+        resummarizeConfirmTimer = null;
+      }
       detailFeedback.hidden = true;
       detailFeedback.className = 'detail-feedback';
       detailFeedback.textContent = '';
@@ -9037,7 +9142,12 @@
       closeInputModal(null);
     }, true);
 
-    function showDetailFeedback(message, tone = 'success') {
+    // `durationMs = 0` keeps the message up until the next feedback call or
+    // closeDetailView(). Used for content the user is meant to act on rather
+    // than glance at — resummarize merge notes name the action items and
+    // decisions that did not carry cleanly, and 3.2s is not long enough to
+    // read them.
+    function showDetailFeedback(message, tone = 'success', durationMs = 3200) {
       if (detailFeedbackTimer) {
         clearTimeout(detailFeedbackTimer);
         detailFeedbackTimer = null;
@@ -9045,12 +9155,13 @@
       detailFeedback.hidden = false;
       detailFeedback.className = `detail-feedback ${tone}`;
       detailFeedback.textContent = message;
+      if (durationMs <= 0) return;
       detailFeedbackTimer = setTimeout(() => {
         detailFeedback.hidden = true;
         detailFeedback.className = 'detail-feedback';
         detailFeedback.textContent = '';
         detailFeedbackTimer = null;
-      }, 3200);
+      }, durationMs);
     }
 
     function renderDetailSections(detail) {
@@ -9517,6 +9628,7 @@
       try {
         const detail = await invoke('cmd_get_meeting_detail', { path });
         renderDetailSections(detail);
+        refreshResummarizeButton();
       } catch (e) {
         console.error('Detail:', e);
         await invoke('cmd_open_file', { path });
