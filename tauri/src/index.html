@@ -6816,6 +6816,7 @@
     const detailTitle = document.getElementById('detail-title');
     const detailMeta = document.getElementById('detail-meta');
     const detailFeedback = document.getElementById('detail-feedback');
+    const detailCard = document.querySelector('.detail-card');
     const detailScroll = document.getElementById('detail-scroll');
     const resummarizeBtn = document.getElementById('btn-resummarize');
     const openExternalBtn = document.getElementById('btn-open-external');
@@ -6904,6 +6905,8 @@
     let latestOutput = null;
     let detailFeedbackTimer = null;
     let resummarizeConfirmTimer = null;
+    let resummarizeStatusPollTimer = null;
+    let resummarizeStatusRequestId = 0;
     let processingJobs = [];
     let readinessItems = [];
     let recoveryItems = [];
@@ -8667,14 +8670,38 @@
         clearTimeout(resummarizeConfirmTimer);
         resummarizeConfirmTimer = null;
       }
+      stopResummarizeStatusPoll();
       resummarizeBtn.disabled = false;
       resummarizeBtn.style.minWidth = '';
       resummarizeBtn.textContent = 'Resummarize';
+      if (detailCard) {
+        detailCard.style.height = '';
+      }
+    }
+
+    // `currentMeetingPath` alone is NOT a detail-view identity check: Recall
+    // reuses it ("Discuss with Agent" closes the overlay and then assigns the
+    // same path back), so a completion could reopen the meeting on top of
+    // Recall. Require the overlay to actually be showing this path.
+    function isDetailViewShowing(path) {
+      return detailOverlay.classList.contains('active') && currentMeetingPath === path;
+    }
+
+    function stopResummarizeStatusPoll() {
+      if (resummarizeStatusPollTimer) {
+        clearTimeout(resummarizeStatusPollTimer);
+        resummarizeStatusPollTimer = null;
+      }
     }
 
     async function refreshResummarizeButton() {
+      const requestId = ++resummarizeStatusRequestId;
       try {
         const status = await invoke('cmd_resummarize_status');
+        // These queries are fire-and-forget, so an older reply can land after a
+        // newer one. Applying it would strand the button in the stale state.
+        if (requestId !== resummarizeStatusRequestId) return;
+        stopResummarizeStatusPoll();
         if (status && status.running) {
           // Runs are globally serialized: disable for any in-flight run, and
           // say so when it is a different file than the one open here.
@@ -8682,6 +8709,13 @@
           resummarizeBtn.textContent = 'Resummarizing…';
           if (status.path && status.path !== currentMeetingPath) {
             showDetailFeedback('Another meeting is being resummarized — this button unlocks when it finishes.');
+          }
+          // Only the view that started a run learns when it ends. Without this
+          // re-check, a view opened during someone else's run keeps a disabled
+          // button for the rest of its life — and the explanation above has
+          // already auto-hidden, so it looks simply broken.
+          if (detailOverlay.classList.contains('active')) {
+            resummarizeStatusPollTimer = setTimeout(refreshResummarizeButton, 2000);
           }
         } else {
           resetResummarizeButton();
@@ -8706,6 +8740,16 @@
         // reflows and slides "Open in Editor" under the cursor — so the
         // second click of a double-click lands on the wrong button.
         resummarizeBtn.style.minWidth = `${resummarizeBtn.offsetWidth}px`;
+        // Vertical twin of the width pin above. The hint banner below is added
+        // to the card's flow, and the card is centred in the overlay — so a
+        // card shorter than max-height grows and its header slides UP by half
+        // the banner's height, moving this row out from under the cursor. The
+        // second click of a double-click then lands on "Delete". Freeze the
+        // card's height for the armed window; .detail-scroll (overflow-y:auto)
+        // absorbs the banner instead. Cleared in resetResummarizeButton().
+        if (detailCard) {
+          detailCard.style.height = `${detailCard.offsetHeight}px`;
+        }
         resummarizeBtn.textContent = 'Confirm?';
         showDetailFeedback('Click again to re-run the AI pass. The summary is rewritten and a timestamped backup is saved.');
         resummarizeConfirmTimer = setTimeout(resetResummarizeButton, 4000);
@@ -8743,18 +8787,26 @@
         // Tone stays 'success' (the write did succeed, and .detail-feedback has
         // no warning variant); persistence is what carries the emphasis.
         const needsAttention = mergeNotes.length || refreshWarnings.length;
-        showDetailFeedback(parts.join(' '), 'success', needsAttention ? 0 : 3200);
-        await openMeetingDetail(path);
+        // The run outlives the view: the user can close the detail view or open
+        // another meeting while it is in flight. Only report into the view that
+        // started it — otherwise this reopens meeting A over meeting B and
+        // attaches A's feedback to B.
+        if (isDetailViewShowing(path)) {
+          showDetailFeedback(parts.join(' '), 'success', needsAttention ? 0 : 3200);
+          await openMeetingDetail(path);
+        }
         loadMeetings();
       } catch (e) {
         const message = e?.message || String(e || 'Unknown error');
         console.error('Resummarize:', e);
-        // Errors are actionable (a ConcurrentEdit asks the user to save their
-        // editor and re-run) — do not auto-hide them.
-        showDetailFeedback(message, 'error', 0);
-        // Reload without retrying: a ConcurrentEdit means the on-disk file
-        // moved on, so show the user its current state.
-        await openMeetingDetail(path);
+        if (isDetailViewShowing(path)) {
+          // Errors are actionable (a ConcurrentEdit asks the user to save their
+          // editor and re-run) — do not auto-hide them.
+          showDetailFeedback(message, 'error', 0);
+          // Reload without retrying: a ConcurrentEdit means the on-disk file
+          // moved on, so show the user its current state.
+          await openMeetingDetail(path);
+        }
       } finally {
         resetResummarizeButton();
       }
@@ -9071,10 +9123,11 @@
         clearTimeout(detailFeedbackTimer);
         detailFeedbackTimer = null;
       }
-      if (resummarizeConfirmTimer) {
-        clearTimeout(resummarizeConfirmTimer);
-        resummarizeConfirmTimer = null;
-      }
+      // Closing while the confirm is armed must not leave the armed state
+      // behind: this clears the timer and also the "Confirm?" label, the pinned
+      // button width, and the pinned card height, none of which are repaired
+      // until refreshResummarizeButton() happens to take its idle branch.
+      resetResummarizeButton();
       detailFeedback.hidden = true;
       detailFeedback.className = 'detail-feedback';
       detailFeedback.textContent = '';
@@ -9625,6 +9678,12 @@
     }
 
     async function openMeetingDetail(path) {
+      // Clear any armed state synchronously, before the awaits below. The
+      // "Confirm?" label, the pinned button width, and the pinned card height
+      // all belong to the detail that was showing; carrying them into a
+      // different meeting (or leaving them while the status refresh is still
+      // in flight) shows a stale, wrongly-sized control.
+      resetResummarizeButton();
       try {
         const detail = await invoke('cmd_get_meeting_detail', { path });
         renderDetailSections(detail);
@@ -15082,6 +15141,9 @@
       // newly-active md-viewer is actually visible.
       if (detailOverlay.classList.contains('active')) {
         detailOverlay.classList.remove('active');
+        // Hiding the overlay bypasses closeDetailView(), so drop any armed
+        // "Confirm?" state and its pinned width/height with it.
+        resetResummarizeButton();
       }
       meetingsScroll.style.display = 'none';
       mdSearchWrap.style.display = 'none';

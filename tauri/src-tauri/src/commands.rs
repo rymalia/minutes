@@ -7228,7 +7228,7 @@ fn validate_text_file_path(path: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn validate_resummarize_meeting_path(path: &Path) -> Result<PathBuf, String> {
+fn validate_resummarize_meeting_path(path: &Path, meetings_root: &Path) -> Result<PathBuf, String> {
     let (canonical, _) = validate_text_file_path_common(path)?;
     let path_str = canonical.to_string_lossy();
     let is_markdown = canonical
@@ -7239,6 +7239,28 @@ fn validate_resummarize_meeting_path(path: &Path) -> Result<PathBuf, String> {
         return Err(format!(
             "Unsupported artifact: {} (expected a .md file)",
             path_str
+        ));
+    }
+
+    // This command rewrites the artifact in place, so home-containment alone is
+    // too wide a surface: it would let a direct IPC call rewrite any
+    // Minutes-shaped `.md` elsewhere under $HOME. Require the configured
+    // meetings root, matching `cmd_get_meeting_detail`'s read-side check.
+    // Containment is checked here rather than via `notes::validate_meeting_path`
+    // because that helper also re-checks the extension case-sensitively, which
+    // would reject a legitimately-named `.MD` artifact this command accepts.
+    let canonical_root = meetings_root.canonicalize().map_err(|e| {
+        format!(
+            "could not resolve meetings directory {}: {}",
+            meetings_root.display(),
+            e
+        )
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!(
+            "{} is outside the meetings directory {}",
+            path_str,
+            canonical_root.display()
         ));
     }
 
@@ -8058,11 +8080,11 @@ pub async fn cmd_resummarize_meeting(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<serde_json::Value, String> {
-    let canonical = validate_resummarize_meeting_path(Path::new(&path))?;
+    let config = Config::load();
+    let canonical = validate_resummarize_meeting_path(Path::new(&path), &config.output_dir)?;
     let _guard = ResummarizeInFlightGuard::acquire(&state.resummarize_in_flight, &canonical)?;
 
     let report = tauri::async_runtime::spawn_blocking(move || {
-        let config = Config::load();
         let opts = minutes_core::resummarize::ResummarizeOptions {
             apply: true,
             template_override: None,
@@ -11199,20 +11221,53 @@ mod tests {
 
     #[test]
     fn resummarize_path_validation_rejects_non_markdown_and_outside_home() {
+        // `with_temp_home` swaps the process-global HOME, and this test reads it
+        // both directly and inside `validate_resummarize_meeting_path`. Without
+        // the shared guard a concurrent swap would point "inside home" at a
+        // temp dir that then gets removed, and would put the "outside home"
+        // fixture *inside* the swapped home — failing on the wrong premise.
+        let _guard = test_guard();
         let home = dirs::home_dir().expect("home dir");
-        let inside_home = TempDir::new_in(home).unwrap();
-        let non_markdown = inside_home.path().join("meeting.txt");
+        let meetings_root = TempDir::new_in(&home).unwrap();
+
+        let non_markdown = meetings_root.path().join("meeting.txt");
         fs::write(&non_markdown, "not markdown").unwrap();
-        assert!(validate_resummarize_meeting_path(&non_markdown)
-            .unwrap_err()
-            .contains("expected a .md file"));
+        assert!(
+            validate_resummarize_meeting_path(&non_markdown, meetings_root.path())
+                .unwrap_err()
+                .contains("expected a .md file")
+        );
 
         let outside_home = TempDir::new().unwrap();
         let outside_markdown = outside_home.path().join("meeting.md");
         fs::write(&outside_markdown, "---\ntitle: Outside\n---\n").unwrap();
-        assert!(validate_resummarize_meeting_path(&outside_markdown)
-            .unwrap_err()
-            .contains("outside home directory"));
+        assert!(
+            validate_resummarize_meeting_path(&outside_markdown, meetings_root.path())
+                .unwrap_err()
+                .contains("outside home directory")
+        );
+
+        // Inside home but outside the configured meetings root: a rewrite must
+        // not reach an unrelated Minutes-shaped artifact elsewhere in $HOME.
+        let other_home_dir = TempDir::new_in(&home).unwrap();
+        let stray_markdown = other_home_dir.path().join("meeting.md");
+        fs::write(&stray_markdown, "---\ntitle: Stray\n---\n").unwrap();
+        assert!(
+            validate_resummarize_meeting_path(&stray_markdown, meetings_root.path())
+                .unwrap_err()
+                .contains("outside the meetings directory")
+        );
+
+        // Uppercase .MD stays accepted: this command's extension check is
+        // case-insensitive, and containment must not silently narrow that.
+        let upper_markdown = meetings_root.path().join("memo.MD");
+        fs::write(&upper_markdown, "---\ntitle: Upper\n---\n").unwrap();
+        assert!(validate_resummarize_meeting_path(&upper_markdown, meetings_root.path()).is_ok());
+
+        // The happy path still resolves inside the configured root.
+        let good_markdown = meetings_root.path().join("meeting.md");
+        fs::write(&good_markdown, "---\ntitle: Good\n---\n").unwrap();
+        assert!(validate_resummarize_meeting_path(&good_markdown, meetings_root.path()).is_ok());
     }
 
     #[test]
