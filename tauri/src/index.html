@@ -3023,6 +3023,33 @@
          line needs its newlines honoured. `pre-line` keeps them while still
          wrapping long lines and collapsing incidental whitespace. */
       white-space: pre-line;
+      /* The completion report names a backup file and quotes action items
+         verbatim — both are things to copy out. `body` sets user-select: none
+         page-wide and every content surface opts back in, so this one must
+         too. break-word matches .detail-section-body, since an unbroken
+         quoted item would otherwise run past the banner. */
+      -webkit-user-select: text;
+      user-select: text;
+      word-break: break-word;
+    }
+
+    /* Detail lines under a report headline: the artifact's normal body text
+       (same colour and weight as .detail-section-body) rather than the
+       banner's accent. A dozen quoted action items in bold green is a wall.
+       The hanging indent keeps a wrapped note aligned under its own text
+       instead of under the leading "- ". */
+    .detail-feedback-note {
+      font-weight: 400;
+      color: var(--text-secondary);
+      padding-left: 1em;
+      text-indent: -1em;
+    }
+
+    /* Separates a new subject (e.g. "Review N items…") from the outcome above
+       it. A blank line in the text would be at the mercy of white-space
+       collapsing; margin is not. */
+    .detail-feedback-spaced {
+      margin-top: 0.75em;
     }
 
     .detail-feedback.success {
@@ -8754,7 +8781,7 @@
     // reads first. Unknown names sort last rather than being dropped.
     const RESUMMARIZE_SECTION_ORDER = ['Summary', 'Decisions', 'Action Items', 'Open Questions', 'Commitments'];
 
-    function orderReplacedSections(sections) {
+    function orderResummarizeSections(sections) {
       const rank = (name) => {
         const index = RESUMMARIZE_SECTION_ORDER.indexOf(name);
         return index === -1 ? RESUMMARIZE_SECTION_ORDER.length : index;
@@ -8788,7 +8815,9 @@
       // The backend detail already contains its own parenthetical, so join
       // with a colon rather than wrapping it in a second set of parentheses.
       const detail = note.detail ? `: ${note.detail}` : '';
-      return `• ${kind}${previous} — ${disposition}${detail}`;
+      // "- " to match the bulleted lists everywhere else in the artifact; the
+      // "•" this used stood out as a different kind of list.
+      return `- ${kind}${previous} — ${disposition}${detail}`;
     }
 
     function stopResummarizeStatusPoll() {
@@ -8924,28 +8953,69 @@
         return;
       }
 
-      const sections = orderReplacedSections(
+      const replaced = orderResummarizeSections(
         Array.isArray(result.sectionsReplaced) ? result.sectionsReplaced : [],
       );
+      // `sectionsWritten` is what the pass produced; `sectionsReplaced` is only
+      // the subset that already existed. The difference is what got created —
+      // without it, a transcript-only meeting's first pass reports "replaced
+      // nothing", which reads as "nothing happened" when in fact a whole
+      // summary and its derived sections were just written.
+      const written = orderResummarizeSections(
+        Array.isArray(result.sectionsWritten) ? result.sectionsWritten : [],
+      );
+      const replacedSet = new Set(replaced);
+      const writtenSet = new Set(written);
+      // A section the new pass did not produce is REMOVED, not replaced:
+      // splice_ai_sections deletes every pre-existing AI section and inserts
+      // only what the pass wrote, so a meeting that had Commitments and a pass
+      // that found none leaves no Commitments section at all. Core folds that
+      // into `sections_replaced`, so reporting that list verbatim would say
+      // "replaced Commitments" about a section that is now gone.
+      //
+      // Without `sectionsWritten` there is nothing to subtract, so fall back
+      // to reporting the replaced list as-is rather than inventing removals.
+      const known = written.length > 0;
+      const rewritten = known ? replaced.filter((name) => writtenSet.has(name)) : replaced;
+      // Summary is named by the lead clause either way, so listing it again
+      // under "Created" would be redundant.
+      const created = written.filter((name) => name !== 'Summary' && !replacedSet.has(name));
+      const removed = known ? replaced.filter((name) => !writtenSet.has(name)) : [];
       const elapsed = formatResummarizeDuration(result.durationMs);
       const took = elapsed ? ` in ${elapsed}` : '';
+      // "rewritten" only when there was something there to rewrite — an
+      // artifact with no `## Summary` gets one written for the first time.
+      const outcome = replacedSet.has('Summary')
+        ? `Summary rewritten${took}`
+        : `Summary written${took}`;
+      const sentences = [
+        rewritten.length ? `${outcome} — replaced ${rewritten.join(', ')}.` : `${outcome}.`,
+      ];
+      if (created.length) {
+        sentences.push(`Created ${created.join(', ')}.`);
+      }
+      if (removed.length) {
+        sentences.push(`Removed ${removed.join(', ')} — the new pass found none.`);
+      }
       // One fact per line: the run's outcome, then where the previous version
       // went, then anything needing a decision. The backup lands beside the
       // artifact, so its filename is the useful half of the path.
-      const lines = [
-        sections.length
-          ? `Summary rewritten${took} — replaced ${sections.join(', ')}.`
-          : `Run finished${took} but replaced no sections — the artifact is unchanged.`,
-      ];
+      const lines = [sentences.join(' ')];
       if (result.backup) {
         lines.push(`Backup: ${fileName(result.backup)}`);
       }
       const mergeNotes = Array.isArray(result.mergeNotes) ? result.mergeNotes : [];
       if (mergeNotes.length) {
-        lines.push(
-          `Review ${mergeNotes.length} item${mergeNotes.length === 1 ? '' : 's'} where the new pass differed from your edits:`,
-        );
-        lines.push(...mergeNotes.map(formatMergeNote));
+        // Set off from the outcome above it: this is a to-do list, not more
+        // detail about the run that just succeeded.
+        lines.push({
+          text: `Review ${mergeNotes.length} item${mergeNotes.length === 1 ? '' : 's'} where the new pass differed from your edits:`,
+          spaced: true,
+        });
+        // Muted: these quote the user's own action items and decisions in full,
+        // so they are long, and the banner's accent colour on all of it drowns
+        // out the one line that says what happened.
+        lines.push(...mergeNotes.map((note) => ({ text: formatMergeNote(note), muted: true })));
       }
       // A refresh warning means the write succeeded but a derived view (graph,
       // vault, QMD) is now stale — silently dropping it is how a stale index
@@ -8967,7 +9037,7 @@
         // any merge conflicts — none of that should evaporate on a timer
         // while the user is still reading it. Tone stays 'success' (the write
         // did succeed, and .detail-feedback has no warning variant).
-        showDetailFeedback(lines.join('\n'), 'success', 0);
+        showDetailFeedback(lines, 'success', 0);
       }
       loadMeetings();
     });
@@ -9368,6 +9438,11 @@
       unpinDetailCardHeight();
     }
 
+    // `message` is either a plain string — whose newlines `white-space:
+    // pre-line` honours — or an array of lines, where each line is a string or
+    // `{ text, muted, spaced }`. The array form exists because a report is not
+    // uniform: the outcome is the headline, merge notes are a muted to-do list
+    // under it, and CSS cannot tell those apart inside one text node.
     function showDetailFeedback(message, tone = 'success', durationMs = 3200) {
       if (detailFeedbackTimer) {
         clearTimeout(detailFeedbackTimer);
@@ -9383,7 +9458,25 @@
       pinDetailCardHeight();
       detailFeedback.hidden = false;
       detailFeedback.className = `detail-feedback ${tone}`;
-      detailFeedback.textContent = message;
+      if (Array.isArray(message)) {
+        detailFeedback.replaceChildren(
+          ...message.map((line) => {
+            const row = document.createElement('div');
+            const spec = typeof line === 'string' ? { text: line } : line || {};
+            // textContent, never innerHTML: merge notes quote action-item and
+            // decision text straight out of the artifact, which is arbitrary
+            // user content.
+            row.textContent = spec.text || '';
+            const classes = [];
+            if (spec.muted) classes.push('detail-feedback-note');
+            if (spec.spaced) classes.push('detail-feedback-spaced');
+            if (classes.length) row.className = classes.join(' ');
+            return row;
+          }),
+        );
+      } else {
+        detailFeedback.textContent = message;
+      }
       if (durationMs <= 0) return;
       // Route the auto-hide through clearDetailFeedback so every path that
       // removes the banner also releases the card pin.

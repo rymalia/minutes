@@ -8034,9 +8034,43 @@ fn merge_disposition_json(
     }
 }
 
+/// Which AI-owned sections the regenerated pass actually wrote.
+///
+/// Core reports only `sections_replaced` — the sections that *already existed*
+/// and were overwritten. That cannot tell "the run changed nothing" apart from
+/// "the artifact had no summary at all and every section was created fresh",
+/// which is exactly what a transcript-only meeting does on its first pass. The
+/// desktop report needs the difference to describe the outcome truthfully.
+///
+/// Parses the exact block `splice_ai_sections` inserts, using core's own
+/// section finder rather than a scanner of our own. That is the whole point:
+/// an independent parser here would drift from the one that decides what the
+/// artifact actually contains. `h2_headings` skips headings inside fenced code
+/// blocks and trims after `## `, so raw summary prose carrying a fenced
+/// ```` ```\n## Commitments\n``` ```` is content (not a section) while
+/// `##   Commitments` is a section — neither of which a line-equality scan
+/// gets right, and both of which come straight out of model output.
+///
+/// `find_unique_section` fails closed on a duplicate heading; a duplicate
+/// still means the section is present, so it counts as written.
+fn resummarize_sections_written(new_ai_body: &str) -> Vec<String> {
+    let block = format!("## Summary\n\n{}\n", new_ai_body.trim_end_matches('\n'));
+    minutes_core::resummarize::AI_SECTIONS
+        .iter()
+        .filter(|name| {
+            !matches!(
+                minutes_core::markdown::find_unique_section(&block, name),
+                Ok(None)
+            )
+        })
+        .map(|name| name.to_string())
+        .collect()
+}
+
 fn resummarize_report_json(
     report: minutes_core::resummarize::ResummarizeReport,
 ) -> serde_json::Value {
+    let sections_written = resummarize_sections_written(&report.new_ai_body);
     let merge_notes: Vec<serde_json::Value> = report
         .merge_notes
         .into_iter()
@@ -8061,6 +8095,7 @@ fn resummarize_report_json(
         "model": report.model,
         "template": report.template,
         "sectionsReplaced": report.sections_replaced,
+        "sectionsWritten": sections_written,
         "durationMs": report.duration_ms,
         "mergeNotes": merge_notes,
         "refreshWarnings": report.refresh.map(|refresh| refresh.warnings).unwrap_or_default(),
@@ -11217,6 +11252,229 @@ mod tests {
         let idle = resummarize_status_json(&slot);
         assert_eq!(idle["running"], false);
         assert!(idle["path"].is_null());
+    }
+
+    /// Build the AI body with core's own renderer rather than a hand-written
+    /// literal, so `resummarize_sections_written` is checked against the real
+    /// emitter and cannot silently drift from it.
+    fn rendered_ai_body(
+        key_points: &[&str],
+        decisions: &[&str],
+        actions: &[&str],
+        open_questions: &[&str],
+        commitments: &[&str],
+    ) -> String {
+        let summary = minutes_core::summarize::Summary {
+            text: String::new(),
+            decisions: Vec::new(),
+            action_items: Vec::new(),
+            open_questions: open_questions.iter().map(|s| s.to_string()).collect(),
+            commitments: commitments.iter().map(|s| s.to_string()).collect(),
+            key_points: key_points.iter().map(|s| s.to_string()).collect(),
+            participants: Vec::new(),
+        };
+        let merged_actions: Vec<minutes_core::markdown::ActionItem> = actions
+            .iter()
+            .map(|task| minutes_core::markdown::ActionItem {
+                assignee: "unassigned".into(),
+                task: (*task).into(),
+                due: None,
+                status: "open".into(),
+            })
+            .collect();
+        let merged_decisions: Vec<minutes_core::markdown::Decision> = decisions
+            .iter()
+            .map(|text| minutes_core::markdown::Decision {
+                text: (*text).into(),
+                topic: None,
+                authority: None,
+                supersedes: None,
+            })
+            .collect();
+        minutes_core::resummarize::render_ai_body(&summary, &merged_actions, &merged_decisions)
+    }
+
+    #[test]
+    fn sections_written_reports_every_section_the_pass_produced() {
+        let body = rendered_ai_body(
+            &["a point"],
+            &["a decision"],
+            &["a task"],
+            &["a q"],
+            &["a c"],
+        );
+        assert_eq!(
+            resummarize_sections_written(&body),
+            vec![
+                "Summary",
+                "Decisions",
+                "Action Items",
+                "Open Questions",
+                "Commitments"
+            ],
+        );
+    }
+
+    #[test]
+    fn sections_written_always_includes_summary_and_omits_empty_sections() {
+        // `render_ai_body` emits a heading only for a section with content, so
+        // a summary-only pass writes exactly one section — and Summary has no
+        // heading of its own inside the block, it is implied.
+        let body = rendered_ai_body(&["only a point"], &[], &[], &[], &[]);
+        assert_eq!(resummarize_sections_written(&body), vec!["Summary"]);
+
+        let partial = rendered_ai_body(&["p"], &["d"], &[], &[], &["c"]);
+        assert_eq!(
+            resummarize_sections_written(&partial),
+            vec!["Summary", "Decisions", "Commitments"],
+        );
+    }
+
+    #[test]
+    fn sections_written_ignores_a_heading_that_is_only_list_content() {
+        // A key point whose text happens to be a heading is emitted as
+        // `- ## Decisions`, which is prose, not a section. Only a line that is
+        // exactly the heading counts.
+        let body = rendered_ai_body(&["## Decisions", "a point"], &[], &[], &[], &[]);
+        assert!(body.contains("- ## Decisions"));
+        assert_eq!(resummarize_sections_written(&body), vec!["Summary"]);
+    }
+
+    #[test]
+    fn sections_written_counts_a_repeated_heading_once() {
+        // Reachable: `render_ai_body` falls back to `summary.text` verbatim
+        // when there are no key points, so a model that writes its own
+        // `## Decisions` heading there gets it emitted alongside the
+        // renderer's canonical one. A duplicate makes core's finder fail
+        // closed, but the section IS in the artifact, so "written" is the
+        // truthful answer — and it must be listed once.
+        let body = "a point\n\n## Decisions\n\n- [x] one\n\n## Decisions\n\n- [x] two\n";
+        assert_eq!(
+            resummarize_sections_written(body),
+            vec!["Summary", "Decisions"],
+        );
+    }
+
+    #[test]
+    fn sections_written_ignores_a_heading_inside_a_fenced_block() {
+        // Raw `summary.text` is copied into the body verbatim, so a model that
+        // quotes markdown puts a fenced heading in there. Core's parser is
+        // fence-aware and does NOT create a section for it — meaning a
+        // pre-existing Commitments section is REMOVED by this run. Counting it
+        // as written would make the banner say "replaced" about a section that
+        // is gone.
+        let body = "a point\n\n```\n## Commitments\n```\n";
+        assert_eq!(resummarize_sections_written(body), vec!["Summary"]);
+    }
+
+    #[test]
+    fn sections_written_accepts_a_heading_with_extra_spacing() {
+        // Core strips `## ` and trims the rest, so this IS a real section in
+        // the written artifact. Requiring an exact `## Commitments` match would
+        // make the banner claim it was removed while it sits on disk.
+        let body = "a point\n\n##   Commitments\n\n- a commitment\n";
+        assert_eq!(
+            resummarize_sections_written(body),
+            vec!["Summary", "Commitments"],
+        );
+    }
+
+    #[test]
+    fn sections_written_matches_the_spliced_artifact() {
+        // The helper parses the new block in ISOLATION, while core parses the
+        // whole document. This drives the real splice and then asks core which
+        // AI sections the finished artifact actually has, so the two can never
+        // silently disagree — including the case this whole change exists for:
+        // a section that existed before and that the new pass did not produce.
+        let before = "## Summary\n\nold summary\n\n## Commitments\n\n- an old commitment\n\n## Notes\n\n- kept by hand\n\n## Transcript\n\n[SPEAKER_00 0:00] hi\n";
+        let new_ai_body = rendered_ai_body(&["a point"], &["a decision"], &[], &[], &[]);
+
+        let (after, replaced) =
+            minutes_core::resummarize::splice_ai_sections(before, &new_ai_body).unwrap();
+
+        let written = resummarize_sections_written(&new_ai_body);
+        let on_disk: Vec<String> = minutes_core::resummarize::AI_SECTIONS
+            .iter()
+            .filter(|name| {
+                !matches!(
+                    minutes_core::markdown::find_unique_section(&after, name),
+                    Ok(None)
+                )
+            })
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(
+            written, on_disk,
+            "reported sections must match the finished artifact",
+        );
+
+        // And the partition the UI draws from is the interesting one: core
+        // calls Commitments "replaced" while the artifact no longer has it.
+        assert!(replaced.contains(&"Commitments".to_string()));
+        assert!(!after.contains("## Commitments"));
+        assert!(!written.contains(&"Commitments".to_string()));
+        // Untouched user content survives, which is what makes "Removed"
+        // a statement about AI sections only.
+        assert!(after.contains("- kept by hand"));
+    }
+
+    #[test]
+    fn report_json_carries_written_sections_and_conflict_details() {
+        use minutes_core::resummarize::{MergeDisposition, MergeNote};
+
+        let report = minutes_core::resummarize::ResummarizeReport {
+            path: PathBuf::from("/tmp/meeting.md"),
+            applied: true,
+            backup: Some(PathBuf::from("/tmp/.meeting.md.pre-resummarize.1.bak")),
+            engine: "agent".into(),
+            model: "test".into(),
+            template: None,
+            new_ai_body: rendered_ai_body(&["a point"], &["a decision"], &[], &[], &[]),
+            // Only Summary pre-existed: Decisions is new. The UI needs both
+            // lists to say "rewritten … created", so both must survive here.
+            sections_replaced: vec!["Summary".into()],
+            merge_notes: vec![
+                MergeNote {
+                    kind: "action_item",
+                    previous: "Ship the fix".into(),
+                    disposition: MergeDisposition::CarriedWithConflict(
+                        "assignee kept as 'Alice' (regenerated pass said 'Bob')".into(),
+                    ),
+                },
+                // A clean carry needed no decision from the user, so it must
+                // not reach the report and pad the "Review N items" count.
+                MergeNote {
+                    kind: "decision",
+                    previous: "Use Postgres".into(),
+                    disposition: MergeDisposition::Carried,
+                },
+            ],
+            action_items: Vec::new(),
+            decisions: Vec::new(),
+            duration_ms: 32_700,
+            refresh: None,
+        };
+
+        let json = resummarize_report_json(report);
+        assert_eq!(json["sectionsReplaced"], serde_json::json!(["Summary"]));
+        assert_eq!(
+            json["sectionsWritten"],
+            serde_json::json!(["Summary", "Decisions"]),
+        );
+        assert_eq!(json["durationMs"], 32_700);
+
+        let notes = json["mergeNotes"]
+            .as_array()
+            .expect("mergeNotes is an array");
+        assert_eq!(notes.len(), 1, "clean carries must be filtered out");
+        assert_eq!(notes[0]["disposition"], "carried-with-conflict");
+        // The detail is the whole point of this disposition — it names the
+        // field that conflicted and both values. Losing it leaves the user a
+        // note that says something differed but not what.
+        assert_eq!(
+            notes[0]["detail"],
+            "assignee kept as 'Alice' (regenerated pass said 'Bob')",
+        );
     }
 
     #[test]
