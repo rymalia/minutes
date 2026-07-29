@@ -1584,6 +1584,49 @@ mod tests {
     }
 
     #[test]
+    fn apply_round_trips_generated_artifact_larger_than_one_megabyte() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("large-meeting.md");
+        let large_transcript = format!(
+            "[SPEAKER_00 0:00] edited hello\\n{}",
+            "generated transcript payload ".repeat(42_500)
+        );
+        let fixture = MEETING.replace("[SPEAKER_00 0:00] edited hello", &large_transcript);
+        assert!(
+            fixture.len() > 1_000_000,
+            "fixture must exercise the >1MB path"
+        );
+        fs::write(&path, fixture).unwrap();
+
+        let expected_transcript = large_transcript.clone();
+        let report = resummarize_meeting_with(
+            &path,
+            &test_config(),
+            &ResummarizeOptions {
+                apply: true,
+                ..Default::default()
+            },
+            move |transcript, _, _| {
+                assert_eq!(transcript, expected_transcript);
+                Some(good_summary())
+            },
+        )
+        .unwrap();
+        assert!(report.applied);
+
+        let rewritten = fs::read_to_string(&path).unwrap();
+        assert!(
+            rewritten.len() > 1_000_000,
+            "resummarize must not truncate a >1MB artifact"
+        );
+        let (_, body) = markdown::split_frontmatter(&rewritten);
+        let transcript = markdown::find_unique_section(body, "Transcript")
+            .unwrap()
+            .expect("rewritten artifact must retain its transcript");
+        assert_eq!(markdown::section_text(body, transcript), large_transcript);
+    }
+
+    #[test]
     fn apply_to_crlf_artifact_keeps_uniform_line_endings() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("meeting.md");
