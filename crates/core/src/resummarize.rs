@@ -1470,10 +1470,20 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_edit_aborts_apply() {
+    fn concurrent_edit_aborts_apply_without_overwriting_user_bytes() {
         let dir = TempDir::new().unwrap();
         let path = write_meeting(&dir);
         let path_clone = path.clone();
+        let user_edit = fs::read(&path)
+            .unwrap()
+            .into_iter()
+            .chain(
+                b"\n<!-- saved mid-inference; preserve every byte -->\n"
+                    .iter()
+                    .copied(),
+            )
+            .collect::<Vec<_>>();
+        let expected_user_edit = user_edit.clone();
         let err = resummarize_meeting_with(
             &path,
             &test_config(),
@@ -1483,17 +1493,14 @@ mod tests {
             },
             move |_, _, _| {
                 // The user saves their editor mid-inference.
-                let mutated = fs::read_to_string(&path_clone)
-                    .unwrap()
-                    .replace("edited hello", "edited again");
-                fs::write(&path_clone, mutated).unwrap();
+                fs::write(&path_clone, &user_edit).unwrap();
                 Some(good_summary())
             },
         )
         .unwrap_err();
         assert!(matches!(err, ResummarizeError::ConcurrentEdit));
-        // The user's mid-flight save is what survives.
-        assert!(fs::read_to_string(&path).unwrap().contains("edited again"));
+        // The user's mid-flight save is the exact byte sequence that survives.
+        assert_eq!(fs::read(&path).unwrap(), expected_user_edit);
     }
 
     #[test]
