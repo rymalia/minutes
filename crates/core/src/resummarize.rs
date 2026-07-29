@@ -1474,15 +1474,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write_meeting(&dir);
         let path_clone = path.clone();
-        let user_edit = fs::read(&path)
-            .unwrap()
-            .into_iter()
-            .chain(
-                b"\n<!-- saved mid-inference; preserve every byte -->\n"
-                    .iter()
-                    .copied(),
-            )
-            .collect::<Vec<_>>();
+        let mut user_edit = fs::read(&path).unwrap();
+        let original_bytes = b"edited hello";
+        let replacement_bytes = b"edited again";
+        assert_eq!(original_bytes.len(), replacement_bytes.len());
+        let edit_start = user_edit
+            .windows(original_bytes.len())
+            .position(|window| window == original_bytes)
+            .expect("fixture must contain the original transcript text");
+        user_edit[edit_start..edit_start + replacement_bytes.len()]
+            .copy_from_slice(replacement_bytes);
         let expected_user_edit = user_edit.clone();
         let err = resummarize_meeting_with(
             &path,
@@ -1588,14 +1589,24 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("large-meeting.md");
         let large_transcript = format!(
-            "[SPEAKER_00 0:00] edited hello\\n{}",
-            "generated transcript payload ".repeat(42_500)
+            "[SPEAKER_00 0:00] edited hello\n{}",
+            "generated transcript payload \n".repeat(42_500)
         );
         let fixture = MEETING.replace("[SPEAKER_00 0:00] edited hello", &large_transcript);
         assert!(
             fixture.len() > 1_000_000,
             "fixture must exercise the >1MB path"
         );
+        assert!(
+            fixture.lines().count() > 42_500,
+            "fixture must exercise many physical line boundaries"
+        );
+        let expected_backup = fixture.as_bytes().to_vec();
+        let (_, original_body) = markdown::split_frontmatter(&fixture);
+        let original_notes = markdown::find_unique_section(original_body, "Notes")
+            .unwrap()
+            .expect("fixture must contain user-owned Notes");
+        let expected_notes = markdown::section_text(original_body, original_notes).to_owned();
         fs::write(&path, fixture).unwrap();
 
         let expected_transcript = large_transcript.clone();
@@ -1613,6 +1624,12 @@ mod tests {
         )
         .unwrap();
         assert!(report.applied);
+        let backup = report.backup.expect("applied run must create a backup");
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            expected_backup,
+            "backup must retain every byte of the original large artifact"
+        );
 
         let rewritten = fs::read_to_string(&path).unwrap();
         assert!(
@@ -1624,6 +1641,10 @@ mod tests {
             .unwrap()
             .expect("rewritten artifact must retain its transcript");
         assert_eq!(markdown::section_text(body, transcript), large_transcript);
+        let notes = markdown::find_unique_section(body, "Notes")
+            .unwrap()
+            .expect("rewritten artifact must retain user-owned Notes");
+        assert_eq!(markdown::section_text(body, notes), expected_notes);
     }
 
     #[test]
